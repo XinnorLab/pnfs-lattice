@@ -1357,7 +1357,8 @@ phase_build() {
     run_local "${LAB_SOURCE_DIR}/scripts/cmake-fresh.sh" "${LAB_BUILD_DIR}" \
         -DCMAKE_BUILD_TYPE="${LAB_BUILD_TYPE}" \
         -DENABLE_RONDB=ON \
-        -DRonDB_ROOT="${LAB_BUILD_HOST_RONDB_LINK}"
+        -DRonDB_ROOT="${LAB_BUILD_HOST_RONDB_LINK}" \
+        -DENABLE_DS_PREALLOC=ON
     heartbeat_start "cmake --build ${LAB_BUILD_DIR}"
     run_local cmake --build "${LAB_BUILD_DIR}" -j"$(nproc)"
     heartbeat_stop
