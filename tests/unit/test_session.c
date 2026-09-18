@@ -1387,6 +1387,98 @@ static void test_compound_op_without_sequence(void)
 }
 
 /* -----------------------------------------------------------------------
+ * Test: identifiers minted by different daemon lifetimes never collide
+ *
+ * next_session_seq and next_clientid both reset on session_table_init(),
+ * so without a restart discriminator a fresh start re-mints the previous
+ * start's session_ids and clientids verbatim.  A client still holding a
+ * pre-restart identifier then collides with a live one, and the
+ * resulting NFS4ERR_SEQ_MISORDERED gives it no recoverable path back.
+ *
+ * Two freshly initialised tables stand in for two daemon lifetimes:
+ * each draws its own restart nonce while both mint counters restart
+ * at 1, which is exactly the state a restart produces.
+ * ----------------------------------------------------------------------- */
+
+/* Low 32 bits of the nonce, as make_session_id() encodes them. */
+static uint32_t sid_nonce_lo32(const uint8_t sid[SESSION_ID_SIZE])
+{
+	return ((uint32_t)sid[12] << 24) | ((uint32_t)sid[13] << 16) |
+	       ((uint32_t)sid[14] << 8)  |  (uint32_t)sid[15];
+}
+
+static void test_ids_restart_unique(void)
+{
+	struct session_table *st1 = NULL;
+	struct session_table *st2 = NULL;
+	uint64_t cid1 = 0, cid2 = 0;
+	uint32_t seqid1 = 0, seqid2 = 0;
+	uint8_t sid1[SESSION_ID_SIZE];
+	uint8_t sid2[SESSION_ID_SIZE];
+	uint32_t fore = 0, back = 0;
+
+	/* "Boot 1". */
+	ASSERT_EQ(session_table_init(TEST_MDS_ID, 0, &st1), 0);
+	ASSERT_EQ(session_exchange_id(st1, owner_alice, owner_alice_len,
+				      verifier_a, 0,
+				      &cid1, &seqid1, NULL, 0, 0, 0), 0);
+	ASSERT_EQ(session_create_session(st1, cid1, seqid1,
+					 32, 4,
+					 0, 0,
+					 0, 0,
+					 0, 0,
+					 1,
+					 0, 0, 0,
+					 sid1, &fore, &back, NULL, NULL), 0);
+
+	/* "Boot 2": fresh table, so both mint counters restart at 1.
+	 * Without the nonce the identifiers would be bit-identical. */
+	ASSERT_EQ(session_table_init(TEST_MDS_ID, 0, &st2), 0);
+	ASSERT_EQ(session_exchange_id(st2, owner_alice, owner_alice_len,
+				      verifier_a, 0,
+				      &cid2, &seqid2, NULL, 0, 0, 0), 0);
+	ASSERT_EQ(session_create_session(st2, cid2, seqid2,
+					 32, 4,
+					 0, 0,
+					 0, 0,
+					 0, 0,
+					 1,
+					 0, 0, 0,
+					 sid2, &fore, &back, NULL, NULL), 0);
+
+	/* session_id: [mds:4][seq:8] match because both counters
+	 * restarted; the 32-bit nonce tail is what separates them. */
+	ASSERT_EQ(memcmp(sid1, sid2, 12), 0);
+	ASSERT_NE(sid_nonce_lo32(sid1), sid_nonce_lo32(sid2));
+	ASSERT_NE(memcmp(sid1, sid2, SESSION_ID_SIZE), 0);
+
+	/* clientid layout is [mds_id:16][nonce:16][counter:32].  Both
+	 * lifetimes restarted, so the counter field pins to 1 and the
+	 * mds_id field to TEST_MDS_ID. */
+	ASSERT_EQ(cid1 & 0xFFFFFFFFULL, 1);
+	ASSERT_EQ(cid2 & 0xFFFFFFFFULL, 1);
+	ASSERT_EQ(cid1 >> 48, (uint64_t)TEST_MDS_ID);
+	ASSERT_EQ(cid2 >> 48, (uint64_t)TEST_MDS_ID);
+
+	/* Both salts derive from the same nonce -- the session_id tail is
+	 * its low 32 bits, the clientid salt its low 16 -- so the two
+	 * must agree whatever value each table happened to draw.  This
+	 * pins both field positions without knowing the nonce.
+	 *
+	 * Note the clientid carries only 16 of those bits, so two
+	 * lifetimes CAN draw the same clientid salt; the session_id's
+	 * 32-bit tail above is the assertion that pins the
+	 * different-lifetimes property. */
+	ASSERT_EQ((cid1 >> 32) & 0xFFFFULL,
+		  (uint64_t)(sid_nonce_lo32(sid1) & 0xFFFFU));
+	ASSERT_EQ((cid2 >> 32) & 0xFFFFULL,
+		  (uint64_t)(sid_nonce_lo32(sid2) & 0xFFFFU));
+
+	session_table_destroy(st2);
+	session_table_destroy(st1);
+}
+
+/* -----------------------------------------------------------------------
  * main
  * ----------------------------------------------------------------------- */
 
@@ -1410,6 +1502,7 @@ int main(void)
 	RUN_TEST(test_sequence_misordered);
 	RUN_TEST(test_sequence_bad_session);
 	RUN_TEST(test_sequence_bad_slot);
+	RUN_TEST(test_ids_restart_unique);
 
 	/* Compound integration tests */
 	RUN_TEST(test_compound_full_flow);

@@ -26,6 +26,7 @@
 #include <unistd.h>
 #include <endian.h>
 #include <time.h>
+#include <sys/random.h>
 
 #include "pnfs_mds.h"
 #include "mds_catalogue.h"
@@ -64,6 +65,24 @@ struct session_table {
 	uint32_t             session_buckets;
 	uint64_t             next_clientid;
 	uint64_t             next_session_seq;
+	/*
+	 * Restart discriminator mixed into every minted session ID and
+	 * clientid, so identifiers from one daemon lifetime cannot
+	 * collide with those of the next.
+	 *
+	 * Drawn from the CSPRNG at init.  Both consumers truncate it --
+	 * 32 bits into the session ID tail, 16 into the clientid -- so
+	 * uniformly distributed bits are what matter here, not any
+	 * relation to wall-clock time.
+	 *
+	 * Deliberately local for now.  The daemon's boot epoch would be
+	 * the natural source, but it is computed only on the RonDB path
+	 * and from CLOCK_MONOTONIC, which restarts near zero on every
+	 * machine boot.  Once one daemon-wide restart identifier exists
+	 * and reaches every state table at init, this should take that
+	 * instead of drawing its own.
+	 */
+	uint64_t             restart_nonce;
 	uint32_t             mds_id;
 	uint32_t             lease_time_sec;
 	/*
@@ -400,7 +419,23 @@ static void free_client(struct session_table *st, struct nfs4_client *c)
 /* -----------------------------------------------------------------------
  * Internal: generate a session ID
  *
- * Layout: [mds_id 4B BE][session_counter 8B BE][0-pad 4B]
+ * Layout: [mds_id 4B BE][session_counter 8B BE][nonce_lo32 4B BE]
+ *
+ * The trailing 4 bytes carry the low 32 bits of the table's restart
+ * nonce.  Without them next_session_seq restarts at 1 on every
+ * session_table_init(), so a fresh daemon start mints session IDs
+ * bit-identical to the previous start's.  A client still holding a
+ * pre-restart session ID then finds a DIFFERENT, freshly created
+ * session answering to the same ID: its SEQUENCE draws
+ * NFS4ERR_SEQ_MISORDERED (session "valid", slot sequence wrong)
+ * instead of the clean NFS4ERR_BADSESSION that starts recovery.  That
+ * cannot converge, because the slot the client is trying to
+ * resynchronise carries another client's traffic.
+ *
+ * Bucket distribution is unaffected: hash_session_id() and
+ * session_id_shard() both hash the first 8 bytes only.  Identity
+ * comparisons (find_session) use all 16, which is what lets the tail
+ * discriminate.
  * ----------------------------------------------------------------------- */
 
 static void make_session_id(struct session_table *st,
@@ -408,10 +443,13 @@ static void make_session_id(struct session_table *st,
 {
 	uint32_t mds_be = htobe32(st->mds_id);
 	uint64_t seq_be = htobe64(st->next_session_seq++);
+	uint32_t nonce_lo_be =
+		htobe32((uint32_t)(st->restart_nonce & 0xFFFFFFFFu));
 
 	memset(out, 0, SESSION_ID_SIZE);
 	memcpy(out, &mds_be, 4);
 	memcpy(out + 4, &seq_be, 8);
+	memcpy(out + 12, &nonce_lo_be, 4);
 }
 
 /* -----------------------------------------------------------------------
@@ -477,8 +515,46 @@ int session_table_init_ex(uint32_t mds_id, uint32_t lease_time_sec,
 	}
 
 	st->mds_id = mds_id;
-	st->next_clientid = ((uint64_t)mds_id << 48) | 1;
+	/*
+	 * Plain mint counter; the wire clientid is assembled at mint
+	 * time as [mds_id:16][restart_nonce:16][counter:32].
+	 *
+	 * The salt is there for the same reason as the one in
+	 * make_session_id(): without it a fresh start re-mints clientids
+	 * from [mds_id][1], bit-identical to the previous start's, and a
+	 * client still holding its pre-restart clientid finds a
+	 * DIFFERENT, freshly minted record answering to the same number.
+	 * Its CREATE_SESSION then draws NFS4ERR_SEQ_MISORDERED instead
+	 * of the clean NFS4ERR_STALE_CLIENTID that begins recovery, and
+	 * the Linux state manager escalates to a verifier reset whose
+	 * RFC 8881 18.35.4 case-5 supersede destroys every open and
+	 * byte-range lock the client had just re-established.
+	 *
+	 * Only 16 bits of the nonce fit here, so two lifetimes whose
+	 * low-16 bits coincide can still re-mint the same clientids --
+	 * a 1-in-65536 draw rather than a certainty.  The session ID
+	 * tail carries 32 bits and is correspondingly stronger.
+	 */
+	st->next_clientid = 1;
 	st->next_session_seq = 1;
+	/* Restart discriminator -- see restart_nonce.  getrandom() with
+	 * the same degraded fallback mds_ds_synth_gen() uses, so a CSPRNG
+	 * failure still yields a value that varies per table rather than
+	 * a constant. */
+	{
+		uint64_t nonce = 0;
+
+		if (getrandom(&nonce, sizeof(nonce), 0) !=
+		    (ssize_t)sizeof(nonce)) {
+			struct timespec ts;
+
+			(void)clock_gettime(CLOCK_REALTIME, &ts);
+			nonce = ((uint64_t)ts.tv_sec * 1000000000ULL +
+				 (uint64_t)ts.tv_nsec) ^
+				((uint64_t)(uintptr_t)st * 2654435761ULL);
+		}
+		st->restart_nonce = nonce;
+	}
 	st->lease_time_sec = (lease_time_sec > 0)
 		? lease_time_sec : SESSION_DEFAULT_LEASE_SEC;
 	st->max_fore_slots = SESSION_MAX_SLOTS;
@@ -691,11 +767,26 @@ static int session_alloc_new_client(struct session_table *st,
 
 	if (use_recovered_id) {
 		c->clientid = recovered_clientid;
-		if (st->next_clientid <= recovered_clientid) {
-			st->next_clientid = recovered_clientid + 1;
+		/* Advance the mint counter past a recovered id only when
+		 * that id carries this lifetime's mds_id and nonce, since
+		 * only such an id shares the space this lifetime mints
+		 * from.  A recovered id whose salt happens to coincide also
+		 * advances the counter, which is the safe direction. */
+		if ((recovered_clientid >> 48) == (uint64_t)st->mds_id &&
+		    ((recovered_clientid >> 32) & 0xFFFFULL) ==
+		    (st->restart_nonce & 0xFFFFULL)) {
+			uint64_t rctr = recovered_clientid & 0xFFFFFFFFULL;
+
+			if (st->next_clientid <= rctr) {
+				st->next_clientid = rctr + 1;
+			}
 		}
 	} else {
-		c->clientid = st->next_clientid++;
+		/* [mds_id:16][restart_nonce:16][counter:32] -- see the
+		 * next_clientid init comment for why the salt is here. */
+		c->clientid = ((uint64_t)st->mds_id << 48) |
+			      ((st->restart_nonce & 0xFFFFULL) << 32) |
+			      (st->next_clientid++ & 0xFFFFFFFFULL);
 	}
 	memcpy(c->co_ownerid, co_ownerid, co_ownerid_len);
 	c->co_ownerid_len = co_ownerid_len;
