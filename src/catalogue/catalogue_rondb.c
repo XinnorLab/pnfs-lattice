@@ -2885,6 +2885,16 @@ enum mds_status catalogue_rondb_ns_create_with_layout(
 	uint32_t child_synth_sgid = 0;
 
 	uint64_t child_fid = 0;
+	/*
+	 * Does the popped slot have a persisted mds_prealloc_pool row?
+	 * When it does, ds_prealloc_pop_ex() leaves the row in place and
+	 * the fused shim below deletes it inside the create commit
+	 * instead.  The row is keyed by the same fileid the child inode
+	 * gets (child_fid), so this flag is the only extra input the shim
+	 * needs.  False for the ring-empty synchronous fallback, which
+	 * allocates a fileid inline and never writes a pool row.
+	 */
+	bool prealloc_has_pool_row = false;
 	if (type == MDS_FTYPE_REG && prealloc != NULL) {
 		struct mds_ds_map_entry ds_entry;
 		uint32_t stripe_unit = 0;
@@ -2903,8 +2913,9 @@ enum mds_status catalogue_rondb_ns_create_with_layout(
 		 * on the layout DS.  One pop, one placement decision,
 		 * used everywhere below.
 		 */
-		if (ds_prealloc_pop(prealloc, &ds_entry, &stripe_unit,
-				    &prealloc_fid) == 0) {
+		if (ds_prealloc_pop_ex(prealloc, &ds_entry, &stripe_unit,
+				       &prealloc_fid,
+				       &prealloc_has_pool_row) == 0) {
 			layout_ds_id = ds_entry.ds_id;
 			layout_ds_count = 1;
 			if (prealloc_fid != 0) {
@@ -3003,7 +3014,14 @@ enum mds_status catalogue_rondb_ns_create_with_layout(
 			layout_stateid ? layout_stateid->other : NULL,
 			layout_stateid ? layout_stateid->seqid : 0,
 			layout_ds_count > 0 ? &layout_ds_id : NULL,
-			layout_ds_count, layout_mds_id);
+			layout_ds_count, layout_mds_id,
+			/* Delete the pre-alloc pool row in this same
+			 * commit.  It is keyed by child_fid -- the one
+			 * fileid the popped slot carried.  0 tells the
+			 * shim to skip the delete: no slot was popped, or
+			 * it came from the synchronous fallback, which
+			 * never persisted a row. */
+			prealloc_has_pool_row ? child_fid : 0);
 		if (rc != -2) {
 			break;
 		}

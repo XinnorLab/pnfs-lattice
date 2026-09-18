@@ -7851,7 +7851,8 @@ int rondb_shim_ns_create_with_layout(
     uint64_t layout_offset, uint64_t layout_length,
     const uint8_t layout_stateid_other[12], uint32_t layout_seqid,
     const uint32_t *layout_ds_ids, uint32_t layout_ds_count,
-    uint32_t layout_mds_id)
+    uint32_t layout_mds_id,
+    uint64_t prealloc_pool_fileid)
 {
     rondb_shim_handle *state = rondb_checked_handle(handle, nullptr);
     NdbDictionary::Dictionary *dict;
@@ -8178,7 +8179,57 @@ int rondb_shim_ns_create_with_layout(
         }
     }
 
-    /* Single Commit covering dirent + inode + parent + stripe + layout.
+    /*
+     * 6. Delete the pre-alloc pool row for the fileid this CREATE is
+     *    consuming, inside this same transaction.
+     *
+     *    mds_prealloc_pool is partitioned by fileid -- the same
+     *    partition this transaction already writes the child inode,
+     *    stripe and layout rows to -- so the delete adds no new
+     *    commit participant, and the CREATE loses a whole NDB
+     *    transaction.
+     *
+     *    It also narrows a consistency window.  recover_pool() pushes
+     *    every surviving pool row back into a ring without checking
+     *    whether that fileid has an inode, so "a pool row exists"
+     *    needs to mean "that fileid is unconsumed".  Doing the delete
+     *    in its own transaction, before the create, left that to a
+     *    separate commit that could fail on its own; doing it here
+     *    ties the two together.
+     *
+     *    AO_IgnoreError: produce_slot()'s pool insert is best-effort
+     *    and its result discarded, so a ring slot can name a fileid
+     *    whose row was never written and this delete can legitimately
+     *    hit a 626.  Ignoring per-op errors keeps that from aborting
+     *    the CREATE.  Note the cost: NDB ignores ALL errors on the
+     *    operation, not just 626, so a delete that fails for another
+     *    reason is swallowed and leaves the row behind.  That hole is
+     *    narrower than the separate-transaction one it replaces but
+     *    is not closed; fixing it needs the producer to report
+     *    truthfully whether the row exists, which is deferred.
+     *
+     *    A caller holding no reservation -- the ring-empty fallback,
+     *    which allocates its fileid inline -- passes 0, and the op is
+     *    skipped.
+     */
+    if (prealloc_pool_fileid != 0) {
+        const NdbDictionary::Table *pp_tbl =
+            dict->getTable(RONDB_TBL_PREALLOC_POOL);
+        if (pp_tbl != nullptr) {
+            NdbOperation *pp_op = tx->getNdbOperation(pp_tbl);
+            if (pp_op != nullptr) {
+                pp_op->deleteTuple();
+                (void)rondb_equal_u64(pp_op, RONDB_PP_COL_FILEID,
+                                      prealloc_pool_fileid);
+                (void)pp_op->setAbortOption(
+                    NdbOperation::AO_IgnoreError);
+                track(pp_op, "prealloc_pool_delete");
+            }
+        }
+    }
+
+    /* Single Commit covering dirent + inode + parent + stripe + layout
+     * + pre-alloc pool delete.
      * Async mode routes it through the batch pipeline. */
     {
         int commit_rc = use_async
@@ -8226,7 +8277,8 @@ int rondb_shim_ns_create_wide(
     return rondb_shim_ns_create_with_layout(
         handle, parent_fileid, name, child_inode_buf, child_ino_len,
         0, stripe_buf, stripe_len, stripe_count, stripe_unit, mirror_count,
-        0, 0, 0, 0, nullptr, 0, nullptr, 0, 0);
+        0, 0, 0, 0, nullptr, 0, nullptr, 0, 0,
+        /* prealloc_pool_fileid */ 0);
 }
 
 /* -----------------------------------------------------------------------
