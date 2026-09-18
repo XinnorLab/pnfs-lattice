@@ -986,33 +986,28 @@ enum mds_status mds_proxy_ensure_ds_file(const struct mds_proxy_ctx *ctx,
         return MDS_ERR_IO;
 }
 
-    fd = open(file_path, O_WRONLY | O_CREAT, 0666);
-    if (fd < 0) {
-        return MDS_ERR_IO;
-    }
-
     /*
-     * RFC 8435 S2.2.1: In the loosely coupled model, the MDS
-     * MUST set the owner of the data file to the synthetic
-     * uid/gid so that the client's AUTH_SYS credentials
-     * (from ffl_user/ffl_group in the layout) pass the DS's
-     * permission check.
+     * Mode 0666: the DS backing file must be writable by whatever
+     * AUTH_SYS uid the client presents, which for an ordinary
+     * workload is not root.  The DS is a backend store gated by the
+     * MDS layout grant, so a permissive backing-file mode is the
+     * model here.
      *
-     * Mode 0666: the DS backing file must be writable by the
-     * client's real AUTH_SYS uid, which for an ordinary (non-root)
-     * workload is NOT root -- so the old 0600 + "rely on
-     * no_root_squash" model silently blocked every non-root client
-     * with EACCES.  Aligning ownership via a post-create path chown
-     * is racy (the fresh file is not yet visible through the MDS's
-     * NFS mount of the DS, so the chown hits ENOENT), which left the
-     * file 0600 and unwritable.  In this trusted pNFS cluster the DS
-     * is a backend store gated by the MDS layout grant, so a
-     * permissive backing-file mode is the correct, race-free model.
+     * O_EXCL distinguishes create from already-exists.  open()'s
+     * mode argument is masked by the daemon umask, so the fchmod is
+     * what actually sets 0666, and only the creating caller needs
+     * it -- an existing file already carries the mode.
      */
-    (void)fchmod(fd, 0666);
-    close(fd);
-
-    return MDS_OK;
+    fd = open(file_path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (fd >= 0) {
+        (void)fchmod(fd, 0666);
+        close(fd);
+        return MDS_OK;
+    }
+    if (errno == EEXIST) {
+        return MDS_OK;   /* Already present: nothing to do. */
+    }
+    return MDS_ERR_IO;
 }
 
 /* -----------------------------------------------------------------------
@@ -1189,15 +1184,16 @@ enum mds_status mds_proxy_ensure_ds_file_fh(
                           fileid, stripe, mirror) != 0) {
             goto fallback_rpc;
         }
-        fd = open(file_path, O_WRONLY | O_CREAT, 0666);
-        if (fd < 0) {
+        /* O_EXCL distinguishes create from already-exists; the
+         * fchmod is issued only on the branch that created the file.
+         * See the mode rationale in mds_proxy_ensure_ds_file above. */
+        fd = open(file_path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+        if (fd >= 0) {
+            (void)fchmod(fd, 0666);
+            close(fd);
+        } else if (errno != EEXIST) {
             goto fallback_rpc;
         }
-        /* 0666: DS backing file must be writable by the client's
-         * real (non-root) AUTH_SYS uid; see the mode rationale in
-         * mds_proxy_ensure_ds_file above. */
-        (void)fchmod(fd, 0666);
-        close(fd);
 
         clock_gettime(CLOCK_MONOTONIC, &t1);
 
