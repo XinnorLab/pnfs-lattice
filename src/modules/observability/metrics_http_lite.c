@@ -15,6 +15,13 @@
  *   - HTTP/1.0 with explicit Connection: close so we never have
  *     to manage keep-alive state.
  *
+ *   - Graceful close: the request is fully consumed before we
+ *     reply, and the socket is shut down write-side then drained to
+ *     EOF before close().  close() on a socket that still has
+ *     unread data queued makes Linux emit RST instead of FIN, and
+ *     the RST discards whatever is still sitting in our send
+ *     buffer -- a silently truncated scrape.
+ *
  *   - Accept any path -- /metrics, /, /healthz, etc. all return
  *     the Prometheus body.  Saves clients (and operators
  *     curl'ing for sanity checks) from path mistakes.
@@ -49,10 +56,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #define METRICS_HTTP_BODY_CAP (256 * 1024)
+
+/* Bound how long a single scrape connection may occupy the
+ * single-threaded accept loop.  Scrapes are cheap and usually local;
+ * a peer that stalls mid-request must not wedge the endpoint. */
+#define METRICS_HTTP_IO_TIMEOUT_SEC 5
+
+/* Upper bound on the request bytes buffered while looking for the end
+ * of the headers. */
+#define METRICS_HTTP_REQ_MAX 8192
 
 struct metrics_http_ctx {
     int                   listen_fd;
@@ -183,26 +200,82 @@ static int write_all(int fd, const char *buf, size_t n)
     return 0;
 }
 
-/* Consume the request line + headers up to the first blank line.
- * We do not parse anything (any path returns metrics); we just
- * need to drain enough that the client's send buffer can flush
- * before we reply.  Reads cap out at 8 KiB; oversize requests
- * are dropped. */
-static void drain_request(int fd)
+/* Apply a send/receive deadline to an accepted connection so no
+ * single peer can block the accept loop indefinitely. */
+static void set_io_timeouts(int fd)
 {
-    char    buf[2048];
-    ssize_t n;
-    int     attempts = 0;
+    struct timeval tv;
 
-    while (attempts++ < 4) {
-        n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
-        if (n <= 0) {
-            return;
+    tv.tv_sec  = METRICS_HTTP_IO_TIMEOUT_SEC;
+    tv.tv_usec = 0;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+/* Consume the request line + headers up to the first blank line.
+ *
+ * Nothing is parsed (any path returns metrics), but the request MUST
+ * be consumed: close() on a socket whose receive queue still holds
+ * data makes Linux send RST instead of FIN, and the RST throws away
+ * any response bytes still queued in our send buffer -- truncating
+ * the scrape mid-line after the client has already been promised a
+ * larger Content-Length.
+ *
+ * Reads block, bounded by SO_RCVTIMEO, and bytes accumulate across
+ * reads so a "\r\n\r\n" straddling two segments is still found.
+ * Returns 0 once the headers are consumed, -1 on EOF, error, timeout,
+ * or an oversize request.
+ */
+static int drain_request(int fd)
+{
+    char   buf[METRICS_HTTP_REQ_MAX];
+    size_t used = 0;
+
+    while (used < sizeof(buf)) {
+        ssize_t n = recv(fd, buf + used, sizeof(buf) - used, 0);
+
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;  /* timeout (EAGAIN/EWOULDBLOCK) or hard error */
         }
-        if (memmem(buf, (size_t)n, "\r\n\r\n", 4) != NULL) {
-            return;
+        if (n == 0) {
+            return -1;  /* peer closed before finishing the request */
+        }
+        used += (size_t)n;
+        if (memmem(buf, used, "\r\n\r\n", 4) != NULL) {
+            return 0;
         }
     }
+    return -1;          /* oversize request headers */
+}
+
+/* Close a served connection without truncating the response.
+ *
+ * Send FIN first, then read until the peer's FIN arrives (or the
+ * receive deadline fires), so close() never runs with unread data in
+ * the receive queue and therefore never degenerates into an RST.  Any
+ * trailing bytes the client sent -- a pipelined request, a request
+ * body -- are read and discarded. */
+static void close_gracefully(int fd)
+{
+    char buf[1024];
+
+    if (shutdown(fd, SHUT_WR) == 0) {
+        for (;;) {
+            ssize_t n = recv(fd, buf, sizeof(buf), 0);
+
+            if (n > 0) {
+                continue;   /* trailing bytes: discard */
+            }
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            break;          /* 0 = peer FIN, <0 = timeout/error */
+        }
+    }
+    close(fd);
 }
 
 static void handle_connection(int conn_fd, struct mds_catalogue *cat)
@@ -222,7 +295,13 @@ static void handle_connection(int conn_fd, struct mds_catalogue *cat)
         return;
     }
 
-    drain_request(conn_fd);
+    /* Consume the request before replying.  A peer that never
+     * finished sending one has nothing useful to receive, and
+     * answering anyway would leave bytes unread at close(). */
+    if (drain_request(conn_fd) != 0) {
+        free(body);
+        return;
+    }
 
     body_len = render_metrics_body(cat, body, METRICS_HTTP_BODY_CAP);
     if (body_len < 0) {
@@ -247,8 +326,12 @@ static void handle_connection(int conn_fd, struct mds_catalogue *cat)
         free(body);
         return;
     }
-    (void)write_all(conn_fd, header, (size_t)header_len);
-    (void)write_all(conn_fd, body, (size_t)body_len);
+    /* Skip the body when the header write already failed -- the peer
+     * is gone and the second write would only queue bytes nobody
+     * will read. */
+    if (write_all(conn_fd, header, (size_t)header_len) == 0) {
+        (void)write_all(conn_fd, body, (size_t)body_len);
+    }
     free(body);
 }
 
@@ -275,8 +358,9 @@ static void *accept_loop(void *arg)
             return NULL;
         }
 
+        set_io_timeouts(conn_fd);
         handle_connection(conn_fd, ctx->cat);
-        close(conn_fd);
+        close_gracefully(conn_fd);
     }
 }
 
