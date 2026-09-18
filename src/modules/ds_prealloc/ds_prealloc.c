@@ -59,6 +59,14 @@
 #define DS_PREALLOC_MIN_RING_DEPTH       8U
 #define DS_PREALLOC_REFILL_BACKOFF_NS    (20U * 1000U * 1000U) /* 20 ms */
 #define DS_PREALLOC_PLAN_CACHE           8U
+/*
+ * Lifetime of the cached DS registry snapshot (see ds_list_snapshot).
+ * The mds_ds_registry rows it mirrors change when a DS is added or
+ * removed and when the ds_health poller flips a DS state, and that
+ * poller runs every ds_heartbeat_ms (default 5 s), so a 1 s snapshot
+ * is never the freshness bottleneck.
+ */
+#define DS_PREALLOC_DS_LIST_TTL_NS       (1000ULL * 1000ULL * 1000ULL)
 
 /*
  * Cached wide-batch placement decision.  Back-to-back CREATEs into the
@@ -124,6 +132,13 @@ struct ds_prealloc_ctx {
     struct prealloc_plan        plans[DS_PREALLOC_PLAN_CACHE];
     uint32_t                    plan_rr;
 
+    /* TTL-cached DS registry snapshot -- see ds_list_snapshot(). */
+    pthread_mutex_t             ds_list_lock;
+    struct mds_ds_info         *ds_list_cache;
+    uint32_t                    ds_list_count;
+    struct timespec             ds_list_stamp;   /* CLOCK_MONOTONIC */
+    bool                        ds_list_valid;
+
     _Atomic bool                stop;
     bool                        synthetic_fh;
     bool                        synth_owner;   /* v8: ds_synth_owner mode */
@@ -166,6 +181,109 @@ static bool ds_belongs_to_ring(const struct ds_prealloc_ctx *ctx,
     return (((p / csz) % ctx->ring_count) == ring_index);
 }
 
+/* Monotonic nanoseconds elapsed from @a to @b, clamped at 0. */
+static uint64_t ts_since_ns(const struct timespec *a,
+                            const struct timespec *b)
+{
+    int64_t delta = ((int64_t)(b->tv_sec - a->tv_sec) * 1000000000LL) +
+                    (int64_t)(b->tv_nsec - a->tv_nsec);
+
+    return (delta < 0) ? 0U : (uint64_t)delta;
+}
+
+/*
+ * Serve the DS registry from a snapshot refreshed at most once per
+ * DS_PREALLOC_DS_LIST_TTL_NS.
+ *
+ * ring_select_ds() needs the registry once per produced slot, so a
+ * read per call puts a full scan of mds_ds_registry behind every
+ * preallocated file.  The refill workers sit off the create critical
+ * path, but those scans compete with the create transactions for the
+ * same cluster capacity, and the rows they read are the same every
+ * time.
+ *
+ * Returns a private malloc'd copy, keeping mds_cat_ds_list()'s
+ * contract that the caller frees.  The copy is necessary rather than
+ * incidental: callers pass the array to ds_cache_overlay_weights(),
+ * which rewrites weight and capacity in place, and the shared
+ * snapshot must not be written by several refill workers at once.
+ *
+ * Refreshing under ds_list_lock means that when the TTL expires one
+ * worker scans while its siblings wait briefly and reuse the result.
+ *
+ * Staleness costs a wasted slot, not correctness.  The snapshot
+ * carries each row's state column, which is what placement filters
+ * on, so a DS that has just left DS_ONLINE can still be picked;
+ * produce_slot()'s mds_proxy_ensure_ds_file_fh() then fails, the slot
+ * is not published, and the worker backs off -- the path any
+ * transient DS error already takes.  Placement weights and capacity
+ * do not age with the snapshot: ds_cache_overlay_weights() supplies
+ * those from the live DS cache on every call.
+ *
+ * A failed refresh goes to the caller rather than being answered from
+ * the previous snapshot, so the age of what callers see stays bounded
+ * by the TTL, and each caller retries the scan until one succeeds.
+ * Refusing to serve the older list gives nothing up: every caller
+ * follows this with mds_cat_alloc_fileid() against the same
+ * catalogue, so a stale list would not let the work proceed anyway.
+ */
+static enum mds_status ds_list_snapshot(struct ds_prealloc_ctx *ctx,
+                                        struct mds_ds_info **out,
+                                        uint32_t *out_count)
+{
+    struct mds_ds_info *copy = NULL;
+    struct timespec now;
+
+    *out = NULL;
+    *out_count = 0;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        /* No usable clock -- read straight through. */
+        return mds_cat_ds_list((struct mds_catalogue *)ctx->cat,
+                               out, out_count);
+    }
+
+    pthread_mutex_lock(&ctx->ds_list_lock);
+
+    if (!ctx->ds_list_valid ||
+        ts_since_ns(&ctx->ds_list_stamp, &now) >=
+            DS_PREALLOC_DS_LIST_TTL_NS) {
+        struct mds_ds_info *fresh = NULL;
+        uint32_t fresh_count = 0;
+        enum mds_status st;
+
+        st = mds_cat_ds_list((struct mds_catalogue *)ctx->cat,
+                             &fresh, &fresh_count);
+        if (st != MDS_OK) {
+            free(fresh);
+            pthread_mutex_unlock(&ctx->ds_list_lock);
+            return st;
+        }
+        free(ctx->ds_list_cache);
+        ctx->ds_list_cache = fresh;
+        ctx->ds_list_count = fresh_count;
+        ctx->ds_list_stamp = now;
+        ctx->ds_list_valid = true;
+    }
+
+    if (ctx->ds_list_cache != NULL && ctx->ds_list_count > 0) {
+        size_t bytes = (size_t)ctx->ds_list_count * sizeof(*copy);
+
+        copy = malloc(bytes);
+        if (copy == NULL) {
+            pthread_mutex_unlock(&ctx->ds_list_lock);
+            return MDS_ERR_NOMEM;
+        }
+        memcpy(copy, ctx->ds_list_cache, bytes);
+        *out_count = ctx->ds_list_count;
+    }
+
+    pthread_mutex_unlock(&ctx->ds_list_lock);
+
+    *out = copy;
+    return MDS_OK;
+}
+
 /*
  * Snapshot ONLINE DSes assigned to @ring, overlay live weights, and run
  * the placement policy to choose one ds_id.  Returns MDS_OK with
@@ -183,8 +301,7 @@ static enum mds_status ring_select_ds(struct ds_prealloc_ctx *ctx,
 
     memset(entry, 0, sizeof(*entry));
 
-    st = mds_cat_ds_list((struct mds_catalogue *)ctx->cat, &ds_list,
-                         &ds_count);
+    st = ds_list_snapshot(ctx, &ds_list, &ds_count);
     if (st != MDS_OK) {
         return st;
     }
@@ -374,8 +491,7 @@ static int sync_pop(struct ds_prealloc_ctx *ctx,
     if (fileid_out != NULL) { *fileid_out = 0; }
     memset(entry, 0, sizeof(*entry));
 
-    st = mds_cat_ds_list((struct mds_catalogue *)ctx->cat, &ds_list,
-                         &ds_count);
+    st = ds_list_snapshot(ctx, &ds_list, &ds_count);
     if (st != MDS_OK || ds_list == NULL || ds_count == 0) {
         free(ds_list);
         return -1;
@@ -428,6 +544,8 @@ static void ctx_free(struct ds_prealloc_ctx *ctx)
         free(ctx->plans[i].ds_ids);
     }
     pthread_mutex_destroy(&ctx->plan_lock);
+    free(ctx->ds_list_cache);
+    pthread_mutex_destroy(&ctx->ds_list_lock);
     if (ctx->rings != NULL) {
         for (uint32_t i = 0; i < ctx->ring_count; i++) {
             free(ctx->rings[i].slots);
@@ -573,6 +691,7 @@ int ds_prealloc_init_ex2(const struct mds_catalogue *cat,
     ctx->cluster_size = (cluster_size >= 1U) ? cluster_size : 1U;
     atomic_store_explicit(&ctx->stop, false, memory_order_relaxed);
     pthread_mutex_init(&ctx->plan_lock, NULL);
+    pthread_mutex_init(&ctx->ds_list_lock, NULL);
 
     if (pool_size == 0U) {
         pool_size = 128U;
@@ -780,8 +899,8 @@ enum mds_status ds_prealloc_select_any_online(
         return MDS_ERR_INVAL;
     }
     if (stripe_unit != NULL) { *stripe_unit = ctx->stripe_unit; }
-    st = mds_cat_ds_list((struct mds_catalogue *)ctx->cat, &ds_list,
-                         &ds_count);
+    st = ds_list_snapshot((struct ds_prealloc_ctx *)ctx, &ds_list,
+                          &ds_count);
     if (st != MDS_OK) {
         return st;
     }
