@@ -418,6 +418,24 @@ void mds_proxy_set_fh_knfsd_strict(struct mds_proxy_ctx *ctx,
  * DS mount registration
  * ----------------------------------------------------------------------- */
 
+/**
+ * Create the {mount}/data subdirectory.
+ *
+ * Called once per DS at registration, and thereafter only as an ENOENT
+ * recovery step in mds_proxy_ensure_ds_file{,_fh}() -- never on the
+ * steady-state path.
+ */
+static void ds_data_dir_ensure(const char *mount_path)
+{
+    char dir_path[MDS_MAX_PATH];
+
+    if (mount_path == NULL || mount_path[0] == '\0') {
+        return;
+    }
+    (void)snprintf(dir_path, sizeof(dir_path), "%s/data", mount_path);
+    (void)mkdir(dir_path, 0755);  /* Ignore EEXIST. */
+}
+
 enum mds_status mds_proxy_mount_set(struct mds_proxy_ctx *ctx,
                                     uint32_t ds_id,
                                     const char *mount_path)
@@ -434,6 +452,20 @@ enum mds_status mds_proxy_mount_set(struct mds_proxy_ctx *ctx,
              sizeof(ctx->mounts[ds_id].path),
              "%s", mount_path);
     ctx->mounts[ds_id].registered = true;
+
+    /*
+     * Create {mount}/data once here rather than on every
+     * ensure_ds_file*() call.  mkdir() takes the exclusive parent
+     * i_rwsem before it can discover EEXIST, so a per-call mkdir
+     * serialises every worker thread and every prealloc refill
+     * thread touching this DS behind one lock.
+     *
+     * Best-effort: the NFS mount may not be up yet at registration,
+     * in which case this lands on the underlying mountpoint and is
+     * shadowed once the mount appears.  The ENOENT retry in both
+     * ensure_ds_file*() paths is the backstop.
+     */
+    ds_data_dir_ensure(mount_path);
     return MDS_OK;
 }
 
@@ -961,7 +993,6 @@ enum mds_status mds_proxy_ensure_ds_file(const struct mds_proxy_ctx *ctx,
                                          uint32_t mirror)
 {
     const char *mount;
-    char dir_path[MDS_MAX_PATH];
     char file_path[MDS_MAX_PATH];
     int fd;
 
@@ -976,11 +1007,9 @@ enum mds_status mds_proxy_ensure_ds_file(const struct mds_proxy_ctx *ctx,
         return MDS_ERR_NOTFOUND;
 }
 
-    /* Ensure data/ subdirectory exists. */
-    (void)snprintf(dir_path, sizeof(dir_path), "%s/data", mount);
-    (void)mkdir(dir_path, 0755);  /* Ignore EEXIST. */
-
-    /* Create the data file if absent. */
+    /* {mount}/data is created once per DS at registration
+     * (mds_proxy_mount_set); the ENOENT retry below is the only
+     * thing that recreates it. */
     if (build_ds_path(file_path, sizeof(file_path), mount,
                       fileid, stripe, mirror) != 0) {
         return MDS_ERR_IO;
@@ -999,6 +1028,18 @@ enum mds_status mds_proxy_ensure_ds_file(const struct mds_proxy_ctx *ctx,
      * it -- an existing file already carries the mode.
      */
     fd = open(file_path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (fd < 0 && errno == ENOENT) {
+        /* {mount}/data should always exist -- DS provisioning creates
+         * it and registration recreates it -- so reaching here means
+         * an invariant is already broken.  The likeliest cause is
+         * that the DS is not mounted, which makes {mount} an ordinary
+         * local directory: the retry below then creates the backing
+         * file on the MDS's own disk while the catalogue records it
+         * as living on the DS.  Nothing here distinguishes that from
+         * a genuinely missing subdirectory on a healthy mount. */
+        ds_data_dir_ensure(mount);
+        fd = open(file_path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+    }
     if (fd >= 0) {
         (void)fchmod(fd, 0666);
         close(fd);
@@ -1169,17 +1210,11 @@ enum mds_status mds_proxy_ensure_ds_file_fh(
      * Requires the DS to be NFS-mounted on the MDS.
      */
     if (mount != NULL) {
-        char dir_path[MDS_MAX_PATH];
         int fd;
         struct timespec t0, t1, t2;
 
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
-        /* Ensure data/ subdirectory exists. */
-        (void)snprintf(dir_path, sizeof(dir_path), "%s/data", mount);
-        (void)mkdir(dir_path, 0755);
-
-        /* Create the file if absent. */
         if (build_ds_path(file_path, sizeof(file_path), mount,
                           fileid, stripe, mirror) != 0) {
             goto fallback_rpc;
@@ -1188,6 +1223,14 @@ enum mds_status mds_proxy_ensure_ds_file_fh(
          * fchmod is issued only on the branch that created the file.
          * See the mode rationale in mds_proxy_ensure_ds_file above. */
         fd = open(file_path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+        /* See the ENOENT note in mds_proxy_ensure_ds_file above: this
+         * recovers a missing {mount}/data, but does not distinguish an
+         * unmounted DS from a healthy mount whose subdirectory went
+         * away. */
+        if (fd < 0 && errno == ENOENT) {
+            ds_data_dir_ensure(mount);
+            fd = open(file_path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+        }
         if (fd >= 0) {
             (void)fchmod(fd, 0666);
             close(fd);
