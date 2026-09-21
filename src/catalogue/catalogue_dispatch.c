@@ -682,11 +682,14 @@ enum mds_status mds_cat_ns_dirent_name_for_child(
         name_out == NULL || name_out_len == 0) {
         return MDS_ERR_INVAL;
     }
-    if (cat->auth_ops->dirent_name_for_child != NULL) {
-        return cat->auth_ops->dirent_name_for_child(
-            cat, parent_fileid, child_fileid, name_out, name_out_len);
+    /* Absent slot is NOSUPPORT (C4/C5), not NOTFOUND: NOTFOUND is the
+     * slot's own answer for a child that is not in the directory, and
+     * the cookie-resume fallback below treats it as a stale cookie. */
+    if (cat->auth_ops->dirent_name_for_child == NULL) {
+        return MDS_ERR_NOSUPPORT;
     }
-    return MDS_ERR_NOTFOUND;
+    return cat->auth_ops->dirent_name_for_child(
+        cat, parent_fileid, child_fileid, name_out, name_out_len);
 }
 
 /* -----------------------------------------------------------------------
@@ -844,7 +847,10 @@ enum mds_status mds_cat_ns_readdir_plus_from_cookie(
      * order via the existing readdir_plus path (which carries its own
      * cookie guard).  Valid only while the backend assigns cookie =
      * child fileid, i.e. for every in-tree backend without the cursor
-     * slot today. */
+     * slot today.  A backend with neither slot cannot resume at all:
+     * that is MDS_ERR_NOSUPPORT from the name lookup and propagates
+     * unchanged -- converting it to MDS_OK would silently end every
+     * directory listing at its second page. */
     if (cookie != 0) {
         st = mds_cat_ns_dirent_name_for_child(cat, parent_fileid, cookie,
                                               start_name,

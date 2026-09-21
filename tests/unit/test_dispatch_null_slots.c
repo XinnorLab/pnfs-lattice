@@ -114,6 +114,19 @@ static int remove_pending_cb(const struct mds_remove_pending_entry *entry,
     return 0;
 }
 
+static int readdir_plus_cb(const struct mds_cat_dirent *entry,
+                           const struct mds_inode *inode,
+                           bool inode_valid, void *arg)
+{
+    int *calls = arg;
+
+    (void)entry;
+    (void)inode;
+    (void)inode_valid;
+    (*calls)++;
+    return 0;
+}
+
 /* --- Inline data / xattr ---------------------------------------------- */
 
 static void test_inline_nosupport(void)
@@ -303,6 +316,27 @@ static void test_ext_dirent_link_anchor_nosupport(void)
     ASSERT_EQ(mds_cat_link_anchor_del(&cat, NULL, 7), MDS_ERR_NOSUPPORT);
 }
 
+/* --- READDIR cookie resume ---------------------------------------------- */
+
+/* A backend with neither ns_readdir_plus_from nor dirent_name_for_child
+ * cannot resume a READDIR from a cookie.  The dispatcher must say so
+ * (NOSUPPORT, and no entry delivered) rather than answer an empty,
+ * drained page: that MDS_OK would silently end every directory listing
+ * at its second page. */
+static void test_readdir_cookie_resume_nosupport(void)
+{
+    struct mds_catalogue cat = make_test_cat();
+    char name[MDS_MAX_NAME + 1];
+    int calls = 0;
+
+    ASSERT_EQ(mds_cat_ns_dirent_name_for_child(&cat, 2, 42, name, sizeof(name)),
+              MDS_ERR_NOSUPPORT);
+    ASSERT_EQ(mds_cat_ns_readdir_plus_from_cookie(&cat, 2, 42, 0, NULL,
+                                                  readdir_plus_cb, &calls),
+              MDS_ERR_NOSUPPORT);
+    ASSERT_EQ(calls, 0);
+}
+
 /* --- Raw rows, composite namespace ops, stats -------------------------- */
 
 /* The raw-row slots belong to the core every backend populates; the
@@ -443,6 +477,7 @@ int main(void)
     RUN_TEST(test_prealloc_pool_nosupport);
     RUN_TEST(test_shard_fileid_nosupport);
     RUN_TEST(test_ext_dirent_link_anchor_nosupport);
+    RUN_TEST(test_readdir_cookie_resume_nosupport);
     RUN_TEST(test_raw_rows_guarded);
     RUN_TEST(test_ns_composites_nosupport);
     RUN_TEST(test_backend_client_stats_nosupport);
