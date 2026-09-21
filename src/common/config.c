@@ -327,7 +327,9 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
      * Apply sane defaults here; INI keys override below. */
     cfg->inline_max_size = 65536;          /* 64 KiB */
     cfg->inode_cache_size = 0;             /* 0 = disabled; set >0 to enable */
-    cfg->dirent_cache_size = 0;     /* disabled by default: per-MDS namespace caches cannot stay coherent across the referral cluster */
+    /* dirent cache disabled by default: per-MDS namespace caches
+     * cannot stay coherent across the referral cluster. */
+    cfg->dirent_cache_size = 0;
     cfg->layout_cache_size = 0;     /* disabled by default */
     cfg->negative_cache_ttl_ms = 5000;
 
@@ -797,7 +799,7 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
             char *saveptr = NULL;
             char *tok = strtok_r(buf, ",", &saveptr);
             while (tok != NULL && cfg->admin_allowed_host_count < 32) {
-                char *h = strip_whitespace(tok);
+                const char *h = strip_whitespace(tok);
                 if (*h != '\0') {
                     (void)snprintf(
                         cfg->admin_allowed_hosts[cfg->admin_allowed_host_count],
@@ -950,29 +952,6 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
             unsigned long v = strtoul(val, NULL, 10);
             if (v >= 16 && v <= 1048576) {
                 cfg->parent_touch_max_dirs = (uint32_t)v;
-            }
-        } else if (strcmp(key, "remove_async") == 0) {
-            cfg->remove_async =
-                (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
-        } else if (strcmp(key, "remove_async_batch") == 0) {
-            unsigned long v = strtoul(val, NULL, 10);
-            if (v >= 1 && v <= 4096) {
-                cfg->remove_async_batch = (uint32_t)v;
-            }
-        } else if (strcmp(key, "remove_async_workers") == 0) {
-            unsigned long v = strtoul(val, NULL, 10);
-            if (v >= 1 && v <= 32) {
-                cfg->remove_async_workers = (uint32_t)v;
-            }
-        } else if (strcmp(key, "remove_async_poll_ms") == 0) {
-            unsigned long v = strtoul(val, NULL, 10);
-            if (v >= 10 && v <= 60000) {
-                cfg->remove_async_poll_ms = (uint32_t)v;
-            }
-        } else if (strcmp(key, "remove_async_claim_ttl_ms") == 0) {
-            unsigned long v = strtoul(val, NULL, 10);
-            if (v >= 1000 && v <= 600000) {
-                cfg->remove_async_claim_ttl_ms = (uint32_t)v;
             }
         } else if (strcmp(key, "remove_async") == 0) {
             cfg->remove_async =

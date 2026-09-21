@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdatomic.h>
+#include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
@@ -97,27 +98,29 @@ struct rpc_conn {
     _Atomic int32_t  comp_next;
 };
 
+/* Field order groups the small scalars together so the singleton
+ * stays within the analyzer's padding budget; the comments keep the
+ * logical grouping visible. */
 struct rpc_server {
     int                      listen_fd;
     int                      epoll_fd;
     int                      stop_pipe[2]; /**< Write end to wake epoll. */
+    uint64_t                 write_verf;
     _Atomic int              running;
 
-    uint16_t                 port;
     uint32_t                 mds_id;
     uint32_t                 stripe_unit;
-    uint8_t                  ds_getdev_transport;
-    uint16_t                 ds_rdma_port;
-    bool                     auto_widen_lease_on_4k;
-    uint64_t                 write_verf;
     uint32_t                 max_conns;
+    uint16_t                 port;
+    uint16_t                 ds_rdma_port;
+    uint8_t                  ds_getdev_transport;
+    bool                     auto_widen_lease_on_4k;
     /* Backpressure park list (epoll-thread owned).  Conns holding an
      * assembled-but-unsubmitted record; retried from the epoll loop. */
     struct rpc_conn         *park_head;
     uint32_t                 park_count;
     /* Phase 1: placement policy dispatcher for LAYOUTGET. */
     enum mds_placement_policy placement_policy;
-    bool                     placement_policy_enabled;
     /* Phase 3: default stripe/mirror geometry. */
     uint32_t                 default_stripe_count;
     uint32_t                 default_mirror_count;
@@ -130,11 +133,20 @@ struct rpc_server {
     /* Phase C of docs/hpc-nto1-plan.md -- flex-files layout XDR
      * wire form for HPC-Shared inodes.  See enum mds_hpc_xdr_form. */
     enum mds_hpc_xdr_form    hpc_xdr_form;
+    /* Extended compound_data context (Item 52): minimum auth flavor. */
+    enum nfs_auth_mode       min_auth;
+    bool                     placement_policy_enabled;
     bool                     hpc_serve_layouts;
     bool                     serve_layouts;
     /* Wave 3 T3.1: new-file LAYOUTGET fast path (skip conflict-recall
      * scan for same-compound creates). */
     bool                     layoutget_newfile_fastpath;
+    /* Extended compound_data context (Item 52). */
+    bool                     gpudirect_required;
+    bool                     skip_transient_ndb;
+    bool                     hide_referral_junctions;
+    bool                     posix_dac;
+    bool                     referral_strict;
 
     struct mds_catalogue    *cat;
     struct session_table    *st;
@@ -145,13 +157,7 @@ struct rpc_server {
     struct subtree_map              *smap;
     const struct cluster_membership *membership;
 
-    /* Extended compound_data context (Item 52). */
-    bool gpudirect_required;
-    bool skip_transient_ndb;
-    bool hide_referral_junctions;
-    bool posix_dac;
-    bool referral_strict;
-    enum nfs_auth_mode min_auth;
+    /* Extended compound_data context (Item 52), continued. */
     struct mds_proxy_ctx            *proxy;
     struct health_monitor           *hm;
     struct io_tracker               *io_tracker;
@@ -665,6 +671,106 @@ static int process_gss_destroy(struct rpc_server *srv,
                        xdr_getpos(&enc));
 }
 
+/* -----------------------------------------------------------------------
+ * Per-worker-thread RPC scratch
+ *
+ * Reusable scratch buffers, allocated once per worker thread on its
+ * first request and reused for every subsequent request on that
+ * thread.  Eliminates malloc+calloc+free per RPC (~1MB per request).
+ *
+ * Ownership: the buffers belong to the thread.  A pthread key
+ * destructor releases them when the thread exits (worker shutdown), so
+ * no heap state outlives its thread and sanitizer runs stay clean.
+ *
+ * Phase C / Step 1 of docs/hpc-nto1-plan.md -- results MUST be
+ * calloc'd, not malloc'd.  compound_process() calls
+ * nfs4_result_destroy(&results[i]) BEFORE memset on each iteration so
+ * prior compounds' heap state is freed before the slot is reused.  On
+ * the very first compound on a fresh worker thread the slot would
+ * otherwise be uninitialised; if the random byte at results[i].opnum
+ * happened to equal OP_LAYOUTGET (50) the dispatcher would free
+ * uninitialised pointers and corrupt the heap.  calloc zeroes the
+ * whole array once at thread bring-up and removes that class of bug.
+ * ops is calloc'd for the same reason: struct nfs4_op carries a
+ * scratch block whose NULL zero state is load-bearing.  reply_buf owns
+ * no heap state, so plain malloc is safe for it.
+ * ----------------------------------------------------------------------- */
+
+struct rpc_thread_scratch {
+    char               *reply_buf;
+    struct nfs4_op     *ops;
+    struct nfs4_result *results;
+};
+
+static pthread_key_t  rpc_scratch_key;
+static pthread_once_t rpc_scratch_once = PTHREAD_ONCE_INIT;
+static int            rpc_scratch_key_rc = -1;
+
+/* Key destructor: runs on the owning thread at thread exit. */
+static void rpc_scratch_destroy(void *arg)
+{
+    struct rpc_thread_scratch *s = arg;
+
+    if (s == NULL) {
+        return;
+    }
+    if (s->results != NULL) {
+        for (uint32_t i = 0; i < NFS4_MAX_OPS; i++) {
+            nfs4_result_destroy(&s->results[i]);
+        }
+    }
+    if (s->ops != NULL) {
+        for (uint32_t i = 0; i < NFS4_MAX_OPS; i++) {
+            nfs4_op_scratch_release(&s->ops[i]);
+        }
+    }
+    free(s->reply_buf);
+    free(s->ops);
+    free(s->results);
+    free(s);
+}
+
+static void rpc_scratch_key_init(void)
+{
+    rpc_scratch_key_rc = pthread_key_create(&rpc_scratch_key,
+                                            rpc_scratch_destroy);
+}
+
+/* Return this thread's scratch, allocating it on first use.  NULL only
+ * on allocation failure (nothing is retained in that case). */
+static struct rpc_thread_scratch *rpc_scratch_get(void)
+{
+    static __thread struct rpc_thread_scratch *tl_scratch = NULL;
+    struct rpc_thread_scratch *s;
+
+    if (tl_scratch != NULL) {
+        return tl_scratch;
+    }
+
+    s = calloc(1, sizeof(*s));
+    if (s == NULL) {
+        return NULL;
+    }
+    s->reply_buf = malloc(REPLY_BUF_SIZE);
+    s->ops = calloc((size_t)NFS4_MAX_OPS, sizeof(struct nfs4_op));
+    s->results = calloc((size_t)NFS4_MAX_OPS, sizeof(struct nfs4_result));
+    if (s->reply_buf == NULL || s->ops == NULL || s->results == NULL) {
+        rpc_scratch_destroy(s);
+        return NULL;
+    }
+
+    (void)pthread_once(&rpc_scratch_once, rpc_scratch_key_init);
+    if (rpc_scratch_key_rc == 0 &&
+        pthread_setspecific(rpc_scratch_key, s) != 0) {
+        /* Without the destructor the buffers would live until process
+         * exit; refuse rather than leak per thread. */
+        rpc_scratch_destroy(s);
+        return NULL;
+    }
+    tl_scratch = s;
+    return s;
+}
+
 /** Process a complete RPC record. */
 /* NOLINTNEXTLINE(readability-function-cognitive-complexity) */
 static int process_rpc_record(struct rpc_server *srv, struct rpc_conn *c,
@@ -677,48 +783,13 @@ static int process_rpc_record(struct rpc_server *srv, struct rpc_conn *c,
     struct nfs4_result *results = NULL;
     XDR enc;
     int rc = -1;
+    struct rpc_thread_scratch *scratch = rpc_scratch_get();
 
-    /* Per-thread reusable scratch buffers: allocated once on first use,
-     * reused across all subsequent requests on the same thread.
-     * Eliminates malloc+calloc+free per RPC (~1MB per request).
-     *
-     * Phase C / Step 1 of docs/hpc-nto1-plan.md -- tl_results MUST be
-     * calloc'd, not malloc'd.  compound_process() now calls
-     * nfs4_result_destroy(&results[i]) BEFORE memset on each
-     * iteration so prior compounds' heap state is freed before the
-     * slot is reused.  On the very first compound on a fresh worker
-     * thread, the slot is uninitialised; if the random byte at
-     * results[i].opnum happens to equal OP_LAYOUTGET (50) the
-     * dispatcher would call free() on uninitialised pointers, which
-     * corrupts the heap and produces hard-to-diagnose hangs in
-     * later RPC paths.  calloc zeroes the whole array once at
-     * thread bring-up, which costs one mmap-backed memset and
-     * removes the entire class of bug.
-     *
-     * tl_reply_buf owns no heap state, so plain malloc remains safe
-     * for it.  tl_ops DID become heap-owning with the Wave-2 op
-     * scratch block and is calloc'd below for the same reason as
-     * tl_results. */
-    static __thread char *tl_reply_buf = NULL;
-    static __thread struct nfs4_op *tl_ops = NULL;
-    static __thread struct nfs4_result *tl_results = NULL;
-
-    if (tl_reply_buf == NULL) {
-        tl_reply_buf = malloc(REPLY_BUF_SIZE);
-        /* Wave 2: tl_ops must be calloc'd too -- struct nfs4_op now
-         * carries a scratch block (decode payload ownership) whose
-         * NULL-pointer zero state is load-bearing, exactly like the
-         * results' fresh-thread guarantee described above. */
-        tl_ops = calloc((size_t)NFS4_MAX_OPS, sizeof(struct nfs4_op));
-        tl_results = calloc((size_t)NFS4_MAX_OPS,
-                            sizeof(struct nfs4_result));
-        if (tl_reply_buf == NULL || tl_ops == NULL ||
-            tl_results == NULL) {
-            return -1;
-        }
+    if (scratch == NULL) {
+        return -1;
     }
 
-    reply_buf = tl_reply_buf;
+    reply_buf = scratch->reply_buf;
 
     xdrmem_ncreate(&dec, (char *)record, record_len, XDR_DECODE);
 
@@ -817,8 +888,8 @@ static int process_rpc_record(struct rpc_server *srv, struct rpc_conn *c,
          */
         /* Reuse thread-local scratch arrays.  Zero AFTER decode
          * so we only clear the ops actually used (not all 64). */
-        ops = tl_ops;
-        results = tl_results;
+        ops = scratch->ops;
+        results = scratch->results;
 
         /* --------------------------------------------------------
          * Auth enforcement -- whitelist gate.
@@ -1579,9 +1650,13 @@ static void rpc_work_fn(void *arg)
         } while (!atomic_compare_exchange_weak_explicit(
             &srv->comp_stack_head, &old_head, (int32_t)cidx,
             memory_order_release, memory_order_relaxed));
-        /* Wake the epoll thread to drain the close stack. */
+        /* Wake the epoll thread to drain the close stack.  Best
+         * effort: a lost byte only delays the drain to the next
+         * epoll wake-up. */
         uint8_t b = 1;
-        (void)write(srv->stop_pipe[1], &b, 1);
+        ssize_t wn = write(srv->stop_pipe[1], &b, 1);
+
+        (void)wn;
     } else if (!is_closing && conn_fd >= 0) {
         /* Normal path: re-arm EPOLLIN (may have been disabled at the
          * in-flight cap) and EPOLLOUT if reply bytes are queued. */
@@ -1750,6 +1825,97 @@ static void unpark_walk(struct rpc_server *srv)
     }
 }
 
+/*
+ * A full record sits in c->recv_buf.  Route callback REPLY records to
+ * the pending-CB handler, otherwise hand the request to the worker
+ * pool or the inline path.  Returns 1 to keep reading pipelined
+ * records, 0 when conn_read must stop (record parked / in-flight cap
+ * reached), -1 to drop the connection.
+ */
+static int conn_record_complete(struct rpc_server *srv, struct rpc_conn *c)
+{
+    /* RFC 8881 §2.10.3.1: the backchannel shares the
+     * forechannel TCP connection.  Callback REPLY records
+     * (msg_type=1) arrive interleaved with client CALL
+     * records.  Peek at msg_type (bytes 4-7) and route
+     * replies to the pending-CB-reply handler instead of
+     * the COMPOUND dispatcher.  Without this demux,
+     * rpc_decode_call_header rejects msg_type!=0 and
+     * drops the connection. */
+    if (c->recv_len >= 8) {
+        uint32_t msg_type =
+            ((uint32_t)c->recv_buf[4] << 24) |
+            ((uint32_t)c->recv_buf[5] << 16) |
+            ((uint32_t)c->recv_buf[6] << 8)  |
+            ((uint32_t)c->recv_buf[7]);
+        if (msg_type == 1) { /* RPC REPLY */
+            nfs4_cb_deliver_reply(c->recv_buf,
+                                  c->recv_len);
+            c->recv_len = 0;
+            return 1; /* Next record. */
+        }
+    }
+
+    if (srv->tp != NULL) {
+        int dr = dispatch_record(srv, c);
+        if (dr < 0) {
+            return -1;  /* allocation failure -- drop conn */
+        }
+        if (dr == 1) {
+            /* Pool full: park the assembled record and pause
+             * this connection.  The epoll loop retries within
+             * a few ms as workers drain -- no record is ever
+             * dropped. */
+            park_conn(srv, c);
+            return 0;
+        }
+        /* Bounded pipelining: at the in-flight cap, stop reading
+         * and disarm EPOLLIN; a worker completion re-arms it via
+         * the completion pipe.  Below the cap, keep reading any
+         * pipelined records already buffered by the kernel. */
+        if (atomic_load_explicit(&c->inflight,
+                    memory_order_relaxed) >=
+                srv->max_inflight_per_conn) {
+            struct epoll_event ev;
+            ev.events = 0;
+            ev.data.fd = c->fd;
+            epoll_ctl(srv->epoll_fd, EPOLL_CTL_MOD, c->fd, &ev);
+            /* Lost-wakeup guard: every worker that finished
+             * between the inflight load above and the disarm
+             * has already done its re-arm MOD, which our
+             * stale disarm just overwrote.  Their decrements
+             * are visible by now (fetch_sub is acq_rel), so
+             * re-check: if the connection drained below the
+             * cap, re-arm EPOLLIN ourselves.  Workers that
+             * complete after this load re-arm on their own
+             * and their MOD lands after ours.  Without this,
+             * the connection goes dark -- queued requests and
+             * the client's retransmissions on it are never
+             * read again (multi-second to permanent stalls). */
+            if (atomic_load_explicit(&c->inflight,
+                        memory_order_acquire) <
+                    srv->max_inflight_per_conn) {
+                ev.events = EPOLLIN;
+                epoll_ctl(srv->epoll_fd, EPOLL_CTL_MOD,
+                          c->fd, &ev);
+            }
+            return 0;
+        }
+        return 1;
+    }
+
+    /* Inline path (no threadpool or tests). */
+    int rc = process_rpc_record(srv, c,
+                                c->recv_buf, c->recv_len);
+
+    c->recv_len = 0;
+    if (rc != 0) {
+        return -1;
+    }
+    /* Continue reading -- there may be pipelined requests. */
+    return 1;
+}
+
 static int conn_read(struct rpc_server *srv, struct rpc_conn *c)
 {
     if (c->record_parked) {
@@ -1806,87 +1972,12 @@ static int conn_read(struct rpc_server *srv, struct rpc_conn *c)
         c->have_frag_hdr = false;
 
         if (c->frag_last) {
-            /* Full record assembled.
-             *
-             * RFC 8881 §2.10.3.1: the backchannel shares the
-             * forechannel TCP connection.  Callback REPLY records
-             * (msg_type=1) arrive interleaved with client CALL
-             * records.  Peek at msg_type (bytes 4-7) and route
-             * replies to the pending-CB-reply handler instead of
-             * the COMPOUND dispatcher.  Without this demux,
-             * rpc_decode_call_header rejects msg_type!=0 and
-             * drops the connection. */
-            if (c->recv_len >= 8) {
-                uint32_t msg_type =
-                    ((uint32_t)c->recv_buf[4] << 24) |
-                    ((uint32_t)c->recv_buf[5] << 16) |
-                    ((uint32_t)c->recv_buf[6] << 8)  |
-                    ((uint32_t)c->recv_buf[7]);
-                if (msg_type == 1) { /* RPC REPLY */
-                    nfs4_cb_deliver_reply(c->recv_buf,
-                                          c->recv_len);
-                    c->recv_len = 0;
-                    continue; /* Next record. */
-                }
+            /* Full record assembled. */
+            int rr = conn_record_complete(srv, c);
+
+            if (rr <= 0) {
+                return rr;
             }
-
-            if (srv->tp != NULL) {
-                int dr = dispatch_record(srv, c);
-                if (dr < 0) {
-                    return -1;  /* allocation failure -- drop conn */
-                }
-                if (dr == 1) {
-                    /* Pool full: park the assembled record and pause
-                     * this connection.  The epoll loop retries within
-                     * a few ms as workers drain -- no record is ever
-                     * dropped. */
-                    park_conn(srv, c);
-                    return 0;
-                }
-                /* Bounded pipelining: at the in-flight cap, stop reading
-                 * and disarm EPOLLIN; a worker completion re-arms it via
-                 * the completion pipe.  Below the cap, keep reading any
-                 * pipelined records already buffered by the kernel. */
-                if (atomic_load_explicit(&c->inflight,
-                            memory_order_relaxed) >=
-                        srv->max_inflight_per_conn) {
-                    struct epoll_event ev;
-                    ev.events = 0;
-                    ev.data.fd = c->fd;
-                    epoll_ctl(srv->epoll_fd, EPOLL_CTL_MOD, c->fd, &ev);
-                    /* Lost-wakeup guard: every worker that finished
-                     * between the inflight load above and the disarm
-                     * has already done its re-arm MOD, which our
-                     * stale disarm just overwrote.  Their decrements
-                     * are visible by now (fetch_sub is acq_rel), so
-                     * re-check: if the connection drained below the
-                     * cap, re-arm EPOLLIN ourselves.  Workers that
-                     * complete after this load re-arm on their own
-                     * and their MOD lands after ours.  Without this,
-                     * the connection goes dark -- queued requests and
-                     * the client's retransmissions on it are never
-                     * read again (multi-second to permanent stalls). */
-                    if (atomic_load_explicit(&c->inflight,
-                                memory_order_acquire) <
-                            srv->max_inflight_per_conn) {
-                        ev.events = EPOLLIN;
-                        epoll_ctl(srv->epoll_fd, EPOLL_CTL_MOD,
-                                  c->fd, &ev);
-                    }
-                    return 0;
-                }
-                continue;
-            }
-
-            /* Inline path (no threadpool or tests). */
-            int rc = process_rpc_record(srv, c,
-                                        c->recv_buf, c->recv_len);
-
-            c->recv_len = 0;
-            if (rc != 0) {
-                return -1;
-}
-            /* Continue reading -- there may be pipelined requests. */
         }
         /* Else: more fragments expected. Loop back to read next header. */
     }
@@ -2232,11 +2323,13 @@ static void handle_epoll_accept(struct rpc_server *srv)
                        &nodelay,
                        sizeof(nodelay)) != 0) {
             char errbuf[64];
-            (void)strerror_r(errno, errbuf,
-                             sizeof(errbuf));
+            /* GNU strerror_r may return a static string and leave
+             * errbuf untouched: log the returned pointer. */
+            const char *msg = strerror_r(errno, errbuf,
+                                         sizeof(errbuf));
             MDS_LOG_WARN(LOG_COMP_NFS,
                 "TCP_NODELAY failed on "
-                "fd %d: %s", cfd, errbuf);
+                "fd %d: %s", cfd, msg);
         }
     }
 
@@ -2414,7 +2507,10 @@ int rpc_server_start(struct rpc_server *srv)
              * (set by rpc_server_stop) actually terminates. */
             if (fd == srv->stop_pipe[0]) {
                 uint8_t drain[64];
-                (void)read(srv->stop_pipe[0], drain, sizeof(drain));
+                ssize_t rn = read(srv->stop_pipe[0], drain,
+                                  sizeof(drain));
+
+                (void)rn; /* drain only; 'running' decides */
                 if (!atomic_load(&srv->running)) {
                     break;
                 }
@@ -2442,7 +2538,10 @@ void rpc_server_stop(struct rpc_server *srv)
     atomic_store(&srv->running, 0);
     if (srv->stop_pipe[1] >= 0) {
         uint8_t b = 1;
-        (void)write(srv->stop_pipe[1], &b, 1);
+        /* Best-effort wake; the epoll timeout bounds the wait. */
+        ssize_t wn = write(srv->stop_pipe[1], &b, 1);
+
+        (void)wn;
     }
 
     /* Wait for any in-flight worker threads to finish.

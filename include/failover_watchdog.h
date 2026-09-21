@@ -15,6 +15,7 @@
 #ifndef FAILOVER_WATCHDOG_H
 #define FAILOVER_WATCHDOG_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "pnfs_mds.h"
@@ -22,6 +23,58 @@
 struct failover_ctx;
 struct mds_catalogue;
 struct failover_watchdog;
+
+/* -----------------------------------------------------------------------
+ * Heartbeat clock domain
+ *
+ * Registry heartbeat timestamps are the writer's CLOCK_REALTIME in
+ * nanoseconds (mds_cluster.h) and the watchdog compares them against
+ * its own CLOCK_REALTIME, so the stale threshold must exceed the
+ * deployment's NTP skew bound.  Before that contract the RonDB writers
+ * stamped CLOCK_MONOTONIC -- nanoseconds since the writer's host
+ * booted -- and such a value cannot reach FAILOVER_HB_REALTIME_FLOOR_NS
+ * (2020-01-01T00:00:00Z) unless the host has been up for fifty years.
+ * A row below the floor was therefore written by a not-yet-upgraded
+ * primary during a rolling upgrade.  Consumers treat it as
+ * INDETERMINATE: the watchdog skips the tick for that partner and
+ * never declares it stale, because promoting against a live primary
+ * that merely runs the old clock domain would be split-brain.  The
+ * mds_list consumers (cluster_membership_populate) do not interpret
+ * the timestamp at all.
+ * ----------------------------------------------------------------------- */
+
+/** 2020-01-01T00:00:00Z as CLOCK_REALTIME nanoseconds. */
+#define FAILOVER_HB_REALTIME_FLOOR_NS 1577836800000000000ULL
+
+/**
+ * True when @p last_heartbeat_ns can be a CLOCK_REALTIME stamp, i.e. it
+ * is at or above FAILOVER_HB_REALTIME_FLOOR_NS.  False means the row
+ * is indeterminate (see above), never that it is stale.
+ */
+bool failover_heartbeat_plausible(uint64_t last_heartbeat_ns);
+
+/* -----------------------------------------------------------------------
+ * Stale threshold and the startup bound derived from it
+ *
+ * The default stale threshold is three heartbeat intervals (main.c
+ * heartbeats every 5 s).  A node that has registered (fresh row) must
+ * start its heartbeat thread within CLUSTER_STARTUP_DEADLINE_MS or exit
+ * (main.c): otherwise its row goes stale while it is still
+ * initialising, the standby promotes and takes its subtrees, and the
+ * node then begins serving them too.  Two heartbeat intervals leave
+ * one interval of margin below the threshold for clock skew and the
+ * watchdog's 2 s poll cadence.
+ * ----------------------------------------------------------------------- */
+
+/** Default stale threshold (failover_watchdog_cfg.stale_timeout_ms == 0). */
+#define FAILOVER_WATCHDOG_STALE_TIMEOUT_MS_DEFAULT 15000u
+
+/** Budget from a successful node_register to the heartbeat thread start. */
+#define CLUSTER_STARTUP_DEADLINE_MS 10000u
+
+_Static_assert(CLUSTER_STARTUP_DEADLINE_MS <
+	       FAILOVER_WATCHDOG_STALE_TIMEOUT_MS_DEFAULT,
+	       "startup deadline must leave margin below the stale threshold");
 
 struct failover_watchdog_cfg {
 	struct failover_ctx  *fo;            /**< Existing failover context. */
@@ -34,6 +87,10 @@ struct failover_watchdog_cfg {
 
 /**
  * Start the partner-liveness watchdog.
+ *
+ * A partner row whose heartbeat is below FAILOVER_HB_REALTIME_FLOOR_NS
+ * is indeterminate: the tick is skipped (logged once per transition)
+ * and the partner is never declared stale on its account.
  *
  * @param cfg Config (see struct).  poll_interval_ms,
  *            stale_timeout_ms, and min_observe_ms are optional

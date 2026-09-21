@@ -109,11 +109,15 @@ typedef int (*mds_cluster_partition_cb)(uint32_t partition_id,
  *
  * One row per mds_id.  boot_epoch identifies one incarnation of an MDS
  * and must be monotonic across restarts of the same mds_id; it is what
- * lets the store tell a restarted node from a stale one.
+ * lets the store tell a restarted node from a stale one.  The daemon
+ * derives it from CLOCK_REALTIME nanoseconds at startup (main.c), so
+ * it stays monotonic across host reboots as long as the wall clock is
+ * not stepped back below the previous incarnation's value; when it is,
+ * node_register refuses with MDS_ERR_EXISTS and the daemon exits with
+ * a message naming the row and both epochs rather than continuing
+ * unregistered.
  *
- * Target contract (binding on every new backend; the RonDB slots are
- * brought to it in their own reviewed changes and until then deviate
- * as noted per operation):
+ * Contract (binding on every backend; RonDB and memdb implement it):
  *
  *   node_register    conditional upsert: insert when absent; replace
  *                    when the existing row's boot_epoch is lower;
@@ -132,12 +136,20 @@ typedef int (*mds_cluster_partition_cb)(uint32_t partition_id,
  *                    an epoch mismatch, nothing deleted.
  *   timestamps       the writer's CLOCK_REALTIME in nanoseconds, so the
  *                    watchdog's threshold (its own CLOCK_REALTIME) is in
- *                    the same clock domain across hosts.
+ *                    the same clock domain across hosts; the stale
+ *                    threshold (15 s default) must therefore exceed the
+ *                    deployment's NTP skew bound.
  *
- * Current RonDB behaviour (documented deviation): register is an
- * unconditional upsert, heartbeat overwrites boot_epoch and returns
- * MDS_ERR_NOTFOUND only for a missing row, deregister deletes by mds_id
- * alone, and both stamp CLOCK_MONOTONIC.
+ * Consumer rule for last_heartbeat_ns (rolling upgrade): RonDB writers
+ * that predate this contract stamped CLOCK_MONOTONIC, a value that can
+ * never reach FAILOVER_HB_REALTIME_FLOOR_NS (failover_watchdog.h,
+ * 2020-01-01 UTC) in the realtime domain.  A row below that floor is
+ * INDETERMINATE: the failover watchdog skips its tick for that partner
+ * and never declares it stale, so an upgraded standby cannot promote
+ * against a not-yet-upgraded primary; the node_list consumer
+ * (cluster_membership_populate) does not interpret the timestamp at
+ * all.  The store applies no such rule -- it reports rows below the
+ * threshold as asked.
  * ----------------------------------------------------------------------- */
 
 /**
@@ -165,7 +177,7 @@ enum mds_status mds_cluster_node_register(struct mds_catalogue *cat,
  * Refresh this incarnation's heartbeat timestamp.
  *
  * @return MDS_OK; MDS_ERR_NOTFOUND when no row exists for @mds_id;
- *         MDS_ERR_STALE on a boot_epoch mismatch (target contract);
+ *         MDS_ERR_STALE on a boot_epoch mismatch;
  *         MDS_ERR_NOSUPPORT when the backend has no registry;
  *         MDS_ERR_INVAL on a NULL handle; or the backend's status.
  */
@@ -177,7 +189,7 @@ enum mds_status mds_cluster_node_heartbeat(struct mds_catalogue *cat,
  * Remove this incarnation's registry row on clean shutdown.
  *
  * @return MDS_OK (also when the row is already absent);
- *         MDS_ERR_STALE on a boot_epoch mismatch (target contract);
+ *         MDS_ERR_STALE on a boot_epoch mismatch (nothing deleted);
  *         MDS_ERR_NOSUPPORT when the backend has no registry;
  *         MDS_ERR_INVAL on a NULL handle; or the backend's status.
  */
@@ -215,15 +227,14 @@ enum mds_status mds_cluster_node_scan_stale(struct mds_catalogue *cat,
  *
  * One row per partition_id: (owner_mds_id, state, subtree_path).
  *
- * Target contract: partition_put with insert_only == true inserts the
- * row only when @partition_id is absent and returns MDS_ERR_EXISTS
- * otherwise (the root claim at startup, so a transient error can never
- * rewrite the real owner); insert_only == false is an upsert and is
- * reserved for seeding a never-owned initial shard layout.  A failed
- * partition_list at startup is fatal for the caller, never "empty map".
- *
- * Current RonDB behaviour (documented deviation): partition_put is an
- * unconditional upsert and insert_only is ignored.
+ * Contract (RonDB and memdb implement it): partition_put with
+ * insert_only == true inserts the row only when @partition_id is absent
+ * and returns MDS_ERR_EXISTS otherwise (the root claim at startup, so a
+ * transient error can never rewrite the real owner); insert_only ==
+ * false is an upsert and is reserved for seeding a never-owned initial
+ * shard layout.  A failed partition_list at startup is fatal for the
+ * caller after a bounded retry (subtree_map_init_from_catalogue), never
+ * "empty map".
  * ----------------------------------------------------------------------- */
 
 /**
@@ -247,7 +258,7 @@ enum mds_status mds_cluster_partition_list(struct mds_catalogue *cat,
  * @param state         One of MDS_PARTITION_STATE_*.
  * @param subtree_path  Absolute subtree root path (non-NULL).
  * @param insert_only   true: fail with MDS_ERR_EXISTS when the row
- *                      exists (target contract); false: upsert.
+ *                      exists; false: upsert.
  * @return MDS_OK; MDS_ERR_EXISTS per @insert_only; MDS_ERR_NOSUPPORT
  *         when the backend has no partition map; MDS_ERR_INVAL on a
  *         NULL handle or path; or the backend's status.

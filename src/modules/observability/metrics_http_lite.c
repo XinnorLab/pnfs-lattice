@@ -52,7 +52,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define METRICS_HTTP_BODY_CAP (256 * 1024)
+#define METRICS_HTTP_BODY_CAP ((size_t)256 * 1024)
 
 struct metrics_http_ctx {
     int                   listen_fd;
@@ -61,6 +61,14 @@ struct metrics_http_ctx {
     struct mds_catalogue *cat;
     uint16_t              port;
 };
+
+/* Thread-safe strerror(3) for the diagnostics below.  The build
+ * defines _GNU_SOURCE, so this is the GNU strerror_r(): it returns
+ * the message text, which may live in @buf or in a static string. */
+static const char *errno_text(int err, char *buf, size_t cap)
+{
+    return strerror_r(err, buf, cap);
+}
 
 /* Append the backend client-side counters (round trips, transactions,
  * bytes) as Prometheus lines after the v2 body.  Best-effort: when the
@@ -81,7 +89,8 @@ static int append_backend_client_stats(struct mds_catalogue *cat,
     }
 
     n = snprintf(out + used, cap - (size_t)used,
-        "# HELP pnfs_mds_ndb_exec_roundtrips_total Times a request thread blocked on an NDB execute round trip.\n"
+        "# HELP pnfs_mds_ndb_exec_roundtrips_total Times a request thread "
+        "blocked on an NDB execute round trip.\n"
         "# TYPE pnfs_mds_ndb_exec_roundtrips_total counter\n"
         "pnfs_mds_ndb_exec_roundtrips_total %llu\n"
         "# HELP pnfs_mds_ndb_scan_batch_waits_total Waits for the next NDB scan result batch.\n"
@@ -151,7 +160,7 @@ static int render_metrics_body(struct mds_catalogue *cat,
     int n;
 
     if (cat != NULL) {
-        struct catalog_stats *cs = mds_catalogue_stats(cat);
+        const struct catalog_stats *cs = mds_catalogue_stats(cat);
         if (cs != NULL) {
             mds_metrics_snapshot_fill_catalog(&snap, cs);
         }
@@ -191,11 +200,10 @@ static int write_all(int fd, const char *buf, size_t n)
 static void drain_request(int fd)
 {
     char    buf[2048];
-    ssize_t n;
     int     attempts = 0;
 
     while (attempts++ < 4) {
-        n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+        ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
         if (n <= 0) {
             return;
         }
@@ -286,6 +294,7 @@ int metrics_http_start(uint16_t port, struct mds_catalogue *cat,
     struct metrics_http_ctx *ctx;
     struct sockaddr_in       addr;
     int                      one = 1;
+    char                     errbuf[128];
 
     if (out == NULL) {
         return -1;
@@ -308,7 +317,7 @@ int metrics_http_start(uint16_t port, struct mds_catalogue *cat,
     if (ctx->listen_fd < 0) {
         (void)fprintf(stderr,
             "WARN: metrics_http: socket() failed: %s\n",
-            strerror(errno));
+            errno_text(errno, errbuf, sizeof(errbuf)));
         free(ctx);
         return -1;
     }
@@ -325,7 +334,7 @@ int metrics_http_start(uint16_t port, struct mds_catalogue *cat,
              sizeof(addr)) < 0) {
         (void)fprintf(stderr,
             "WARN: metrics_http: bind(:%u) failed: %s\n",
-            (unsigned)port, strerror(errno));
+            (unsigned)port, errno_text(errno, errbuf, sizeof(errbuf)));
         close(ctx->listen_fd);
         free(ctx);
         return -1;
@@ -334,7 +343,7 @@ int metrics_http_start(uint16_t port, struct mds_catalogue *cat,
     if (listen(ctx->listen_fd, 8) < 0) {
         (void)fprintf(stderr,
             "WARN: metrics_http: listen() failed: %s\n",
-            strerror(errno));
+            errno_text(errno, errbuf, sizeof(errbuf)));
         close(ctx->listen_fd);
         free(ctx);
         return -1;

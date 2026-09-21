@@ -45,10 +45,14 @@
  *     stale.  Covers the case where the standby came up before the
  *     primary finished initial heartbeat insertion.
  *   - Clock domain: the threshold is derived from this host's
- *     CLOCK_REALTIME.  The heartbeat writer's clock domain is the
- *     backend's business (mds_cluster.h documents the target contract
- *     and the current RonDB deviation); this file is deliberately
- *     left unchanged in that respect.
+ *     CLOCK_REALTIME and the writers stamp their CLOCK_REALTIME
+ *     (mds_cluster.h), so the stale threshold must exceed the
+ *     deployment's NTP skew bound.  A partner row whose timestamp is
+ *     below FAILOVER_HB_REALTIME_FLOOR_NS (failover_watchdog.h) was
+ *     written in the old CLOCK_MONOTONIC domain by a not-yet-upgraded
+ *     primary; it is INDETERMINATE -- the tick is skipped and the
+ *     partner is never declared stale on its account -- so a rolling
+ *     upgrade cannot promote the standby against a live primary.
  */
 
 #include <errno.h>
@@ -71,7 +75,6 @@
  * ----------------------------------------------------------------------- */
 
 #define WATCHDOG_POLL_INTERVAL_MS_DEFAULT      2000u
-#define WATCHDOG_STALE_TIMEOUT_MS_DEFAULT     15000u
 #define WATCHDOG_MIN_OBSERVE_MS_DEFAULT       20000u
 
 /* -----------------------------------------------------------------------
@@ -89,13 +92,23 @@ struct failover_watchdog {
 	_Atomic bool           running;
 	_Atomic bool           started;
 	uint64_t               start_ts_ns;
+	/* Indeterminate-partner log edge; touched by the watchdog thread
+	 * only, so it needs no synchronisation. */
+	bool                   indeterminate_logged;
 };
 
 /* Per-tick scan context. */
 struct scan_ctx {
 	uint32_t partner_id;
-	bool     partner_stale_found;
+	bool     partner_stale_found;   /* stale AND in the realtime domain */
+	bool     partner_indeterminate; /* below the realtime floor */
+	uint64_t partner_hb_ns;         /* for the indeterminate log line */
 };
+
+bool failover_heartbeat_plausible(uint64_t last_heartbeat_ns)
+{
+	return last_heartbeat_ns >= FAILOVER_HB_REALTIME_FLOOR_NS;
+}
 
 static uint64_t clock_now_ns(void)
 {
@@ -107,22 +120,133 @@ static uint64_t clock_now_ns(void)
 	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+/* The store reports every row below the threshold, so a partner row
+ * still stamped in the old CLOCK_MONOTONIC domain is always reported;
+ * classify it here rather than count it as stale. */
 static int watchdog_scan_cb(uint32_t mds_id, uint64_t boot_epoch,
 			    uint64_t last_heartbeat_ns, void *ctx_void)
 {
 	struct scan_ctx *ctx = ctx_void;
 
 	(void)boot_epoch;
-	(void)last_heartbeat_ns;
 
 	if (ctx == NULL) {
 		return 1;
 	}
 	if (mds_id == ctx->partner_id) {
-		ctx->partner_stale_found = true;
+		ctx->partner_hb_ns = last_heartbeat_ns;
+		if (failover_heartbeat_plausible(last_heartbeat_ns)) {
+			ctx->partner_stale_found = true;
+		} else {
+			ctx->partner_indeterminate = true;
+		}
 		return 1; /* found what we need; stop scanning */
 	}
 	return 0;
+}
+
+/* Sleep one poll interval.  An interrupted sleep only shortens the
+ * wait; the loop re-checks `running` right after. */
+static void watchdog_sleep(const struct failover_watchdog *wd)
+{
+	struct timespec sleep_ts;
+
+	sleep_ts.tv_sec  = (time_t)(wd->poll_interval_ms / 1000u);
+	sleep_ts.tv_nsec = (long)((wd->poll_interval_ms % 1000u) *
+				  1000000u);
+	(void)nanosleep(&sleep_ts, NULL);
+}
+
+/* Boot-up grace: give the primary time to insert its own initial
+ * heartbeat row. */
+static bool watchdog_in_grace(const struct failover_watchdog *wd,
+			      uint64_t now_ns)
+{
+	return wd->start_ts_ns != 0 &&
+	       now_ns - wd->start_ts_ns <
+		       (uint64_t)wd->min_observe_ms * 1000000ULL;
+}
+
+/* Rows older than this are stale; clamps at 0 so an early clock can
+ * never underflow. */
+static uint64_t watchdog_threshold_ns(const struct failover_watchdog *wd,
+				      uint64_t now_ns)
+{
+	uint64_t stale_ns = (uint64_t)wd->stale_timeout_ms * 1000000ULL;
+
+	return (now_ns > stale_ns) ? now_ns - stale_ns : 0;
+}
+
+/* One observation of the partner.  True only when the partner's row is
+ * stale AND stamped in the realtime domain.  A scan failure skips the
+ * tick silently (transient); an indeterminate row skips it and is
+ * logged once per transition -- guessing wrong here fires a spurious
+ * promotion, which is more expensive than waiting one more cycle. */
+static bool watchdog_partner_is_stale(struct failover_watchdog *wd,
+				      uint64_t now_ns)
+{
+	struct scan_ctx sctx;
+	enum mds_status st;
+
+	memset(&sctx, 0, sizeof(sctx));
+	sctx.partner_id = wd->partner_id;
+
+	st = mds_cluster_node_scan_stale(wd->cat,
+					 watchdog_threshold_ns(wd, now_ns),
+					 watchdog_scan_cb, &sctx);
+	if (st != MDS_OK) {
+		return false;
+	}
+	if (sctx.partner_indeterminate) {
+		if (!wd->indeterminate_logged) {
+			MDS_LOG_WARN(LOG_COMP_CLUSTER,
+				"failover_watchdog: partner %u heartbeat "
+				"%llu ns is below the realtime floor "
+				"(pre-upgrade writer clock?); tick skipped, "
+				"partner not declared stale",
+				(unsigned)wd->partner_id,
+				(unsigned long long)sctx.partner_hb_ns);
+			wd->indeterminate_logged = true;
+		}
+		return false;
+	}
+	if (wd->indeterminate_logged) {
+		MDS_LOG_INFO(LOG_COMP_CLUSTER,
+			"failover_watchdog: partner %u heartbeat is back in "
+			"the realtime domain", (unsigned)wd->partner_id);
+		wd->indeterminate_logged = false;
+	}
+	return sctx.partner_stale_found;
+}
+
+/* The partner is stale: attempt the promotion.  True when it succeeded
+ * and the watchdog is done; false to loop and re-poll -- the precheck
+ * guards in failover_promote (self-fencing, repl health, wire compat)
+ * are the right place for the retry decision; the watchdog's job is
+ * just to keep observing. */
+static bool watchdog_try_promote(const struct failover_watchdog *wd)
+{
+	enum mds_status st;
+
+	MDS_LOG_INFO(LOG_COMP_CLUSTER,
+		"failover_watchdog: partner %u heartbeat stale > %u ms, "
+		"attempting promotion",
+		(unsigned)wd->partner_id,
+		(unsigned)wd->stale_timeout_ms);
+
+	st = failover_promote(wd->fo);
+	if (st == MDS_OK) {
+		MDS_LOG_INFO(LOG_COMP_CLUSTER,
+			"failover_watchdog: promotion succeeded; "
+			"watchdog exiting");
+		return true;
+	}
+
+	MDS_LOG_INFO(LOG_COMP_CLUSTER,
+		"failover_watchdog: promotion refused (st=%d); "
+		"will retry next tick",
+		(int)st);
+	return false;
 }
 
 static void *watchdog_fn(void *arg)
@@ -130,17 +254,10 @@ static void *watchdog_fn(void *arg)
 	struct failover_watchdog *wd = arg;
 
 	while (atomic_load(&wd->running)) {
-		struct timespec sleep_ts;
 		uint64_t now_ns;
-		uint64_t threshold_ns;
-		struct scan_ctx sctx;
-		enum mds_status st;
 
 		/* Sleep first so the initial tick respects min_observe_ms. */
-		sleep_ts.tv_sec  = (time_t)(wd->poll_interval_ms / 1000u);
-		sleep_ts.tv_nsec = (long)((wd->poll_interval_ms % 1000u) *
-					  1000000u);
-		(void)nanosleep(&sleep_ts, NULL);
+		watchdog_sleep(wd);
 
 		if (!atomic_load(&wd->running)) {
 			break;
@@ -155,57 +272,15 @@ static void *watchdog_fn(void *arg)
 		if (now_ns == 0) {
 			continue;
 		}
-
-		/* Boot-up grace: give the primary time to insert its own
-		 * initial heartbeat row. */
-		if (wd->start_ts_ns != 0 &&
-		    now_ns - wd->start_ts_ns <
-			    (uint64_t)wd->min_observe_ms * 1000000ULL) {
+		if (watchdog_in_grace(wd, now_ns)) {
 			continue;
 		}
-
-		threshold_ns = (now_ns > (uint64_t)wd->stale_timeout_ms *
-					 1000000ULL)
-			     ? now_ns - (uint64_t)wd->stale_timeout_ms *
-					1000000ULL
-			     : 0;
-
-		memset(&sctx, 0, sizeof(sctx));
-		sctx.partner_id = wd->partner_id;
-
-		st = mds_cluster_node_scan_stale(wd->cat, threshold_ns,
-						 watchdog_scan_cb, &sctx);
-		if (st != MDS_OK) {
-			/* Transient scan failure: skip this tick. */
+		if (!watchdog_partner_is_stale(wd, now_ns)) {
 			continue;
 		}
-
-		if (!sctx.partner_stale_found) {
-			continue;
-		}
-
-		MDS_LOG_INFO(LOG_COMP_CLUSTER,
-			"failover_watchdog: partner %u heartbeat stale > %u ms, "
-			"attempting promotion",
-			(unsigned)wd->partner_id,
-			(unsigned)wd->stale_timeout_ms);
-
-		st = failover_promote(wd->fo);
-		if (st == MDS_OK) {
-			MDS_LOG_INFO(LOG_COMP_CLUSTER,
-				"failover_watchdog: promotion succeeded; "
-				"watchdog exiting");
+		if (watchdog_try_promote(wd)) {
 			break;
 		}
-
-		MDS_LOG_INFO(LOG_COMP_CLUSTER,
-			"failover_watchdog: promotion refused (st=%d); "
-			"will retry next tick",
-			(int)st);
-		/* Loop and re-poll.  The precheck guards in
-		 * failover_promote (self-fencing, repl health, wire
-		 * compat) are the right place for the retry decision;
-		 * the watchdog's job is just to keep observing. */
 	}
 
 	return NULL;
@@ -244,7 +319,7 @@ enum mds_status failover_watchdog_start(const struct failover_watchdog_cfg *cfg,
 			     : WATCHDOG_POLL_INTERVAL_MS_DEFAULT;
 	wd->stale_timeout_ms = cfg->stale_timeout_ms > 0
 			     ? cfg->stale_timeout_ms
-			     : WATCHDOG_STALE_TIMEOUT_MS_DEFAULT;
+			     : FAILOVER_WATCHDOG_STALE_TIMEOUT_MS_DEFAULT;
 	wd->min_observe_ms   = cfg->min_observe_ms > 0
 			     ? cfg->min_observe_ms
 			     : WATCHDOG_MIN_OBSERVE_MS_DEFAULT;

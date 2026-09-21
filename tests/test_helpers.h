@@ -12,6 +12,8 @@
 #ifndef TEST_HELPERS_H
 #define TEST_HELPERS_H
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include "pnfs_mds.h"
@@ -31,6 +33,36 @@
 static inline struct mds_catalogue *open_test_catalogue(void)
 {
 	return catalogue_memdb_open();
+}
+
+/**
+ * Remove a test fixture directory tree (best effort).
+ *
+ * Cleanup runs after the assertions, so a failure here must not
+ * turn a passing test into a failing one: a non-zero shell status
+ * is reported on stderr and otherwise ignored.  @path is a
+ * fixture path produced by mkdtemp() or a fixed /tmp name and so
+ * never contains a single quote; it is quoted defensively anyway.
+ *
+ * @param path  Directory to remove recursively.
+ */
+static inline void test_rm_rf(const char *path)
+{
+	char cmd[4200];
+	int n;
+	int rc;
+
+	n = snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
+	if (n < 0 || (size_t)n >= sizeof(cmd)) {
+		fprintf(stderr, "warning: fixture path too long, not removed: %s\n",
+			path);
+		return;
+	}
+	rc = system(cmd);
+	if (rc != 0) {
+		fprintf(stderr, "warning: fixture cleanup failed (rc=%d): %s\n",
+			rc, cmd);
+	}
 }
 
 /**

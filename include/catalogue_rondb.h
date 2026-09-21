@@ -338,7 +338,19 @@ int rondb_shim_ns_create_wide(
  *  Deletes src dirent, writes dst dirent, atomically updates both
  *  parent inodes via interpretedUpdateTuple, optionally handles
  *  overwrite (dst child nlink decrement or delete).
- *  Returns 0 on success, 1 on src NOTFOUND, -1 on error. */
+ *
+ *  When the overwritten destination is a directory (dst_child_type ==
+ *  MDS_FTYPE_DIR) its emptiness is decided inside this transaction --
+ *  the victim's inode row is read LM_Exclusive, then a bounded dirent
+ *  probe runs; any entry aborts with rc 3 and nothing is mutated.  An
+ *  empty victim is deleted outright (delete_dst_child is ignored: a
+ *  directory has exactly one name).  The caller accounts for the
+ *  victim's ".." link in the parent nlink deltas.
+ *
+ *  Returns 0 on success, 3 when a directory victim is not empty
+ *  (MDS_ERR_NOTEMPTY), -2 when the transaction must be re-resolved and
+ *  retried (transient NDB error, or the victim vanished since the
+ *  caller read it), -1 on error. */
 int rondb_shim_rename(void *handle,
                      uint64_t src_parent, const char *src_name,
                      uint64_t dst_parent, const char *dst_name,
@@ -348,13 +360,23 @@ int rondb_shim_rename(void *handle,
                      uint64_t src_child_fid, uint8_t src_child_type,
                      int dst_exists,
                      const uint8_t *dst_child_buf, uint32_t dc_len,
-                     uint64_t dst_child_fid, int delete_dst_child);
+                     uint64_t dst_child_fid, uint8_t dst_child_type,
+                     int delete_dst_child);
 
 /** Atomic REMOVE: delete dirent + update/delete child inode + atomic
  *  parent update + delete stripe data if nlink=0.  Single NDB txn.
  *  child_inode_buf contains the updated child inode (nlink decremented).
  *  Parent nlink/change/mtime updated atomically via interpretedUpdateTuple.
- *  Returns 0 on success, -1 on error. */
+ *
+ *  Directory target (child type DIR): emptiness is decided inside this
+ *  transaction -- the directory inode row is read LM_Exclusive, then a
+ *  bounded dirent probe runs; any entry aborts with rc 3 and nothing is
+ *  mutated.  An empty directory is deleted outright (delete_child is
+ *  ignored: a directory has exactly one name).
+ *
+ *  Returns 0 on success (including the idempotent already-removed case),
+ *  3 when a directory target is not empty (MDS_ERR_NOTEMPTY), -2 when
+ *  transient NDB contention survived every retry, -1 on error. */
 int rondb_shim_ns_remove(void *handle,
                          uint64_t parent_fileid, const char *name,
                          uint64_t child_fileid,
@@ -362,16 +384,6 @@ int rondb_shim_ns_remove(void *handle,
                          int delete_child,
                          int32_t parent_nlink_delta,
                          uint32_t stripe_count);
-
-/** Fused REMOVE: dirent read + inode read + atomic delete in ONE NDB
- *  transaction (2 execute phases: NoCommit reads + Commit mutations).
- *  Replaces the separate ns_lookup + ns_remove call pair.
- *  Returns child_type and nlink via out params for caller's use.
- *  Returns 0 on success, 1 on NOTFOUND, -1 on error, -2 transient. */
-int rondb_shim_ns_remove_full(void *handle,
-                              uint64_t parent_fileid, const char *name,
-                              uint8_t *out_child_type,
-                              uint32_t *out_old_nlink);
 
 /** One pre-minted mds_gc_queue row for the fused REMOVE+GC path.
  *  gc_seq must come from rondb_shim_gc_seq_alloc (block-cached, so
@@ -397,7 +409,8 @@ struct rondb_gc_row {
  *  the transaction is a no-op success and no rows are inserted --
  *  the earlier winning remove already queued them.
  *
- *  Returns 0 on success, -1 on error, -2 transient-exhausted. */
+ *  Returns 0 on success, 3 when a directory target is not empty (see
+ *  rondb_shim_ns_remove), -1 on error, -2 transient-exhausted. */
 int rondb_shim_ns_remove_gc(void *handle,
                             uint64_t parent_fileid, const char *name,
                             uint64_t child_fileid,
@@ -488,14 +501,19 @@ int rondb_shim_ns_readdir_plus_from(void *handle,
                                     uint32_t max_entries,
                                     rondb_readdir_plus_cb cb, void *ctx);
 
-/** Atomic LINK: create dirent + bump target nlink + atomic parent
- *  update.  Single NDB txn.  Parent nlink/change/mtime updated
- *  atomically via interpretedUpdateTuple (delta=0 for hard links).
- *  Returns 0 on success, 1 on EXISTS (dirent conflict), -1 on error. */
+/** Atomic LINK in ONE NDB transaction (two round trips): parent and
+ *  target inode rows are read LM_Exclusive (type validation under the
+ *  lock), then the dirent is inserted (insert-only), the target gets an
+ *  interpreted nlink+1 / change+1 / ctime update and the parent its
+ *  interpreted change/mtime/ctime update.  No full-row write, no read
+ *  outside the transaction.
+ *  Returns 0 on success, 1 EXISTS (name collision), 2 NOTFOUND (parent
+ *  or target inode missing), 3 ISDIR (target is a directory), 4 NOTDIR
+ *  (parent is not a directory), -2 transient NDB error, -1 on error.
+ *  Every non-zero return leaves the store unchanged. */
 int rondb_shim_ns_link(void *handle,
                        uint64_t parent_fileid, const char *name,
-                       uint64_t target_fileid, uint8_t target_type,
-                       const uint8_t *target_inode_buf, uint32_t ti_len);
+                       uint64_t target_fileid);
 
 /** Atomic nlink adjustment on a single inode row.
  *  Returns 0 on success, 1 on NOTFOUND, -1 on error. */
@@ -723,19 +741,25 @@ typedef int (*rondb_layout_file_iter_cb)(uint64_t clientid,
 int rondb_shim_layout_iter_file(void *handle, uint64_t fileid,
                                 rondb_layout_file_iter_cb cb, void *ctx);
 
-/* Client recovery (mds_client_recovery: PK=clientid). */
+/* Client recovery (mds_client_recovery: PK=clientid).  Each row records
+ * the (owner_mds_id, owner_boot_epoch) of the MDS that served the
+ * client; rondb_shim_recovery_scan filters on exactly that owner. */
 int rondb_shim_recovery_put(void *handle, uint64_t clientid,
                             const uint8_t *co_ownerid,
                             uint32_t co_ownerid_len,
-                            const uint8_t verifier[8]);
+                            const uint8_t verifier[8],
+                            uint32_t owner_mds_id,
+                            uint64_t owner_boot_epoch);
 int rondb_shim_recovery_del(void *handle, uint64_t clientid);
 int rondb_shim_recovery_get(void *handle, uint64_t clientid,
                             uint8_t *co_ownerid,
                             uint32_t *co_ownerid_len,
                             uint8_t verifier[8]);
 
-/** Scan all client recovery records.  Callback receives
- *  (clientid, owner_mds_id, owner_boot_epoch). */
+/** Scan client recovery records owned by filter_mds_id, plus unassigned
+ *  rows (stored owner 0, written by a pre-ownership binary); 0 = every
+ *  row.  Rows owned by another MDS are never returned.  Callback
+ *  receives the STORED (clientid, owner_mds_id, owner_boot_epoch). */
 typedef int (*rondb_recovery_scan_cb)(uint64_t clientid,
                                       uint32_t owner_mds_id,
                                       uint64_t owner_boot_epoch,
@@ -791,18 +815,30 @@ int rondb_shim_lock_test(void *handle,
  * Phase 9A -- Node registry, range allocation, lock reaping
  * ----------------------------------------------------------------------- */
 
-/** Register this MDS in mds_node_registry (writeTuple = insert or update). */
+/** Register this MDS incarnation in mds_node_registry: insert when the
+ *  row is absent, replace it when its boot_epoch is lower.  Stamps
+ *  last_heartbeat_ns with CLOCK_REALTIME.  Returns 0 on success, 1 when
+ *  a row with an equal or higher boot_epoch exists (nothing written),
+ *  -1 on error.  One transaction: exclusive read + insert/update. */
 int rondb_shim_mds_register(void *handle, uint32_t mds_id,
                             uint64_t boot_epoch,
                             const char *hostname,
                             uint16_t nfs_port, uint16_t grpc_port);
 
-/** Update last_heartbeat_ns for this (mds_id, boot_epoch). */
+/** Refresh last_heartbeat_ns (CLOCK_REALTIME) only when the row exists
+ *  AND its boot_epoch equals @boot_epoch -- one interpreted update, no
+ *  read-before-write; boot_epoch itself is never written.  Returns 0 on
+ *  success, 1 when no row exists for @mds_id, 2 on a boot_epoch
+ *  mismatch, -1 on error. */
 int rondb_shim_mds_heartbeat(void *handle, uint32_t mds_id,
                              uint64_t boot_epoch);
 
-/** Remove this MDS from the registry. */
-int rondb_shim_mds_deregister(void *handle, uint32_t mds_id);
+/** Delete this MDS's registry row only when its boot_epoch equals
+ *  @boot_epoch (one interpreted delete).  Returns 0 when deleted or
+ *  already absent, 2 on a boot_epoch mismatch (nothing deleted), -1 on
+ *  error. */
+int rondb_shim_mds_deregister(void *handle, uint32_t mds_id,
+                              uint64_t boot_epoch);
 
 /** Callback for scan_stale.  Return 0 to continue, non-zero to stop. */
 typedef int (*rondb_stale_node_cb)(uint32_t mds_id, uint64_t boot_epoch,
@@ -829,6 +865,21 @@ int rondb_shim_lock_reap_by_owner(void *handle,
                                   uint32_t owner_mds_id,
                                   uint64_t owner_boot_epoch,
                                   uint32_t *reaped_count);
+
+/* Catalogue-handle wrappers for the three shim calls above (mds_status
+ * mapping, MDS_ERR_INVAL on a NULL handle / output or a zero batch).
+ * No in-tree caller yet; kept for the failover reaper and the
+ * range-allocation tooling. */
+enum mds_status catalogue_rondb_alloc_fileid_range(struct mds_catalogue *cat,
+                                                   uint32_t batch_size,
+                                                   uint64_t *range_start);
+enum mds_status catalogue_rondb_alloc_gc_seq_range(struct mds_catalogue *cat,
+                                                   uint32_t batch_size,
+                                                   uint64_t *range_start);
+enum mds_status catalogue_rondb_lock_reap_by_owner(struct mds_catalogue *cat,
+                                                   uint32_t owner_mds_id,
+                                                   uint64_t owner_boot_epoch,
+                                                   uint32_t *reaped_count);
 
 /* -----------------------------------------------------------------------
  * Phase 9C -- Delta broadcast shim
@@ -933,10 +984,13 @@ int rondb_shim_partition_map_get(void *handle, uint32_t partition_id,
                                 uint32_t *owner_mds_id, uint8_t *state,
                                 char *subtree_path, uint32_t path_cap);
 
-/** Insert or update a partition_map entry. */
+/** Write a partition_map entry.  insert_only != 0: insertTuple, and a
+ *  duplicate key returns 1 (the partition already has an owner);
+ *  insert_only == 0: writeTuple upsert.  Returns 0 on success, -1 on
+ *  error. */
 int rondb_shim_partition_map_put(void *handle, uint32_t partition_id,
                                 uint32_t owner_mds_id, uint8_t state,
-                                const char *subtree_path);
+                                const char *subtree_path, int insert_only);
 
 /** CAS: update owner_mds_id only if current owner matches expected. */
 int rondb_shim_partition_map_cas(void *handle, uint32_t partition_id,

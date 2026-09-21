@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <time.h>
 
 #include "pnfs_mds.h"
 #include "rpc_server.h"
@@ -68,6 +69,16 @@
 
 /** Maximum concurrent RPC listener threads. */
 #define MAX_RPC_LISTENERS 32
+
+/** Whole-second pause without the signal side effects sleep() may
+ * carry (nanosleep is async-signal- and thread-safe).  An EINTR
+ * early return is acceptable at every call site, as with sleep(). */
+static void sleep_seconds(unsigned int sec)
+{
+	struct timespec ts = { .tv_sec = (time_t)sec, .tv_nsec = 0 };
+
+	(void)nanosleep(&ts, NULL);
+}
 
 /** RPC listener thread entry point (blocking). */
 static void *rpc_listener_thread(void *arg)
@@ -130,9 +141,79 @@ static void *cluster_hb_fn(void *a)
 			}
 		}
 		cycle++;
-		sleep(5);
+		sleep_seconds(5);
 	}
 	return NULL;
+}
+
+/* -----------------------------------------------------------------------
+ * Startup registry conflict report
+ *
+ * node_register refused with MDS_ERR_EXISTS: the registry already holds
+ * a row for this mds_id with an equal or higher boot_epoch
+ * (mds_cluster.h).  Read that row back so the fatal message names it --
+ * the operator must tell a duplicate live daemon from the stale row of
+ * a dead incarnation whose epoch is ahead of this host's wall clock.
+ * ----------------------------------------------------------------------- */
+
+struct registry_conflict {
+	uint32_t mds_id;
+	bool     found;
+	uint64_t boot_epoch;
+	uint64_t last_heartbeat_ns;
+	char     hostname[256];
+};
+
+static int registry_conflict_cb(uint32_t mds_id, uint64_t boot_epoch,
+				const char *hostname,
+				uint16_t nfs_port, uint16_t grpc_port,
+				uint64_t last_heartbeat_ns, void *ctx)
+{
+	struct registry_conflict *conf = ctx;
+
+	(void)nfs_port;
+	(void)grpc_port;
+	if (mds_id != conf->mds_id) {
+		return 0;
+	}
+	conf->found = true;
+	conf->boot_epoch = boot_epoch;
+	conf->last_heartbeat_ns = last_heartbeat_ns;
+	(void)snprintf(conf->hostname, sizeof(conf->hostname), "%s",
+		       hostname != NULL ? hostname : "");
+	return 1;
+}
+
+static void log_registry_conflict(struct mds_catalogue *cat,
+				  uint32_t mds_id, uint64_t our_epoch)
+{
+	struct registry_conflict conf;
+
+	memset(&conf, 0, sizeof(conf));
+	conf.mds_id = mds_id;
+	(void)mds_cluster_node_list(cat, registry_conflict_cb, &conf);
+	if (conf.found) {
+		MDS_LOG_FATAL(LOG_COMP_MDS,
+			"node registry already holds mds_id %u with "
+			"boot_epoch %llu (host %s, last heartbeat %llu ns), "
+			"not below ours (%llu): another live daemon uses this "
+			"mds_id, or this host's clock was stepped back below "
+			"the previous incarnation's epoch.  Refusing to start "
+			"(split-brain).  Stop the duplicate, or -- if that "
+			"incarnation is dead -- let the clock pass its epoch "
+			"or remove the stale row, then restart.",
+			(unsigned)mds_id,
+			(unsigned long long)conf.boot_epoch,
+			conf.hostname,
+			(unsigned long long)conf.last_heartbeat_ns,
+			(unsigned long long)our_epoch);
+	} else {
+		MDS_LOG_FATAL(LOG_COMP_MDS,
+			"node registry refused mds_id %u (boot_epoch %llu) "
+			"as already registered but the row could not be read "
+			"back; refusing to start",
+			(unsigned)mds_id, (unsigned long long)our_epoch);
+	}
 }
 
 /** DS failure callback adapter -- bridges ds_health to layout_recall. */
@@ -241,8 +322,6 @@ static void failover_on_partner_loss(
 }
 
 
-
-/* NOLINTNEXTLINE(readability-function-cognitive-complexity) */
 /* -----------------------------------------------------------------------
  * parent_touch flush callback (deferred parent-dir attr aggregator,
  * ported).  Persists the accumulated change delta + flush-time
@@ -281,7 +360,12 @@ static int pt_flush_cb(uint64_t fileid, uint64_t change_delta,
 	return 0;
 }
 
-
+/* Linear daemon lifecycle: one start-up sequence with a single
+ * cleanup label, whose score is dominated by the ~100 logging macro
+ * sites (do/while + level gate each); splitting it into helpers would
+ * only relocate the sequence.  Same annotation as the other
+ * inherently linear dispatchers in this tree. */
+/* NOLINTNEXTLINE(readability-function-cognitive-complexity) */
 int main(int argc, char *argv[])
 {
 	struct mds_config cfg;
@@ -291,8 +375,24 @@ int main(int argc, char *argv[])
 	 * writes (open/lock/deleg owner fencing, remove-manifest claims,
 	 * node registry) so a restarted MDS can be told apart from the
 	 * previous incarnation.  Backend-independent; generated once the
-	 * catalogue is open. */
+	 * catalogue is open.
+	 *
+	 * It is CLOCK_REALTIME in nanoseconds (step 2c) because the node
+	 * registry contract (mds_cluster.h) needs it monotonic across
+	 * restarts of one mds_id, including a host reboot -- a since-boot
+	 * clock restarts near zero and would rank a fresh incarnation
+	 * below the dead row it replaces.  Every consumer treats the value
+	 * as an identity (equality / ordering), never as a time base.
+	 * Ordering across restarts therefore relies on the wall clock not
+	 * being stepped back below the previous incarnation's value; when
+	 * it is, node_register refuses with MDS_ERR_EXISTS and step 2d
+	 * exits with a message naming the row and both epochs -- never a
+	 * silent unregistered start. */
 	uint64_t mds_boot_epoch = 0;
+	/* CLOCK_MONOTONIC at a successful node_register (step 2d); 0 when
+	 * this node did not register.  Step 4c measures the startup
+	 * deadline from it. */
+	uint64_t cluster_register_mono_ns = 0;
 	/* Cluster heartbeat thread; started iff mds_cluster_supported(cat)
 	 * (see step 4c), joined first at shutdown. */
 	pthread_t cluster_hb_thread;
@@ -476,7 +576,7 @@ int main(int argc, char *argv[])
 					attempt,
 					bootstrap_max_retries);
 			}
-			sleep(2);
+			sleep_seconds(2);
 		}
 		if (attempt >= bootstrap_max_retries) {
 			MDS_LOG_FATAL(LOG_COMP_MDS,
@@ -497,10 +597,12 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	/* 2c. Boot epoch for this daemon instance (see declaration). */
+	/* 2c. Boot epoch for this daemon instance (see declaration):
+	 * wall-clock nanoseconds, monotonic across restarts as long as the
+	 * clock is not stepped back below the previous incarnation. */
 	{
 		struct timespec boot_ts;
-		clock_gettime(CLOCK_MONOTONIC, &boot_ts);
+		clock_gettime(CLOCK_REALTIME, &boot_ts);
 		mds_boot_epoch =
 			(uint64_t)boot_ts.tv_sec * 1000000000ULL +
 			(uint64_t)boot_ts.tv_nsec;
@@ -511,18 +613,38 @@ int main(int argc, char *argv[])
 	 * fresh is started in step 4c, AFTER the subtree map and
 	 * membership it refreshes exist; node_register has already
 	 * stamped the row's heartbeat timestamp, so peers see this node
-	 * as live from here on. */
+	 * as live from here on -- and step 4c must follow within
+	 * CLUSTER_STARTUP_DEADLINE_MS or the row goes stale while we are
+	 * still initialising.
+	 *
+	 * MDS_ERR_EXISTS is fatal: a row with an equal or higher
+	 * boot_epoch means another live daemon carries this mds_id (or
+	 * this host's clock stepped back past the dead incarnation's
+	 * epoch).  Continuing unregistered would let the standby promote
+	 * against a node that is about to serve -- split-brain -- so the
+	 * daemon exits with the conflicting row in the log. */
 	if (mds_cluster_supported(cat)) {
 		rc = mds_cluster_node_register(cat, cfg.self.id,
 					       mds_boot_epoch,
 					       cfg.self.hostname,
 					       cfg.self.nfs_port,
 					       cfg.self.grpc_port);
+		if (rc == MDS_ERR_EXISTS) {
+			log_registry_conflict(cat, cfg.self.id, mds_boot_epoch);
+			mds_catalogue_close(cat);
+			return EXIT_FAILURE;
+		}
 		if (rc != MDS_OK) {
 			MDS_LOG_WARN(LOG_COMP_MDS,
 				"node registry register failed: %d",
 				(int)rc);
 		} else {
+			struct timespec reg_ts;
+
+			clock_gettime(CLOCK_MONOTONIC, &reg_ts);
+			cluster_register_mono_ns =
+				(uint64_t)reg_ts.tv_sec * 1000000000ULL +
+				(uint64_t)reg_ts.tv_nsec;
 			MDS_LOG_INFO(LOG_COMP_MDS,
 				"node %u registered "
 				"(boot_epoch=%llu)",
@@ -707,7 +829,8 @@ int main(int argc, char *argv[])
 			for (uint32_t si = 0; si < sm_count; si++) {
 				struct subtree_entry se;
 				char pbuf[MDS_MAX_PATH];
-				char *comp, *save = NULL;
+				const char *comp;
+				char *save = NULL;
 				uint64_t fid = MDS_FILEID_ROOT;
 				bool resolved = true;
 
@@ -763,7 +886,40 @@ int main(int argc, char *argv[])
 		 * (partition-map load, registry scan, junction-root
 		 * lookups) is a handful of bounded catalogue reads.  The
 		 * opt-in legacy recovery scan (step 2f) is the one step in
-		 * between whose duration depends on namespace size. */
+		 * between whose duration depends on namespace size.
+		 *
+		 * Startup deadline: that gap is bounded by
+		 * CLUSTER_STARTUP_DEADLINE_MS (failover_watchdog.h, below the
+		 * stale threshold).  A node that overran it may already have
+		 * been declared dead by its standby, which then owns its
+		 * subtrees; starting to heartbeat and serve now would be
+		 * split-brain, so the daemon exits instead (cleanup
+		 * deregisters the row). */
+		if (cluster_register_mono_ns != 0) {
+			struct timespec now_ts;
+			uint64_t now_ns;
+			uint64_t elapsed_ms;
+
+			clock_gettime(CLOCK_MONOTONIC, &now_ts);
+			now_ns = (uint64_t)now_ts.tv_sec * 1000000000ULL +
+				 (uint64_t)now_ts.tv_nsec;
+			elapsed_ms = (now_ns - cluster_register_mono_ns) /
+				     1000000ULL;
+			if (elapsed_ms > CLUSTER_STARTUP_DEADLINE_MS) {
+				MDS_LOG_FATAL(LOG_COMP_MDS,
+					"startup took %llu ms between "
+					"node_register and the heartbeat "
+					"start, over the %u ms deadline: the "
+					"registry row may already be stale "
+					"and the standby promoted; exiting "
+					"rather than serving into a "
+					"split-brain",
+					(unsigned long long)elapsed_ms,
+					(unsigned)CLUSTER_STARTUP_DEADLINE_MS);
+				exit_code = EXIT_FAILURE;
+				goto cleanup;
+			}
+		}
 		cluster_hb_arg_g.cat = cat;
 		cluster_hb_arg_g.mds_id = cfg.self.id;
 		cluster_hb_arg_g.boot_epoch = mds_boot_epoch;
@@ -1798,7 +1954,11 @@ int main(int argc, char *argv[])
 					(unsigned)neg_ttl,
 					(unsigned)cache_pos_ttl_ms);
 			} else {
-				MDS_LOG_INFO(LOG_COMP_MDS, cfg.dirent_cache_size ? "dirent_cache_init failed" : "dirent cache disabled (dirent_cache_size=0)");
+				MDS_LOG_INFO(LOG_COMP_MDS,
+					cfg.dirent_cache_size
+					? "dirent_cache_init failed"
+					: "dirent cache disabled "
+					  "(dirent_cache_size=0)");
 			}
 		rpc_cfg.dcache = dcache;
 		}
@@ -1824,7 +1984,12 @@ int main(int argc, char *argv[])
 					"(max=%u entries)",
 					(unsigned)lcache_size);
 			} else {
-				MDS_LOG_INFO(LOG_COMP_MDS, cfg.layout_cache_size ? "layout_cache_init failed; falling back to catalogue reads" : "HPC layout cache disabled (layout_cache_size=0)");
+				MDS_LOG_INFO(LOG_COMP_MDS,
+					cfg.layout_cache_size
+					? "layout_cache_init failed; falling back "
+					  "to catalogue reads"
+					: "HPC layout cache disabled "
+					  "(layout_cache_size=0)");
 			}
 			rpc_cfg.lcache = lcache;
 			if (ct_srv != NULL) {

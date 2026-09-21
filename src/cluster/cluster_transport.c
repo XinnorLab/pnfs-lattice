@@ -6333,34 +6333,10 @@ void cluster_transport_server_set_sharding(struct cluster_server *srv,
 
 /* -----------------------------------------------------------------------
  * Split evaluator client requests (Tier 3 Phase 1)
+ *
+ * All client requests connect through ct_client_connect(), which
+ * applies the TLS/peer settings; there is no separate plain-TCP path.
  * ----------------------------------------------------------------------- */
-
-static int admin_connect(const char *host, uint16_t port)
-{
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr;
-
-    if (fd < 0) { return -1; }
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-        struct addrinfo hints = {0}, *res = NULL;
-        hints.ai_family = AF_INET;
-        if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL) {
-            close(fd); return -1;
-        }
-        memcpy(&addr.sin_addr,
-               &((struct sockaddr_in *)res->ai_addr)->sin_addr,
-               sizeof(addr.sin_addr));
-        freeaddrinfo(res);
-    }
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        close(fd); return -1;
-    }
-    { int flag = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)); }
-    return fd;
-}
 
 enum mds_status cluster_transport_request_split_proposals(
     const char *mds_host, uint16_t mds_port,

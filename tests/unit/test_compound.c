@@ -401,6 +401,18 @@ static struct nfs4_op mk_readdir(uint64_t cookie)
 	return op;
 }
 
+/* compound_process() leaves each result's scratch block (READDIR
+ * entry arrays, READ payloads, ...) owned by the caller, exactly as
+ * the RPC server releases it after encoding.  Tests that run ops with
+ * scratch-backed results call this before their result array goes out
+ * of scope. */
+static void release_results(struct nfs4_result *res, uint32_t n)
+{
+	for (uint32_t i = 0; i < n; i++) {
+		nfs4_result_scratch_release(&res[i]);
+	}
+}
+
 /* -----------------------------------------------------------------------
  * test_root_getattr -- SEQUENCE + PUTROOTFH + GETATTR
  * ----------------------------------------------------------------------- */
@@ -799,6 +811,7 @@ static void test_readdir(void)
 	ASSERT_EQ(strcmp(res[2].res.readdir.entries[0].name, "alpha"), 0);
 	ASSERT_EQ(strcmp(res[2].res.readdir.entries[1].name, "bravo"), 0);
 
+	release_results(res, 6);
 	close_test_db(db, path);
 }
 
@@ -867,6 +880,7 @@ static void test_readdir_skips_pending_hpc_create(void)
 	ASSERT_TRUE(saw_bravo);
 	ASSERT_EQ(saw_pending, false);
 
+	release_results(res, 3);
 	close_test_db(db, path);
 }
 
@@ -980,6 +994,7 @@ static void test_readdir_pagination(void)
 		ASSERT_TRUE(res[2].res.readdir.eof);
 	}
 
+	release_results(res, 10);
 	close_test_db(db, path);
 }
 
@@ -1073,6 +1088,7 @@ static void test_readdir_cursor_multipage(void)
 	}
 
 	free(seen);
+	release_results(res, 3);
 	close_test_db(db, path);
 }
 
@@ -1125,6 +1141,7 @@ static void test_readdir_byte_budget(void)
 	ASSERT_TRUE(res[2].res.readdir.count < (uint32_t)NFS4_READDIR_MAX);
 	ASSERT_EQ(res[2].res.readdir.eof, false);
 
+	release_results(res, 3);
 	close_test_db(db, path);
 }
 
@@ -1217,6 +1234,7 @@ static void test_readdir_deleted_cookie(void)
 	}
 	ASSERT_EQ(found_deleted, false);
 
+	release_results(res, 3);
 	close_test_db(db, path);
 }
 
@@ -1308,6 +1326,7 @@ static void test_readdir_hides_referral_junctions(void)
 	ASSERT_TRUE(saw_data);
 	ASSERT_TRUE(saw_alpha);
 
+	release_results(res, 8);
 	subtree_map_destroy(smap);
 	close_test_db(db, path);
 }
@@ -2633,6 +2652,7 @@ static void test_openattr_read_write(void)
 			  strlen(test_val)), 0);
 	ASSERT_TRUE(res[4].res.read.eof);
 
+	release_results(res, 8);
 	close_test_db(db, path);
 }
 
@@ -2832,10 +2852,7 @@ static char *make_ds_tmpdir(void)
 
 static void rm_ds_tmpdir(char *p)
 {
-	char cmd[4200];
-
-	snprintf(cmd, sizeof(cmd), "rm -rf '%s'", p);
-	(void)system(cmd);
+	test_rm_rf(p);
 	free(p);
 }
 
@@ -3425,6 +3442,7 @@ static void test_xattr_short_read_eof(void)
 	ASSERT_EQ(res[4].res.read.data_len, (uint32_t)8);
 	ASSERT_EQ(res[4].res.read.eof, true);
 
+	release_results(res, 8);
 	close_test_db(db, path);
 }
 
@@ -4351,6 +4369,7 @@ static void test_rfc8276_setxattr_getxattr(void)
 	ASSERT_TRUE(res[3].res.setxattr.change_after >=
 		    res[3].res.setxattr.change_before);
 
+	release_results(res, 6);
 	close_test_cat(cat, root_path);
 }
 
@@ -4513,6 +4532,7 @@ static void test_rfc8276_listxattrs(void)
 	ASSERT_EQ(res[3].res.listxattrs.name_count, (uint32_t)2);
 	ASSERT_EQ(res[3].res.listxattrs.eof, true);
 
+	release_results(res, 8);
 	close_test_cat(cat, root_path);
 }
 

@@ -93,21 +93,26 @@ struct mds_catalogue;
  * @brief Initialise the subtree map from the catalogue's partition map.
  *
  * Loads subtree entries through mds_cluster_partition_list() (the
- * backend-neutral cluster service, mds_cluster.h).  When the map has
- * no root entry afterwards, "/" is seeded as owned by @p self_id and
- * written back with mds_cluster_partition_put(); a failed list is
- * currently treated as an empty map (logged as a warning), which is
- * the behaviour carried over from the RonDB-specific initialiser until
- * the cluster-services contract replaces it.
+ * backend-neutral cluster service, mds_cluster.h).  The partition map
+ * is the authority for root ownership, so a failed list is never
+ * treated as an empty map: it is retried a small fixed number of times
+ * (3 attempts, 250 ms apart) and then fails the call -- the caller must
+ * treat that as fatal.  When the loaded map has no root row, "/" is
+ * claimed for @p self_id with an insert-only mds_cluster_partition_put()
+ * (exactly one node wins); MDS_ERR_EXISTS means another node owns root
+ * and the map is reloaded to learn the owner.  The local root entry is
+ * added only after the store accepted the insert, so no transient error
+ * can leave this node believing it owns root.
  *
  * @param cat             Catalogue handle whose backend populates the
  *                        partition_list / partition_put cluster slots
  *                        (see mds_cluster_supported()).
  * @param self_id         This MDS node's ID.
  * @param self_hostname   This node's hostname (for referrals).
- * @param[out] out        Receives the map handle.
+ * @param[out] out        Receives the map handle (untouched on failure).
  * @return MDS_OK on success, MDS_ERR_INVAL for NULL arguments,
- *         MDS_ERR_NOMEM.
+ *         MDS_ERR_NOMEM, or the dispatcher's status of the last failed
+ *         attempt (e.g. MDS_ERR_IO, MDS_ERR_NOSUPPORT).
  */
 enum mds_status subtree_map_init_from_catalogue(struct mds_catalogue *cat,
                                                 uint32_t self_id,
@@ -140,8 +145,12 @@ enum mds_status subtree_map_refresh_from_catalogue(struct subtree_map *map,
  * (mds_cluster_partition_put with insert_only == false) so subsequent
  * restarts load them instead of re-seeding from scratch.
  *
- * Idempotent: existing in-memory paths are left alone; the puts are
- * upserts because the initial shard layout is never-owned.
+ * Idempotent: existing in-memory paths are left alone.  The puts are
+ * upserts (insert_only == false) -- the only upsert in the partition
+ * map -- because the initial shard layout is never-owned: every MDS
+ * racing the seed writes identical rows (/shardK owned by K), so there
+ * is no owner to protect.  Root, which does have an owner, is claimed
+ * insert-only by subtree_map_init_from_catalogue().
  * @p partition_id for `/shardK` is K (root uses 0).
  *
  * Must run before @c subtree_map_set_membership — remote MDS IDs in the

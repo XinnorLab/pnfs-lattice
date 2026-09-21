@@ -8,7 +8,14 @@
  * partner-alive abort, subtree takeover, grace entry, client
  * recovery tracking, reclaim accept/reject, no-demote invariant,
  * replication health gate, self-fencing guard, failover_take_over,
- * partner-loss filtering, and idempotent promotion.
+ * partner-loss filtering, idempotent promotion, and recovery-row
+ * ownership (the rows the partner wrote are the ones a promotion
+ * loads; another owner's rows are not).
+ *
+ * The recovery rows are seeded through a catalogue handle opened with
+ * the PARTNER's identity (catalogue_memdb_open_cfg, cfg.self.id), so
+ * they carry owner_mds_id == PARTNER_ID exactly as the partner's own
+ * daemon would have written them.
  */
 
 #include <stdio.h>
@@ -150,8 +157,26 @@ static int detect_alive(uint32_t partner_id, void *arg)
 
 #define SELF_ID    2
 #define PARTNER_ID 1
+#define OTHER_ID   3   /* an MDS that owns none of the seeded rows */
 #define CLIENT_A   0x1001
 #define CLIENT_B   0x1002
+
+/* Catalogue handle carrying the partner's identity: recovery rows
+ * written through it are owned by PARTNER_ID, like rows the partner's
+ * daemon persisted on CREATE_SESSION. */
+static struct mds_catalogue *open_partner_catalogue(void)
+{
+    struct mds_config cfg;
+    struct mds_catalogue *cat = NULL;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.catalogue_backend = MDS_BACKEND_MEMDB;
+    cfg.self.id = PARTNER_ID;
+    if (catalogue_memdb_open_cfg(&cfg, &cat) != MDS_OK) {
+        return NULL;
+    }
+    return cat;
+}
 
 static void seed_recovery_records(struct mds_catalogue *db)
 {
@@ -243,7 +268,7 @@ static void test_promote_success(void)
     grace_init();
 
     db_path = make_temp_db_path();
-    st = ((db = open_test_catalogue()) != NULL ? MDS_OK : MDS_ERR_IO);
+    st = ((db = open_partner_catalogue()) != NULL ? MDS_OK : MDS_ERR_IO);
     ASSERT_EQ(st, MDS_OK);
     cat = db;
 
@@ -303,7 +328,7 @@ static void test_promote_from_non_standby(void)
     grace_init();
 
     db_path = make_temp_db_path();
-    st = ((db = open_test_catalogue()) != NULL ? MDS_OK : MDS_ERR_IO);
+    st = ((db = open_partner_catalogue()) != NULL ? MDS_OK : MDS_ERR_IO);
     ASSERT_EQ(st, MDS_OK);
     cat = db;
 
@@ -441,7 +466,7 @@ static void test_promote_enters_grace(void)
     grace_init();
 
     db_path = make_temp_db_path();
-    st = ((db = open_test_catalogue()) != NULL ? MDS_OK : MDS_ERR_IO);
+    st = ((db = open_partner_catalogue()) != NULL ? MDS_OK : MDS_ERR_IO);
     ASSERT_EQ(st, MDS_OK);
     cat = db;
 
@@ -489,7 +514,7 @@ static void test_grace_client_tracking(void)
     grace_init();
 
     db_path = make_temp_db_path();
-    st = ((db = open_test_catalogue()) != NULL ? MDS_OK : MDS_ERR_IO);
+    st = ((db = open_partner_catalogue()) != NULL ? MDS_OK : MDS_ERR_IO);
     ASSERT_EQ(st, MDS_OK);
     cat = db;
 
@@ -540,7 +565,7 @@ static void test_reclaim_accepted(void)
     grace_init();
 
     db_path = make_temp_db_path();
-    st = ((db = open_test_catalogue()) != NULL ? MDS_OK : MDS_ERR_IO);
+    st = ((db = open_partner_catalogue()) != NULL ? MDS_OK : MDS_ERR_IO);
     ASSERT_EQ(st, MDS_OK);
     cat = db;
 
@@ -596,7 +621,7 @@ static void test_reclaim_rejected_unknown(void)
     grace_init();
 
     db_path = make_temp_db_path();
-    st = ((db = open_test_catalogue()) != NULL ? MDS_OK : MDS_ERR_IO);
+    st = ((db = open_partner_catalogue()) != NULL ? MDS_OK : MDS_ERR_IO);
     ASSERT_EQ(st, MDS_OK);
     cat = db;
 
@@ -651,7 +676,7 @@ static void test_init_no_detect_cb(void)
     grace_init();
 
     db_path = make_temp_db_path();
-    st = ((db = open_test_catalogue()) != NULL ? MDS_OK : MDS_ERR_IO);
+    st = ((db = open_partner_catalogue()) != NULL ? MDS_OK : MDS_ERR_IO);
     ASSERT_EQ(st, MDS_OK);
     cat = db;
 
@@ -733,7 +758,7 @@ static void test_promote_idempotent(void)
     grace_init();
 
     db_path = make_temp_db_path();
-    st = ((db = open_test_catalogue()) != NULL ? MDS_OK : MDS_ERR_IO);
+    st = ((db = open_partner_catalogue()) != NULL ? MDS_OK : MDS_ERR_IO);
     ASSERT_EQ(st, MDS_OK);
     cat = db;
 
@@ -783,7 +808,7 @@ static void test_promote_with_membership(void)
     grace_init();
 
     db_path = make_temp_db_path();
-    st = ((db = open_test_catalogue()) != NULL ? MDS_OK : MDS_ERR_IO);
+    st = ((db = open_partner_catalogue()) != NULL ? MDS_OK : MDS_ERR_IO);
     ASSERT_EQ(st, MDS_OK);
     cat = db;
 
@@ -844,6 +869,105 @@ static void test_promote_with_membership(void)
 }
 
 /* -------------------------------------------------------------------
+ * Recovery-row ownership
+ * ------------------------------------------------------------------- */
+
+struct owner_list_ctx {
+    uint32_t count;
+    uint32_t foreign;   /* rows whose stored owner is not PARTNER_ID */
+};
+
+static int owner_list_cb(uint64_t clientid, uint32_t owner_mds_id,
+                         uint64_t owner_boot_epoch, void *arg)
+{
+    struct owner_list_ctx *c = arg;
+
+    (void)clientid;
+    (void)owner_boot_epoch;
+    c->count++;
+    if (owner_mds_id != PARTNER_ID) {
+        c->foreign++;
+    }
+    return 0;
+}
+
+/* 16. Rows written by the partner are listed for the partner's id only. */
+static void test_recovery_rows_owned_by_partner(void)
+{
+    struct mds_catalogue *db = NULL;
+    struct owner_list_ctx lc;
+
+    db = open_partner_catalogue();
+    ASSERT_NE(db, NULL);
+    seed_recovery_records(db);
+
+    memset(&lc, 0, sizeof(lc));
+    ASSERT_EQ(mds_coord_recovery_list(db, PARTNER_ID, owner_list_cb, &lc),
+              MDS_OK);
+    ASSERT_EQ(lc.count, 2U);
+    ASSERT_EQ(lc.foreign, 0U);
+
+    memset(&lc, 0, sizeof(lc));
+    ASSERT_EQ(mds_coord_recovery_list(db, OTHER_ID, owner_list_cb, &lc),
+              MDS_OK);
+    ASSERT_EQ(lc.count, 0U);
+
+    memset(&lc, 0, sizeof(lc));
+    ASSERT_EQ(mds_coord_recovery_list(db, SELF_ID, owner_list_cb, &lc),
+              MDS_OK);
+    ASSERT_EQ(lc.count, 0U);
+
+    mds_catalogue_close(db);
+}
+
+/* 17. Promoting against a partner that owns no rows loads no clients:
+ *     the rows PARTNER_ID wrote are not attributed to OTHER_ID. */
+static void test_promote_loads_only_partner_rows(void)
+{
+    struct subtree_map *map = NULL;
+    struct mds_catalogue *db = NULL;
+    struct failover_ctx *ctx = NULL;
+    enum mds_status st;
+
+    grace_init();
+
+    db = open_partner_catalogue();
+    ASSERT_NE(db, NULL);
+    seed_recovery_records(db);
+
+    st = subtree_map_init(NULL, NULL, SELF_ID, "standby.local",
+                                 NULL, &map);
+    ASSERT_EQ(st, MDS_OK);
+
+    struct failover_cfg cfg = {
+        .self_id          = SELF_ID,
+        .partner_id       = OTHER_ID,
+        .map              = map,
+        .cat              = db,
+        .grace_period_sec = 90,
+        .detect_cb        = detect_dead,
+        .detect_arg       = NULL,
+        .membership       = NULL,
+        .hm               = NULL,
+    };
+    ASSERT_EQ(failover_init(&cfg, &ctx), MDS_OK);
+    ASSERT_EQ(failover_promote(ctx), MDS_OK);
+    ASSERT_EQ(failover_get_role(ctx), FAILOVER_PRIMARY);
+
+    /* Grace runs, but with no tracked clients: neither of the
+     * partner's clients may reclaim through this promotion. */
+    ASSERT_TRUE(grace_is_active());
+    ASSERT_EQ(grace_pending_count(), 0U);
+    ASSERT_TRUE(!grace_client_is_recovering(CLIENT_A));
+    ASSERT_TRUE(!grace_client_is_recovering(CLIENT_B));
+
+    grace_exit();
+    failover_destroy(ctx);
+    subtree_map_destroy(map);
+    mds_catalogue_close(db);
+}
+
+/* -------------------------------------------------------------------
  * main
  * ------------------------------------------------------------------- */
 
@@ -867,6 +991,10 @@ int main(void)
     RUN_TEST(test_failover_take_over_local);
     RUN_TEST(test_promote_idempotent);
     RUN_TEST(test_promote_with_membership);
+
+    /* Recovery-row ownership */
+    RUN_TEST(test_recovery_rows_owned_by_partner);
+    RUN_TEST(test_promote_loads_only_partner_rows);
 
     fprintf(stdout, "\n  %d/%d tests passed.\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

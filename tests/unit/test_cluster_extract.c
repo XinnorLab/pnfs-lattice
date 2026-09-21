@@ -9,12 +9,17 @@
  * (and fake lifecycle slots) drives the daemon-side consumers exactly
  * as the dispatchers do, without any backend:
  *   - subtree_map_init_from_catalogue / refresh_from_catalogue /
- *     seed_shards over mds_cluster_partition_list / _put (including
- *     the carried-over seed-root-on-list-failure behaviour, pinned so
- *     its later replacement is a visible test change);
- *   - cluster_membership_populate over mds_cluster_node_list;
+ *     seed_shards over mds_cluster_partition_list / _put: a failed
+ *     list is fatal after a bounded retry and never seeds root, the
+ *     root claim is insert-only and EXISTS means another node owns
+ *     root, shard seeding stays an upsert;
+ *   - cluster_membership_populate over mds_cluster_node_list, which
+ *     merges only the registry's address fields into existing members
+ *     (self keeps its configured standby role and partner);
  *   - failover_watchdog_start refusing with NOSUPPORT when the
- *     node_scan_stale slot is absent;
+ *     node_scan_stale slot is absent, and the heartbeat plausibility
+ *     rule: a partner row below the realtime floor is indeterminate
+ *     and never triggers a promotion attempt;
  *   - the mds_cluster_* / mds_catalogue_image_feed_* dispatchers'
  *     INVAL / NOSUPPORT / pass-through contract (C4);
  *   - the backend name table (pnfs_common: name <-> enum), the core's
@@ -23,10 +28,12 @@
  */
 
 #include <fcntl.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "pnfs_mds.h"
@@ -127,6 +134,11 @@ struct fake_node_row {
 static struct fake_pm_row   fake_pm_rows[FAKE_ROWS_MAX];
 static uint32_t             fake_pm_row_count;
 static enum mds_status      fake_pm_list_status;
+static uint32_t             fake_pm_list_calls;
+/* When non-zero, list calls numbered below this deliver no rows: the
+ * rows "appear" between two startup attempts (a peer's root claim, or
+ * this node's own in-doubt insert landing). */
+static uint32_t             fake_pm_reveal_at_call;
 static struct fake_pm_put   fake_pm_puts[FAKE_CALLS_MAX];
 static uint32_t             fake_pm_put_count;
 static enum mds_status      fake_pm_put_status;
@@ -155,6 +167,8 @@ static void fake_reset(void)
     memset(fake_pm_rows, 0, sizeof(fake_pm_rows));
     fake_pm_row_count = 0;
     fake_pm_list_status = MDS_OK;
+    fake_pm_list_calls = 0;
+    fake_pm_reveal_at_call = 0;
     memset(fake_pm_puts, 0, sizeof(fake_pm_puts));
     fake_pm_put_count = 0;
     fake_pm_put_status = MDS_OK;
@@ -194,6 +208,25 @@ static void fake_node_add(uint32_t mds_id, const char *hostname,
         r->last_heartbeat_ns = last_heartbeat_ns;
         fake_node_row_count++;
     }
+}
+
+static uint64_t realtime_now_ns(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void sleep_ms(unsigned ms)
+{
+    struct timespec ts;
+
+    ts.tv_sec = (time_t)(ms / 1000U);
+    ts.tv_nsec = (long)((ms % 1000U) * 1000000U);
+    (void)nanosleep(&ts, NULL);
 }
 
 static enum mds_status fake_node_register(struct mds_catalogue *cat,
@@ -282,8 +315,13 @@ static enum mds_status fake_partition_list(struct mds_catalogue *cat,
     uint32_t i;
 
     (void)cat;
+    fake_pm_list_calls++;
     if (fake_pm_list_status != MDS_OK) {
         return fake_pm_list_status;
+    }
+    if (fake_pm_reveal_at_call != 0 &&
+        fake_pm_list_calls < fake_pm_reveal_at_call) {
+        return MDS_OK;
     }
     for (i = 0; i < fake_pm_row_count; i++) {
         const struct fake_pm_row *r = &fake_pm_rows[i];
@@ -576,15 +614,15 @@ static void test_subtree_init_loads_rows(void)
               MDS_ERR_INVAL);
 }
 
-/* Pins the carried-over behaviour: a failed partition_list is treated
- * as an empty map, root is seeded for self and written back with ONE
- * upsert (id 0, insert_only == false).  Its replacement by the
- * cluster-services contract must change this test deliberately. */
-static void test_subtree_init_list_failure_seeds_root(void)
+/* Contract (mds_cluster.h): a failed partition_list at startup is
+ * fatal after a bounded retry and never seeds root; the partition map
+ * is the authority for root ownership and is never mutated on a read
+ * failure.  The previous behaviour (empty map + root upsert) rewrote
+ * the real root owner on a transient error. */
+static void test_subtree_init_list_failure_is_fatal(void)
 {
     struct mds_catalogue *cat;
     struct subtree_map *map = NULL;
-    struct subtree_entry e;
 
     fake_reset();
     fake_pm_add(2, 2, MDS_PARTITION_STATE_ACTIVE, "/shard2");
@@ -592,34 +630,97 @@ static void test_subtree_init_list_failure_seeds_root(void)
     cat = make_fake_cat(&fake_ops_full, &fake_lifecycle_no_feed,
                         MDS_CAT_CAP_MULTI_PROCESS);
 
+    /* Every attempt lists, none writes; the status passes through and
+     * *out is untouched. */
+    ASSERT_EQ(subtree_map_init_from_catalogue(cat, 7, "mds7.local", &map),
+              MDS_ERR_IO);
+    ASSERT_TRUE(map == NULL);
+    ASSERT_EQ(fake_pm_list_calls, 3U);
+    ASSERT_EQ(fake_pm_put_count, 0U);
+
+    /* A store without a partition map is refused the same way. */
+    fake_reset();
+    fake_pm_list_status = MDS_ERR_NOSUPPORT;
+    ASSERT_EQ(subtree_map_init_from_catalogue(cat, 7, NULL, &map),
+              MDS_ERR_NOSUPPORT);
+    ASSERT_TRUE(map == NULL);
+    ASSERT_EQ(fake_pm_put_count, 0U);
+}
+
+/* Root claim: insert-only, exactly one node wins; EXISTS means another
+ * node owns root and the map is reloaded to learn the owner; a
+ * transient put failure never leaves this node owning root locally. */
+static void test_subtree_init_root_claim_insert_only(void)
+{
+    struct mds_catalogue *cat;
+    struct subtree_map *map = NULL;
+    struct subtree_entry e;
+
+    /* Empty map: root is claimed with ONE insert-only put for self and
+     * added locally only after the store accepted it. */
+    fake_reset();
+    cat = make_fake_cat(&fake_ops_full, &fake_lifecycle_no_feed,
+                        MDS_CAT_CAP_MULTI_PROCESS);
     ASSERT_EQ(subtree_map_init_from_catalogue(cat, 7, "mds7.local", &map),
               MDS_OK);
     ASSERT_EQ(subtree_map_count(map), 1U);
     ASSERT_EQ(subtree_map_lookup_exact(map, "/", &e), MDS_OK);
     ASSERT_EQ(e.owner_mds_id, 7U);
+    ASSERT_EQ((int)e.state, (int)SUBTREE_ACTIVE);
+    ASSERT_EQ(fake_pm_list_calls, 1U);
     ASSERT_EQ(fake_pm_put_count, 1U);
     ASSERT_EQ(fake_pm_puts[0].partition_id, 0U);
     ASSERT_EQ(fake_pm_puts[0].owner, 7U);
     ASSERT_EQ(fake_pm_puts[0].state, MDS_PARTITION_STATE_ACTIVE);
     ASSERT_STREQ(fake_pm_puts[0].path, "/");
-    ASSERT_TRUE(!fake_pm_puts[0].insert_only);
+    ASSERT_TRUE(fake_pm_puts[0].insert_only);
     subtree_map_destroy(map);
+    map = NULL;
 
-    /* An empty (successful) list seeds root the same way. */
+    /* Lost the claim: node 9 inserted root between our list and our
+     * put.  EXISTS is not an error -- the map is re-listed and root
+     * comes back owned by 9, never by self. */
     fake_reset();
+    fake_pm_add(0, 9, MDS_PARTITION_STATE_ACTIVE, "/");
+    fake_pm_reveal_at_call = 2;
+    fake_pm_put_status = MDS_ERR_EXISTS;
     ASSERT_EQ(subtree_map_init_from_catalogue(cat, 7, NULL, &map), MDS_OK);
     ASSERT_EQ(subtree_map_count(map), 1U);
+    ASSERT_EQ(subtree_map_lookup_exact(map, "/", &e), MDS_OK);
+    ASSERT_EQ(e.owner_mds_id, 9U);
+    ASSERT_TRUE(!subtree_map_is_local(map, "/"));
+    ASSERT_EQ(fake_pm_list_calls, 2U);
     ASSERT_EQ(fake_pm_put_count, 1U);
-    ASSERT_EQ(fake_pm_puts[0].partition_id, 0U);
-    ASSERT_TRUE(!fake_pm_puts[0].insert_only);
+    ASSERT_TRUE(fake_pm_puts[0].insert_only);
     subtree_map_destroy(map);
+    map = NULL;
 
-    /* A failed root put is not fatal (carried over). */
+    /* In-doubt claim: the put reports a failure but the insert landed
+     * (root owned by self appears on the re-list).  The retry converges
+     * on the store's view; the claim is not repeated blindly. */
     fake_reset();
+    fake_pm_add(0, 7, MDS_PARTITION_STATE_ACTIVE, "/");
+    fake_pm_reveal_at_call = 2;
     fake_pm_put_status = MDS_ERR_IO;
     ASSERT_EQ(subtree_map_init_from_catalogue(cat, 7, NULL, &map), MDS_OK);
-    ASSERT_EQ(subtree_map_count(map), 1U);
+    ASSERT_EQ(subtree_map_lookup_exact(map, "/", &e), MDS_OK);
+    ASSERT_EQ(e.owner_mds_id, 7U);
+    ASSERT_EQ(fake_pm_list_calls, 2U);
+    ASSERT_EQ(fake_pm_put_count, 1U);
     subtree_map_destroy(map);
+    map = NULL;
+
+    /* A root claim that keeps failing is fatal: one insert-only put
+     * per attempt, no local root, status passed through. */
+    fake_reset();
+    fake_pm_put_status = MDS_ERR_IO;
+    ASSERT_EQ(subtree_map_init_from_catalogue(cat, 7, NULL, &map),
+              MDS_ERR_IO);
+    ASSERT_TRUE(map == NULL);
+    ASSERT_EQ(fake_pm_list_calls, 3U);
+    ASSERT_EQ(fake_pm_put_count, 3U);
+    ASSERT_TRUE(fake_pm_puts[0].insert_only);
+    ASSERT_TRUE(fake_pm_puts[2].insert_only);
 }
 
 static void test_subtree_refresh_from_catalogue(void)
@@ -735,8 +836,11 @@ static void test_membership_populate(void)
     struct subtree_map *map = NULL;
     struct cluster_membership *cm = NULL;
     struct cluster_member m;
+    struct cluster_member joiner;
     char host[64];
 
+    /* Self is a configured standby paired with node 2; the registry
+     * (which carries addresses only) lists self and two peers. */
     fake_reset();
     fake_node_add(1, "mds1.local", 2049, 50051, 1000);
     fake_node_add(2, "mds2.local", 2050, 50052, 2000);
@@ -744,26 +848,86 @@ static void test_membership_populate(void)
     cat = make_fake_cat(&fake_ops_full, &fake_lifecycle_no_feed,
                         MDS_CAT_CAP_MULTI_PROCESS);
     make_test_config(&cfg, 1, "mds1.local");
+    cfg.self_role = (int)NODE_STANDBY;
+    cfg.self_failover_partner_id = 2;
+    (void)snprintf(cfg.cluster_bind_addr, sizeof(cfg.cluster_bind_addr),
+                   "10.0.0.1");
     ASSERT_EQ(subtree_map_init(NULL, NULL, 1, "mds1.local", NULL, &map),
               MDS_OK);
     ASSERT_EQ(cluster_membership_init(&cfg, map, NULL, &cm), MDS_OK);
     ASSERT_EQ(cluster_membership_count(cm), 1U);
+    ASSERT_EQ(cluster_membership_get(cm, 1, &m), MDS_OK);
+    ASSERT_EQ((int)m.role, (int)NODE_STANDBY);
+    ASSERT_EQ((int)m.lifecycle, (int)NODE_IDLE);
+
+    /* Node 3 joined through the transport as a standby of 1 before the
+     * registry scan; its topology is local state too. */
+    memset(&joiner, 0, sizeof(joiner));
+    joiner.mds_id = 3;
+    (void)snprintf(joiner.hostname, sizeof(joiner.hostname), "old3.local");
+    joiner.nfs_port = 1;
+    joiner.grpc_port = 1;
+    joiner.role = NODE_STANDBY;
+    joiner.lifecycle = NODE_IDLE;
+    joiner.failover_partner_id = 1;
+    joiner.wire_compat_version = 7;
+    (void)snprintf(joiner.cluster_addr, sizeof(joiner.cluster_addr),
+                   "10.0.0.3");
+    ASSERT_EQ(cluster_node_join(cm, &joiner), MDS_OK);
+    ASSERT_EQ(cluster_membership_count(cm), 2U);
 
     ASSERT_EQ(cluster_membership_populate(cm, cat), MDS_OK);
     ASSERT_EQ(cluster_membership_count(cm), 3U);
+
+    /* Self: the registry row refreshes nothing it did not already
+     * know; the configured role, lifecycle, partner, cluster address
+     * and wire-compat version survive (main.c arms failover only when
+     * self is still NODE_STANDBY here). */
+    ASSERT_EQ(cluster_membership_get(cm, 1, &m), MDS_OK);
+    ASSERT_EQ((int)m.role, (int)NODE_STANDBY);
+    ASSERT_EQ((int)m.lifecycle, (int)NODE_IDLE);
+    ASSERT_EQ(m.failover_partner_id, 2U);
+    ASSERT_EQ(m.wire_compat_version, (uint32_t)PNFS_MDS_WIRE_COMPAT_VERSION);
+    ASSERT_STREQ(m.cluster_addr, "10.0.0.1");
+    ASSERT_STREQ(m.hostname, "mds1.local");
+    ASSERT_EQ(m.nfs_port, 2049);
+
+    /* Transport-joined peer: address fields follow the registry, the
+     * JOIN topology is kept. */
+    ASSERT_EQ(cluster_membership_get(cm, 3, &m), MDS_OK);
+    ASSERT_STREQ(m.hostname, "mds3.local");
+    ASSERT_EQ(m.nfs_port, 2051);
+    ASSERT_EQ(m.grpc_port, 50053);
+    ASSERT_EQ((int)m.role, (int)NODE_STANDBY);
+    ASSERT_EQ((int)m.lifecycle, (int)NODE_IDLE);
+    ASSERT_EQ(m.failover_partner_id, 1U);
+    ASSERT_EQ(m.wire_compat_version, 7U);
+    ASSERT_STREQ(m.cluster_addr, "10.0.0.3");
+
+    /* Registry-only peer: inserted with the registry defaults and the
+     * legacy wire-compat version 1 (never 0, which would fail the
+     * promotion compat gate against self's real version). */
     ASSERT_EQ(cluster_membership_get(cm, 2, &m), MDS_OK);
     ASSERT_STREQ(m.hostname, "mds2.local");
     ASSERT_EQ(m.nfs_port, 2050);
     ASSERT_EQ(m.grpc_port, 50052);
     ASSERT_EQ((int)m.role, (int)NODE_ACTIVE);
     ASSERT_EQ((int)m.lifecycle, (int)NODE_ACTIVE_SERVING);
+    ASSERT_EQ(m.failover_partner_id, 0U);
+    ASSERT_EQ(m.wire_compat_version, 1U);
+    ASSERT_STREQ(m.cluster_addr, "");
+    ASSERT_TRUE(m.join_time_sec != 0);
     /* Peer hostnames flow into the subtree map for referrals. */
     ASSERT_EQ(subtree_map_node_hostname(map, 3, host, sizeof(host)), MDS_OK);
     ASSERT_STREQ(host, "mds3.local");
 
-    /* Re-populating is an upsert, not a duplicate insert. */
+    /* Re-populating is a merge, not a duplicate insert, and still does
+     * not touch local state. */
     ASSERT_EQ(cluster_membership_populate(cm, cat), MDS_OK);
     ASSERT_EQ(cluster_membership_count(cm), 3U);
+    ASSERT_EQ(cluster_membership_get(cm, 1, &m), MDS_OK);
+    ASSERT_EQ((int)m.role, (int)NODE_STANDBY);
+    ASSERT_EQ(m.failover_partner_id, 2U);
 
     /* Scan failure passes through unchanged (C4). */
     fake_node_list_status = MDS_ERR_IO;
@@ -839,6 +1003,130 @@ static void test_watchdog_start_contract(void)
     failover_watchdog_stop(wd);
     failover_watchdog_stop(NULL);
     ASSERT_EQ((int)failover_get_role(fo), (int)FAILOVER_STANDBY);
+
+    failover_destroy(fo);
+    subtree_map_destroy(map);
+}
+
+/* -------------------------------------------------------------------
+ * Heartbeat clock domain: the plausibility rule
+ * ------------------------------------------------------------------- */
+
+static void test_heartbeat_plausibility_predicate(void)
+{
+    /* The floor is 2020-01-01T00:00:00Z in nanoseconds. */
+    ASSERT_EQ(FAILOVER_HB_REALTIME_FLOOR_NS,
+              1577836800ULL * 1000000000ULL);
+
+    /* Anything a CLOCK_MONOTONIC writer can produce is implausible:
+     * 0, one second, 30 days and 10 years of uptime. */
+    ASSERT_TRUE(!failover_heartbeat_plausible(0));
+    ASSERT_TRUE(!failover_heartbeat_plausible(1000000000ULL));
+    ASSERT_TRUE(!failover_heartbeat_plausible(30ULL * 86400ULL *
+                                              1000000000ULL));
+    ASSERT_TRUE(!failover_heartbeat_plausible(10ULL * 366ULL * 86400ULL *
+                                              1000000000ULL));
+    ASSERT_TRUE(!failover_heartbeat_plausible(
+                    FAILOVER_HB_REALTIME_FLOOR_NS - 1));
+
+    /* The floor itself and every later realtime stamp are plausible. */
+    ASSERT_TRUE(failover_heartbeat_plausible(FAILOVER_HB_REALTIME_FLOOR_NS));
+    ASSERT_TRUE(failover_heartbeat_plausible(
+                    FAILOVER_HB_REALTIME_FLOOR_NS + 1));
+    ASSERT_TRUE(failover_heartbeat_plausible(realtime_now_ns()));
+    ASSERT_TRUE(failover_heartbeat_plausible(UINT64_MAX));
+
+    /* The startup budget sits below the default stale threshold. */
+    ASSERT_TRUE(CLUSTER_STARTUP_DEADLINE_MS <
+                FAILOVER_WATCHDOG_STALE_TIMEOUT_MS_DEFAULT);
+}
+
+/* detect_cb hook: failover_promote consults it before any state
+ * change, so counting its calls observes "promotion attempted" without
+ * letting a promotion happen (0 = partner alive -> MDS_ERR_PERM). */
+static _Atomic int detect_calls;
+
+static int fake_detect_partner_alive(uint32_t partner_id, void *arg)
+{
+    (void)partner_id;
+    (void)arg;
+    atomic_fetch_add(&detect_calls, 1);
+    return 0;
+}
+
+/* Run the watchdog against the current fake registry for @run_ms with
+ * a 10 ms poll and no boot-up grace; returns the promotion attempts. */
+static int watchdog_attempts_over(struct failover_ctx *fo,
+                                  struct mds_catalogue *cat,
+                                  unsigned run_ms)
+{
+    struct failover_watchdog *wd = NULL;
+    struct failover_watchdog_cfg wd_cfg;
+
+    memset(&wd_cfg, 0, sizeof(wd_cfg));
+    wd_cfg.fo = fo;
+    wd_cfg.cat = cat;
+    wd_cfg.partner_id = 1;
+    wd_cfg.poll_interval_ms = 10;
+    wd_cfg.min_observe_ms = 1;
+    atomic_store(&detect_calls, 0);
+    if (failover_watchdog_start(&wd_cfg, &wd) != MDS_OK) {
+        return -1;
+    }
+    sleep_ms(run_ms);
+    failover_watchdog_stop(wd);
+    return atomic_load(&detect_calls);
+}
+
+/* A partner row below the realtime floor is indeterminate: the store
+ * reports it as stale (it is below any threshold) but the watchdog
+ * must skip the tick and never attempt a promotion.  A plausible stale
+ * row does trigger the attempt; a fresh one does not. */
+static void test_watchdog_indeterminate_partner_skips_tick(void)
+{
+    struct mds_catalogue *cat;
+    struct subtree_map *map = NULL;
+    struct failover_ctx *fo = NULL;
+    struct failover_cfg fo_cfg;
+    int attempts;
+
+    fake_reset();
+    cat = make_fake_cat(&fake_ops_full, &fake_lifecycle_no_feed,
+                        MDS_CAT_CAP_MULTI_PROCESS);
+    ASSERT_EQ(subtree_map_init(NULL, NULL, 2, "standby", NULL, &map), MDS_OK);
+    memset(&fo_cfg, 0, sizeof(fo_cfg));
+    fo_cfg.self_id = 2;
+    fo_cfg.partner_id = 1;
+    fo_cfg.map = map;
+    fo_cfg.cat = cat;
+    fo_cfg.detect_cb = fake_detect_partner_alive;
+    ASSERT_EQ(failover_init(&fo_cfg, &fo), MDS_OK);
+
+    /* Partner stamped 5 s of host uptime (pre-upgrade writer): many
+     * ticks, zero attempts. */
+    fake_node_add(1, "primary", 2049, 50051, 5ULL * 1000000000ULL);
+    attempts = watchdog_attempts_over(fo, cat, 150);
+    ASSERT_EQ(attempts, 0);
+    ASSERT_EQ((int)failover_get_role(fo), (int)FAILOVER_STANDBY);
+
+    /* The same partner with a realtime stamp a minute old IS stale:
+     * promotion is attempted (and refused by detect_cb). */
+    fake_node_rows[0].last_heartbeat_ns =
+        realtime_now_ns() - 60ULL * 1000000000ULL;
+    attempts = watchdog_attempts_over(fo, cat, 150);
+    ASSERT_TRUE(attempts >= 1);
+    ASSERT_EQ((int)failover_get_role(fo), (int)FAILOVER_STANDBY);
+
+    /* A fresh realtime stamp is below no threshold: no attempt. */
+    fake_node_rows[0].last_heartbeat_ns = realtime_now_ns();
+    attempts = watchdog_attempts_over(fo, cat, 150);
+    ASSERT_EQ(attempts, 0);
+    ASSERT_EQ((int)failover_get_role(fo), (int)FAILOVER_STANDBY);
+
+    /* An implausible row of ANOTHER node never affects the partner. */
+    fake_node_add(3, "other", 2049, 50053, 1);
+    attempts = watchdog_attempts_over(fo, cat, 150);
+    ASSERT_EQ(attempts, 0);
 
     failover_destroy(fo);
     subtree_map_destroy(map);
@@ -1217,11 +1505,14 @@ int main(void)
     RUN_TEST(test_cluster_supported_predicates);
     RUN_TEST(test_cluster_dispatch_args_and_passthrough);
     RUN_TEST(test_subtree_init_loads_rows);
-    RUN_TEST(test_subtree_init_list_failure_seeds_root);
+    RUN_TEST(test_subtree_init_list_failure_is_fatal);
+    RUN_TEST(test_subtree_init_root_claim_insert_only);
     RUN_TEST(test_subtree_refresh_from_catalogue);
     RUN_TEST(test_subtree_seed_shards);
     RUN_TEST(test_membership_populate);
     RUN_TEST(test_watchdog_start_contract);
+    RUN_TEST(test_heartbeat_plausibility_predicate);
+    RUN_TEST(test_watchdog_indeterminate_partner_skips_tick);
     RUN_TEST(test_image_feed_dispatch);
     RUN_TEST(test_backend_names);
     RUN_TEST(test_backend_registry);

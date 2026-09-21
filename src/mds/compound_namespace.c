@@ -132,7 +132,6 @@ enum nfs4_status op_access(struct compound_data *cd,
 		{
 			uint32_t mode = acc_inode.mode;
 			uint32_t allowed = 0;
-			uint32_t perm;
 
 			if (cd->cred_uid == 0) {
 				/*
@@ -145,6 +144,8 @@ enum nfs4_status op_access(struct compound_data *cd,
 					allowed &= ~ACCESS4_EXECUTE;
 				}
 			} else {
+				uint32_t perm;
+
 				/* Owner / group / other class. */
 				if (cd->cred_uid == (uint32_t)acc_inode.uid) {
 					perm = (mode >> 6) & 7;
@@ -1642,7 +1643,6 @@ static void enqueue_gc_for_final_unlink(struct compound_data *cd,
 	uint32_t stripe_unit = 0;
 	uint32_t mirror_count = mirror_count_prefetch;
 	enum mds_status st;
-	uint32_t i;
 	bool entries_owned = false;
 	struct mds_ds_map_entry *uniq = NULL;
 	uint32_t n_uniq = 0;
@@ -1656,7 +1656,8 @@ static void enqueue_gc_for_final_unlink(struct compound_data *cd,
 					&mirror_count, &entries);
 		entries_owned = true;
 	} else {
-		st = (entries != NULL && stripe_count > 0 && mirror_count > 0)
+		/* Prefetched snapshot: usable only with a real geometry. */
+		st = (stripe_count > 0 && mirror_count > 0)
 			? MDS_OK : MDS_ERR_NOTFOUND;
 	}
 	(void)stripe_unit;
@@ -1678,6 +1679,8 @@ static void enqueue_gc_for_final_unlink(struct compound_data *cd,
 	if (collect_unique_ds_gc_entries(entries, stripe_count,
 					 mirror_count, &uniq,
 					 &n_uniq) == 0) {
+		uint32_t i;
+
 		for (i = 0; i < n_uniq; i++) {
 			(void)mds_cat_gc_enqueue_hint(cd->cat, NULL, fileid,
 						      uniq[i].ds_id,
@@ -1758,18 +1761,422 @@ void compound_orphan_finalize(struct compound_data *cd,
 	compound_inode_invalidate(cd, ino->fileid);
 }
 
+/* -----------------------------------------------------------------------
+ * REMOVE -- op_remove and its helpers.
+ *
+ * Everything below is derived BEFORE the mutation and shared by the
+ * helpers through this state.  sm_entries is owned by the state and
+ * freed by op_remove unless op_remove_finish hands it over to
+ * enqueue_gc_for_final_unlink.
+ * ----------------------------------------------------------------------- */
+struct op_remove_state {
+	uint64_t change_before;    /* parent change before the mutation */
+	struct mds_inode parent;
+	bool parent_valid;
+	enum mds_status lookup_st; /* cat_lookup of the child */
+	struct mds_inode child;    /* valid iff lookup_st == MDS_OK */
+	bool quota;
+	bool final_data_unlink;    /* REG whose last link is going */
+	uint64_t fileid;           /* child fileid, 0 when unresolved */
+	struct mds_ds_map_entry *sm_entries; /* stripe snapshot (owned) */
+	uint32_t sm_sc;
+	uint32_t sm_su;
+	uint32_t sm_mc;
+	bool gc_folded;
+};
+
+/* Xattr namespace: REMOVE deletes an xattr. */
+static enum nfs4_status op_remove_xattr(struct compound_data *cd,
+					const struct nfs4_op *op)
+{
+	uint64_t base = xattr_base_fileid(cd->current_fh.fileid);
+	enum nfs4_status nst;
+	enum mds_status st;
+
+	nst = check_fh_frozen(cd, base, "");
+	if (nst != NFS4_OK) {
+		return nst;
+	}
+	if (cd->cat == NULL) {
+		return NFS4ERR_INVAL;
+	}
+	st = mds_cat_xattr_del(cd->cat, NULL, base, op->arg.remove.name);
+	if (st != MDS_OK) {
+		return mds_status_to_nfs4(st);
+	}
+
+	cd->xattr_obj_set = false;
+	return NFS4_OK;
+}
+
+/*
+ * Resolve parent and child BEFORE the mutation: the parent for
+ * change_info and the POSIX DAC checks, the child for quota, the
+ * final-unlink decision and the stripe snapshot.  Returns a DAC error
+ * or NFS4_OK; a failed child lookup is NOT an error here -- the remove
+ * itself reports it (NOENT), exactly as before.
+ */
+static enum nfs4_status op_remove_resolve(struct compound_data *cd,
+					  const struct nfs4_op *op,
+					  struct op_remove_state *rs)
+{
+	enum nfs4_status nst;
+
+	/* R1.3: capture parent change before mutation for change_info.
+	 * The same read feeds the POSIX DAC checks (write+search on the
+	 * directory here; the sticky rule after the child lookup). */
+	if (compound_inode_get(cd, cd->current_fh.fileid,
+			       &rs->parent) == MDS_OK) {
+		rs->change_before = rs->parent.change;
+		rs->parent_valid = true;
+	}
+	/* POSIX DAC: removing an entry mutates the directory. */
+	if (rs->parent_valid) {
+		nst = compound_dir_mutate_check(cd, &rs->parent);
+		if (nst != NFS4_OK) {
+			return nst;
+		}
+	}
+
+	/* Quota: look up child to account for removal.
+	 *
+	 * The same lookup also tells us whether this is the final
+	 * unlink of a regular file: nlink == 1 + type == REG means
+	 * the very next cat_remove() will drop the inode to zero
+	 * links and orphan its DS-side data files.  We capture the
+	 * answer here — BEFORE the mutation — so we can schedule
+	 * GC against a still-coherent stripe map after a successful
+	 * remove. */
+	rs->lookup_st = cat_lookup(cd, cd->current_fh.fileid,
+				   op->arg.remove.name, &rs->child);
+	/* POSIX DAC: S_ISVTX restricted deletion (sticky directories). */
+	if (rs->lookup_st == MDS_OK && rs->parent_valid) {
+		nst = compound_sticky_delete_check(cd, &rs->parent,
+						   &rs->child);
+		if (nst != NFS4_OK) {
+			return nst;
+		}
+	}
+	/*
+	 * RFC 8881 S18.25.4 / POSIX rmdir(2): removing a non-empty
+	 * directory MUST fail with NFS4ERR_NOTEMPTY.  Every backend
+	 * decides emptiness INSIDE the transaction that removes the
+	 * directory and answers MDS_ERR_NOTEMPTY (catalogue contract
+	 * C3), so no separate probe runs here: a probe-then-remove pair
+	 * is exactly the window in which a concurrent CREATE used to
+	 * land a dirent under a directory that was then removed.
+	 */
+	rs->quota = (rs->lookup_st == MDS_OK && cd->quota != NULL);
+	rs->final_data_unlink = (rs->lookup_st == MDS_OK &&
+				 rs->child.type == MDS_FTYPE_REG &&
+				 rs->child.nlink == 1);
+	rs->fileid = (rs->lookup_st == MDS_OK) ? rs->child.fileid : 0;
+	return NFS4_OK;
+}
+
+/*
+ * v9: a single-stripe file (MDS_IFLAG_INLINE_STRIPE) carries its one
+ * DS entry on the inode we already read in cat_lookup.  Build the
+ * stripe-map snapshot from it ONCE here -- independent of the
+ * proxy/fence path below -- so both the DS fence AND the GC enqueue
+ * (which cleans up the DS backing file) use it with no
+ * cat_stripe_map_get.  Without this the GC path would fall back to
+ * cat_stripe_map_get, get NOTFOUND (inline files have no stripe
+ * rows), and skip enqueue -> the DS file would leak.
+ */
+static void op_remove_snapshot_inline_stripe(struct op_remove_state *rs)
+{
+	uint32_t fhl;
+
+	if (!rs->final_data_unlink || rs->fileid == 0 ||
+	    (rs->child.flags & MDS_IFLAG_INLINE_STRIPE) == 0U) {
+		return;
+	}
+	rs->sm_entries = calloc(1, sizeof(*rs->sm_entries));
+	if (rs->sm_entries == NULL) {
+		return;
+	}
+	fhl = rs->child.inline_fh_len;
+	if (fhl > MDS_NFS_FH_MAX) {
+		fhl = MDS_NFS_FH_MAX;
+	}
+	rs->sm_entries[0].ds_id = rs->child.inline_ds_id;
+	rs->sm_entries[0].nfs_fh_len = fhl;
+	if (fhl > 0) {
+		memcpy(rs->sm_entries[0].nfs_fh, rs->child.inline_fh, fhl);
+	}
+	rs->sm_sc = 1;
+	rs->sm_mc = 1;
+	rs->sm_su = rs->child.stripe_unit;
+}
+
+/*
+ * Final unlink of a regular file: revoke layouts, prefetch the stripe
+ * map and drop in-memory delegations BEFORE the namespace mutation.
+ * Returns NFS4ERR_DELAY when the layout recall enumeration failed
+ * (fail closed: never remove the entry while stale layouts remain);
+ * the caller still owns rs->sm_entries.
+ */
+static enum nfs4_status op_remove_prepare_final_unlink(
+	struct compound_data *cd, struct op_remove_state *rs)
+{
+	if (!rs->final_data_unlink || rs->fileid == 0) {
+		return NFS4_OK;
+	}
+	/*
+	 * Mark Q5 P04 — layout-recall on final unlink.
+	 *
+	 * Revoke layouts BEFORE cat_remove() drops the final
+	 * namespace entry.  Linux answers CB_LAYOUTRECALL by
+	 * sending LAYOUTRETURN; that compound starts with PUTFH
+	 * on the recalled fileid.  If we remove the inode first,
+	 * the holder sees NFS4ERR_STALE on that PUTFH and enters
+	 * migration recovery instead of returning the layout,
+	 * leaving the peer's unlink path permanently wedged.
+	 *
+	 * layout_recall_revoke_all_for_unlink() is intentionally
+	 * stronger than the ordinary byte-range conflict helper:
+	 * it sends best-effort callbacks while PUTFH can still
+	 * resolve the object, then unconditionally drops every
+	 * layout-state row for this fileid.  If catalogue recall
+	 * enumeration fails, fail closed with DELAY rather than
+	 * removing the namespace entry while stale layouts remain.
+	 */
+	/*
+	 * Under transient_state_cache=on the layout_state table is empty
+	 * (every grant site is gated on !cd->skip_transient_ndb), so this
+	 * unlink recall enumeration is a guaranteed-miss layout_state scan
+	 * on the REMOVE hot path. Under mass-delete concurrency those scans
+	 * exhaust RonDB scan resources and stall removes (10s+). Skip it,
+	 * mirroring the truncate path above. DS files are still fenced below
+	 * and the inode is removed, so any transient layout holder sees
+	 * STALE/EACCES on its next op.
+	 */
+	if (cd->lr != NULL && !cd->skip_transient_ndb) {
+		int lrc = 0;
+
+		/* Wave 6 T6.5: time the client-visible unlink
+		 * recall separately from the ns_remove mutation so
+		 * delete-path cost attribution is readable from the
+		 * cat_op histogram (cat_op="unlink_recall"). */
+		MDS_TIME_CAT_OP(MDS_CATOP_UNLINK_RECALL,
+			lrc = layout_recall_revoke_all_for_unlink(
+				cd->lr, rs->fileid, NULL));
+		if (lrc != 0) {
+			return NFS4ERR_DELAY;
+		}
+	}
+
+	/*
+	 * Prefetch the stripe map once so cat_remove_known() gets
+	 * the stripe count and the post-remove GC enqueue below can
+	 * reuse the entries.  No DS-side fence on the REMOVE path:
+	 * the namespace remove commits and the ds_gc reaper unlinks
+	 * the backing objects, and that unlink is what revokes any
+	 * straggler I/O (deferred-unlink model).
+	 * Layouts were already recalled above.
+	 */
+	if (cd->cat != NULL && rs->sm_entries == NULL) {
+		(void)mds_cat_stripe_map_get(cd->cat, rs->fileid,
+				&rs->sm_sc, &rs->sm_su, &rs->sm_mc,
+				&rs->sm_entries);
+	}
+
+	/*
+	 * Free any in-memory delegation grants that were recorded
+	 * for this fileid by a prior op_open.  This is done before
+	 * cat_remove() for the same final-unlink invalidation
+	 * boundary; it is NULL-safe but keep the guard explicit.
+	 */
+	if (cd->dt != NULL) {
+		deleg_revoke_file(cd->dt, rs->fileid);
+	}
+	return NFS4_OK;
+}
+
+/*
+ * Async-REMOVE fast path (ported; delete-at-ack).  Eligible:
+ * final unlink of a regular file whose parent change_info can be
+ * served from the parent_touch aggregator, and no live writer
+ * holds the file open (delete-at-ack must never destroy stripe
+ * data under an active open; such removes keep the synchronous
+ * path).  The recall /
+ * delegation teardown above already ran.  The submit commits ONE
+ * durable transaction (manifest row + dirent DELETE + inode
+ * DELETE_PENDING flag), so the name is gone on EVERY MDS before
+ * the client is acked; the drainer finalizes the inode, DS
+ * objects and quota off the request thread.  Any failure falls
+ * through to the synchronous path (returns false).
+ *
+ * Returns true when the remove was acked asynchronously (res filled).
+ */
+static bool op_remove_try_async(struct compound_data *cd,
+				const struct nfs4_op *op,
+				struct nfs4_result *res,
+				const struct op_remove_state *rs)
+{
+	struct timespec rm_async_now;
+	uint64_t rm_async_before = 0;
+	uint64_t rm_async_after = 0;
+
+	if (!(cd->rmf != NULL && rs->lookup_st == MDS_OK &&
+	      rs->final_data_unlink && rs->fileid != 0 && cd->ot != NULL &&
+	      open_state_file_has_writers(cd->ot, rs->fileid) == 0 &&
+	      compound_parent_defer_ok(cd) &&
+	      parent_touch_prepare(cd->pt, cd->current_fh.fileid,
+				   rs->change_before) == 0)) {
+		return false;
+	}
+	if (remove_manifest_submit(cd->rmf, cd->current_fh.fileid,
+				   op->arg.remove.name, rs->fileid,
+				   rs->child.generation, true) != 0) {
+		parent_touch_abort_prepared(cd->pt, cd->current_fh.fileid);
+		return false;
+	}
+
+	clock_gettime(CLOCK_REALTIME, &rm_async_now);
+	if (parent_touch_commit_prepared(cd->pt, cd->current_fh.fileid,
+					 rm_async_now, &rm_async_before,
+					 &rm_async_after) == 0) {
+		res->res.change_info.before = rm_async_before;
+		res->res.change_info.after = rm_async_after;
+	} else {
+		res->res.change_info.before = rs->change_before;
+		res->res.change_info.after = rs->change_before + 1;
+	}
+	compound_dirent_invalidate(cd, cd->current_fh.fileid,
+				   op->arg.remove.name);
+	compound_inode_invalidate(cd, cd->current_fh.fileid);
+	/* Ack txn mutated the child inode (DELETE_PENDING):
+	 * drop any cached copy. */
+	compound_inode_invalidate(cd, rs->fileid);
+	return true;
+}
+
+/*
+ * Fused REMOVE+GC fast path: on the final unlink of a regular
+ * file with a prefetched stripe map, commit the namespace
+ * remove and the GC-queue rows in ONE catalogue transaction.
+ * This removes the separate gc_enqueue commit per unique DS
+ * from the REMOVE hot path and closes the crash window where
+ * the name is gone but the DS objects are not yet queued.
+ *
+ * Fallback ladder: NOSUPPORT (backend has no fused op, or the
+ * fold was momentarily unavailable) and STALE (dirent no
+ * longer resolves to the looked-up child) drop to the legacy
+ * split path, which re-resolves and enqueues exactly as
+ * before.  Any other status is the authoritative outcome of
+ * the remove and is returned as-is.
+ */
+static enum mds_status op_remove_commit(struct compound_data *cd,
+					const struct nfs4_op *op,
+					struct op_remove_state *rs)
+{
+	enum mds_status fused_st = MDS_ERR_NOSUPPORT;
+
+	rs->gc_folded = false;
+	if (rs->lookup_st == MDS_OK && rs->final_data_unlink &&
+	    rs->fileid != 0 && rs->sm_entries != NULL) {
+		struct mds_ds_map_entry *uniq = NULL;
+		uint32_t n_uniq = 0;
+
+		if (collect_unique_ds_gc_entries(rs->sm_entries,
+						 rs->sm_sc, rs->sm_mc,
+						 &uniq, &n_uniq) == 0 &&
+		    n_uniq > 0) {
+			fused_st = cat_remove_known_gc(
+				cd, cd->current_fh.fileid,
+				op->arg.remove.name, &rs->child,
+				rs->sm_sc, uniq, n_uniq,
+				MDS_GC_SWEEP_GEOM(rs->sm_sc, rs->sm_mc),
+				&rs->gc_folded);
+		}
+		free(uniq);
+	}
+	if (fused_st != MDS_ERR_NOSUPPORT && fused_st != MDS_ERR_STALE) {
+		return fused_st;
+	}
+	rs->gc_folded = false;
+	if (rs->lookup_st == MDS_OK) {
+		return cat_remove_known(cd, cd->current_fh.fileid,
+					op->arg.remove.name,
+					&rs->child, rs->sm_sc);
+	}
+	return cat_remove(cd, cd->current_fh.fileid, op->arg.remove.name);
+}
+
+/* Post-commit bookkeeping of a successful remove: quota, caches,
+ * change_info and DS-side GC scheduling. */
+static void op_remove_finish(struct compound_data *cd,
+			     const struct nfs4_op *op,
+			     struct nfs4_result *res,
+			     struct op_remove_state *rs)
+{
+	struct mds_inode parent_post;
+
+	if (rs->quota) {
+		quota_submit_adjust(cd, rs->child.uid, rs->child.gid,
+				    -(int64_t)rs->child.size, -1);
+	}
+	/* Invalidate dirent cache for removed entry. */
+	compound_dirent_invalidate(cd, cd->current_fh.fileid,
+				   op->arg.remove.name);
+	/*
+	 * Drop the removed child's inode from the global icache.
+	 * Without this, a subsequent PUTFH on the removed fileid
+	 * (the client may still hold the FH from an earlier OPEN
+	 * or GETFH and use it before getting ESTALE the
+	 * "natural" way) reads the stale alive inode out of
+	 * the icache instead of touching NDB, and downstream
+	 * GETATTR / OPEN observe the file as still present.
+	 * This is the IOR "file cannot be deleted" symptom:
+	 * the unlink returns 0 but a verifying stat still
+	 * succeeds against the stale cache.  rs->fileid is
+	 * captured pre-mutation from cat_lookup above, so it
+	 * is the correct child id even after cat_remove has
+	 * dropped the dirent.
+	 */
+	if (rs->fileid != 0) {
+		compound_inode_invalidate(cd, rs->fileid);
+	}
+	/* Invalidate BEFORE post-mutation re-read. */
+	compound_inode_invalidate(cd, cd->current_fh.fileid);
+	if (cat_getattr(cd, cd->current_fh.fileid, &parent_post) == MDS_OK) {
+		res->res.change_info.after = parent_post.change;
+		res->res.change_info.before = rs->change_before;
+	}
+
+	/* Final unlink of a regular file: schedule DS-side
+	 * data cleanup via the GC queue.  Best-effort --
+	 * failures here do not affect the client-visible
+	 * remove status; the next pass picks up any rows
+	 * we miss.  When the fused path already committed the
+	 * rows with the remove, only the cache coherence step
+	 * remains. */
+	if (rs->final_data_unlink && rs->fileid != 0) {
+		if (rs->gc_folded) {
+			final_unlink_cache_drop(cd, rs->fileid);
+		} else {
+			enqueue_gc_for_final_unlink(cd, rs->fileid,
+						    rs->sm_entries,
+						    rs->sm_sc, rs->sm_mc);
+			rs->sm_entries = NULL;
+		}
+	}
+}
+
 enum nfs4_status op_remove(struct compound_data *cd,
 				  const struct nfs4_op *op,
 				  struct nfs4_result *res)
 {
+	struct op_remove_state rs;
 	enum nfs4_status nst;
 	enum mds_status st;
 
-	(void)res;
 	nst = require_current_fh(cd);
 	if (nst != NFS4_OK) {
 		return nst;
-}
+	}
 	/*
 	 * RFC 8881 §18.25.4 / §12.7 — component4 validation.  Empty
 	 * → NFS4ERR_INVAL; "." / ".." → NFS4ERR_BADNAME; bad UTF-8 →
@@ -1786,372 +2193,42 @@ enum nfs4_status op_remove(struct compound_data *cd,
 	nst = check_subtree_frozen(cd);
 	if (nst != NFS4_OK) {
 		return nst;
-}
+	}
 	nst = check_repl_health(cd);
 	if (nst != NFS4_OK) {
 		return nst;
-}
+	}
 
-	/* Xattr namespace: REMOVE deletes an xattr. */
 	if (is_xattr_fh(cd->current_fh.fileid)) {
-		uint64_t base = xattr_base_fileid(cd->current_fh.fileid);
-		nst = check_fh_frozen(cd, base, "");
-		if (nst != NFS4_OK) {
-			return nst;
-}
-		if (cd->cat == NULL) {
-			return NFS4ERR_INVAL;
-		}
-		st = mds_cat_xattr_del(cd->cat, NULL,
-				       base, op->arg.remove.name);
-		if (st != MDS_OK) {
-			return mds_status_to_nfs4(st);
-		}
-
-		cd->xattr_obj_set = false;
-		return NFS4_OK;
+		return op_remove_xattr(cd, op);
 	}
 
-	/* R1.3: capture parent change before mutation for change_info.
-	 * The same read feeds the POSIX DAC checks (write+search on the
-	 * directory here; the sticky rule after the child lookup). */
-	uint64_t rm_change_before = 0;
-	struct mds_inode rm_parent;
-	bool rm_parent_valid = false;
-	if (compound_inode_get(cd, cd->current_fh.fileid,
-			       &rm_parent) == MDS_OK) {
-		rm_change_before = rm_parent.change;
-		rm_parent_valid = true;
+	memset(&rs, 0, sizeof(rs));
+	nst = op_remove_resolve(cd, op, &rs);
+	if (nst != NFS4_OK) {
+		return nst;
 	}
-	/* POSIX DAC: removing an entry mutates the directory. */
-	if (rm_parent_valid) {
-		nst = compound_dir_mutate_check(cd, &rm_parent);
-		if (nst != NFS4_OK) {
-			return nst;
-		}
-	}
-
-	/* Quota: look up child to account for removal.
-	 *
-	 * The same lookup also tells us whether this is the final
-	 * unlink of a regular file: nlink == 1 + type == REG means
-	 * the very next cat_remove() will drop the inode to zero
-	 * links and orphan its DS-side data files.  We capture the
-	 * answer here — BEFORE the mutation — so we can schedule
-	 * GC against a still-coherent stripe map after a successful
-	 * remove. */
-	struct mds_inode rm_inode;
-	st = cat_lookup(cd, cd->current_fh.fileid,
-			   op->arg.remove.name, &rm_inode);
-	/* POSIX DAC: S_ISVTX restricted deletion (sticky directories). */
-	if (st == MDS_OK && rm_parent_valid) {
-		nst = compound_sticky_delete_check(cd, &rm_parent, &rm_inode);
-		if (nst != NFS4_OK) {
-			return nst;
-		}
-	}
-	/*
-	 * RFC 8881 S18.25.4 / POSIX rmdir(2): removing a non-empty
-	 * directory MUST fail with NFS4ERR_NOTEMPTY.  The catalogue
-	 * remove primitive drops the dirent unconditionally, which
-	 * silently orphaned every child (nfstest_posix rmdir,
-	 * pjdfstest rmdir/06).  Same emptiness probe the RENAME
-	 * dir-overwrite path already uses; checked BEFORE any
-	 * delegation-notify / layout-recall side effects.
-	 */
-	if (st == MDS_OK && rm_inode.type == MDS_FTYPE_DIR &&
-	    cd->cat != NULL) {
-		bool rm_dir_empty = true;
-
-		if (mds_cat_dir_is_empty(cd->cat, rm_inode.fileid,
-					 &rm_dir_empty) == MDS_OK &&
-		    !rm_dir_empty) {
-			return NFS4ERR_NOTEMPTY;
-		}
-	}
-	bool rm_quota = (st == MDS_OK && cd->quota != NULL);
-	bool rm_final_data_unlink =
-		(st == MDS_OK &&
-		 rm_inode.type == MDS_FTYPE_REG &&
-		 rm_inode.nlink == 1);
-	uint64_t rm_fileid = (st == MDS_OK) ? rm_inode.fileid : 0;
-	struct mds_ds_map_entry *rm_sm_entries = NULL;
-	uint32_t rm_sm_sc = 0;
-	uint32_t rm_sm_su = 0;
-	uint32_t rm_sm_mc = 0;
-
-	/*
-	 * v9: a single-stripe file (MDS_IFLAG_INLINE_STRIPE) carries its one
-	 * DS entry on the inode we already read in cat_lookup.  Build the
-	 * stripe-map snapshot from it ONCE here -- independent of the
-	 * proxy/fence path below -- so both the DS fence AND the GC enqueue
-	 * (which cleans up the DS backing file) use it with no
-	 * cat_stripe_map_get.  Without this the GC path would fall back to
-	 * cat_stripe_map_get, get NOTFOUND (inline files have no stripe
-	 * rows), and skip enqueue -> the DS file would leak.
-	 */
-	if (rm_final_data_unlink && rm_fileid != 0 &&
-	    (rm_inode.flags & MDS_IFLAG_INLINE_STRIPE)) {
-		rm_sm_entries = calloc(1, sizeof(*rm_sm_entries));
-		if (rm_sm_entries != NULL) {
-			uint32_t fhl = rm_inode.inline_fh_len;
-
-			if (fhl > MDS_NFS_FH_MAX) {
-				fhl = MDS_NFS_FH_MAX;
-			}
-			rm_sm_entries[0].ds_id = rm_inode.inline_ds_id;
-			rm_sm_entries[0].nfs_fh_len = fhl;
-			if (fhl > 0) {
-				memcpy(rm_sm_entries[0].nfs_fh,
-				       rm_inode.inline_fh, fhl);
-			}
-			rm_sm_sc = 1;
-			rm_sm_mc = 1;
-			rm_sm_su = rm_inode.stripe_unit;
-		}
-	}
+	op_remove_snapshot_inline_stripe(&rs);
 
 	/* Phase 8d: NOTIFY4_REMOVE_ENTRY or recall. */
 	compound_notify_or_recall_dir(cd, cd->current_fh.fileid,
 				      NOTIFY4_REMOVE_ENTRY,
 				      op->arg.remove.name, NULL);
-	if (rm_final_data_unlink && rm_fileid != 0) {
-		/*
-		 * Mark Q5 P04 — layout-recall on final unlink.
-		 *
-		 * Revoke layouts BEFORE cat_remove() drops the final
-		 * namespace entry.  Linux answers CB_LAYOUTRECALL by
-		 * sending LAYOUTRETURN; that compound starts with PUTFH
-		 * on the recalled fileid.  If we remove the inode first,
-		 * the holder sees NFS4ERR_STALE on that PUTFH and enters
-		 * migration recovery instead of returning the layout,
-		 * leaving the peer's unlink path permanently wedged.
-		 *
-		 * layout_recall_revoke_all_for_unlink() is intentionally
-		 * stronger than the ordinary byte-range conflict helper:
-		 * it sends best-effort callbacks while PUTFH can still
-		 * resolve the object, then unconditionally drops every
-		 * layout-state row for this fileid.  If catalogue recall
-		 * enumeration fails, fail closed with DELAY rather than
-		 * removing the namespace entry while stale layouts remain.
-		 */
-		/*
-		 * Under transient_state_cache=on the layout_state table is empty
-		 * (every grant site is gated on !cd->skip_transient_ndb), so this
-		 * unlink recall enumeration is a guaranteed-miss layout_state scan
-		 * on the REMOVE hot path. Under mass-delete concurrency those scans
-		 * exhaust RonDB scan resources and stall removes (10s+). Skip it,
-		 * mirroring the truncate path above. DS files are still fenced below
-		 * and the inode is removed, so any transient layout holder sees
-		 * STALE/EACCES on its next op.
-		 */
-		if (cd->lr != NULL && !cd->skip_transient_ndb) {
-			int lrc = 0;
-
-			/* Wave 6 T6.5: time the client-visible unlink
-			 * recall separately from the ns_remove mutation so
-			 * delete-path cost attribution is readable from the
-			 * cat_op histogram (cat_op="unlink_recall"). */
-			MDS_TIME_CAT_OP(MDS_CATOP_UNLINK_RECALL,
-				lrc = layout_recall_revoke_all_for_unlink(
-					cd->lr, rm_fileid, NULL));
-			if (lrc != 0) {
-				return NFS4ERR_DELAY;
-			}
-		}
-
-		/*
-		 * Prefetch the stripe map once so cat_remove_known() gets
-		 * the stripe count and the post-remove GC enqueue below can
-		 * reuse the entries.  No DS-side fence on the REMOVE path:
-		 * the namespace remove commits and the ds_gc reaper unlinks
-		 * the backing objects, and that unlink is what revokes any
-		 * straggler I/O (deferred-unlink model).
-		 * Layouts were already recalled above.
-		 */
-		if (cd->cat != NULL && rm_sm_entries == NULL) {
-			(void)mds_cat_stripe_map_get(cd->cat, rm_fileid,
-					&rm_sm_sc, &rm_sm_su, &rm_sm_mc,
-					&rm_sm_entries);
-		}
-
-		/*
-		 * Free any in-memory delegation grants that were recorded
-		 * for this fileid by a prior op_open.  This is done before
-		 * cat_remove() for the same final-unlink invalidation
-		 * boundary; it is NULL-safe but keep the guard explicit.
-		 */
-		if (cd->dt != NULL) {
-			deleg_revoke_file(cd->dt, rm_fileid);
-		}
+	nst = op_remove_prepare_final_unlink(cd, &rs);
+	if (nst != NFS4_OK) {
+		free(rs.sm_entries);
+		return nst;
+	}
+	if (op_remove_try_async(cd, op, res, &rs)) {
+		free(rs.sm_entries);
+		return NFS4_OK;
 	}
 
-
-	/*
-	 * Async-REMOVE fast path (ported; delete-at-ack).  Eligible:
-	 * final unlink of a regular file whose parent change_info can be
-	 * served from the parent_touch aggregator, and no live writer
-	 * holds the file open (delete-at-ack must never destroy stripe
-	 * data under an active open; such removes keep the synchronous
-	 * path).  The recall /
-	 * delegation teardown above already ran.  The submit commits ONE
-	 * durable transaction (manifest row + dirent DELETE + inode
-	 * DELETE_PENDING flag), so the name is gone on EVERY MDS before
-	 * the client is acked; the drainer finalizes the inode, DS
-	 * objects and quota off the request thread.  Any failure falls
-	 * through to the synchronous path below.
-	 */
-	if (cd->rmf != NULL && st == MDS_OK && rm_final_data_unlink &&
-	    rm_fileid != 0 && cd->ot != NULL &&
-	    open_state_file_has_writers(cd->ot, rm_fileid) == 0 &&
-	    compound_parent_defer_ok(cd) &&
-	    parent_touch_prepare(cd->pt, cd->current_fh.fileid,
-				 rm_change_before) == 0) {
-		if (remove_manifest_submit(cd->rmf,
-					   cd->current_fh.fileid,
-					   op->arg.remove.name,
-					   rm_fileid,
-					   rm_inode.generation,
-					   true) == 0) {
-			struct timespec rm_async_now;
-			uint64_t rm_async_before = 0;
-			uint64_t rm_async_after = 0;
-
-			clock_gettime(CLOCK_REALTIME, &rm_async_now);
-			if (parent_touch_commit_prepared(cd->pt,
-					cd->current_fh.fileid,
-					rm_async_now,
-					&rm_async_before,
-					&rm_async_after) == 0) {
-				res->res.change_info.before =
-					rm_async_before;
-				res->res.change_info.after =
-					rm_async_after;
-			} else {
-				res->res.change_info.before =
-					rm_change_before;
-				res->res.change_info.after =
-					rm_change_before + 1;
-			}
-			compound_dirent_invalidate(cd,
-						   cd->current_fh.fileid,
-						   op->arg.remove.name);
-			compound_inode_invalidate(cd, cd->current_fh.fileid);
-			/* Ack txn mutated the child inode (DELETE_PENDING):
-			 * drop any cached copy. */
-			compound_inode_invalidate(cd, rm_fileid);
-			free(rm_sm_entries);
-			return NFS4_OK;
-		}
-		parent_touch_abort_prepared(cd->pt, cd->current_fh.fileid);
-	}
-
-	/*
-	 * Fused REMOVE+GC fast path: on the final unlink of a regular
-	 * file with a prefetched stripe map, commit the namespace
-	 * remove and the GC-queue rows in ONE catalogue transaction.
-	 * This removes the separate gc_enqueue commit per unique DS
-	 * from the REMOVE hot path and closes the crash window where
-	 * the name is gone but the DS objects are not yet queued.
-	 *
-	 * Fallback ladder: NOSUPPORT (backend has no fused op, or the
-	 * fold was momentarily unavailable) and STALE (dirent no
-	 * longer resolves to the looked-up child) drop to the legacy
-	 * split path below, which re-resolves and enqueues exactly as
-	 * before.  Any other status is the authoritative outcome of
-	 * the remove and is returned as-is.
-	 */
-	bool rm_gc_folded = false;
-	{
-		enum mds_status fused_st = MDS_ERR_NOSUPPORT;
-
-		if (st == MDS_OK && rm_final_data_unlink &&
-		    rm_fileid != 0 && rm_sm_entries != NULL) {
-			struct mds_ds_map_entry *uniq = NULL;
-			uint32_t n_uniq = 0;
-
-			if (collect_unique_ds_gc_entries(rm_sm_entries,
-							 rm_sm_sc, rm_sm_mc,
-							 &uniq,
-							 &n_uniq) == 0 &&
-			    n_uniq > 0) {
-				fused_st = cat_remove_known_gc(
-					cd, cd->current_fh.fileid,
-					op->arg.remove.name, &rm_inode,
-					rm_sm_sc, uniq, n_uniq,
-					MDS_GC_SWEEP_GEOM(rm_sm_sc, rm_sm_mc),
-					&rm_gc_folded);
-			}
-			free(uniq);
-		}
-		if (fused_st == MDS_ERR_NOSUPPORT ||
-		    fused_st == MDS_ERR_STALE) {
-			rm_gc_folded = false;
-			st = (st == MDS_OK)
-				? cat_remove_known(cd, cd->current_fh.fileid,
-						   op->arg.remove.name,
-						   &rm_inode, rm_sm_sc)
-				: cat_remove(cd, cd->current_fh.fileid,
-					     op->arg.remove.name);
-		} else {
-			st = fused_st;
-		}
-	}
-	if (st == MDS_OK && rm_quota) {
-		quota_submit_adjust(cd, rm_inode.uid, rm_inode.gid,
-				    -(int64_t)rm_inode.size, -1);
-	}
+	st = op_remove_commit(cd, op, &rs);
 	if (st == MDS_OK) {
-		/* Invalidate dirent cache for removed entry. */
-		compound_dirent_invalidate(cd, cd->current_fh.fileid,
-					   op->arg.remove.name);
-		/*
-		 * Drop the removed child's inode from the global icache.
-		 * Without this, a subsequent PUTFH on the removed fileid
-		 * (the client may still hold the FH from an earlier OPEN
-		 * or GETFH and use it before getting ESTALE the
-		 * "natural" way) reads the stale alive inode out of
-		 * the icache instead of touching NDB, and downstream
-		 * GETATTR / OPEN observe the file as still present.
-		 * This is the IOR "file cannot be deleted" symptom:
-		 * the unlink returns 0 but a verifying stat still
-		 * succeeds against the stale cache.  rm_fileid is
-		 * captured pre-mutation from cat_lookup above, so it
-		 * is the correct child id even after cat_remove has
-		 * dropped the dirent.
-		 */
-		if (rm_fileid != 0) {
-			compound_inode_invalidate(cd, rm_fileid);
-		}
-		struct mds_inode parent_post;
-		/* Invalidate BEFORE post-mutation re-read. */
-		compound_inode_invalidate(cd, cd->current_fh.fileid);
-		if (cat_getattr(cd, cd->current_fh.fileid,
-				   &parent_post) == MDS_OK) {
-			res->res.change_info.after = parent_post.change;
-			res->res.change_info.before = rm_change_before;
-		}
-
-		/* Final unlink of a regular file: schedule DS-side
-		 * data cleanup via the GC queue.  Best-effort --
-		 * failures here do not affect the client-visible
-		 * remove status; the next pass picks up any rows
-		 * we miss.  When the fused path already committed the
-		 * rows with the remove, only the cache coherence step
-		 * remains. */
-		if (rm_final_data_unlink && rm_fileid != 0) {
-			if (rm_gc_folded) {
-				final_unlink_cache_drop(cd, rm_fileid);
-			} else {
-				enqueue_gc_for_final_unlink(cd, rm_fileid,
-							    rm_sm_entries,
-							    rm_sm_sc,
-							    rm_sm_mc);
-				rm_sm_entries = NULL;
-			}
-		}
+		op_remove_finish(cd, op, res, &rs);
 	}
-	free(rm_sm_entries);
+	free(rs.sm_entries);
 	return mds_status_to_nfs4(st);
 }
 

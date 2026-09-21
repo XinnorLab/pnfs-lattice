@@ -251,9 +251,9 @@ struct mds_remove_pending_entry {
 	uint64_t child_fileid;      /**< Expected dirent target (guard). */
 	uint64_t child_generation;  /**< Expected inode generation (guard). */
 	uint64_t enqueued_ns;       /**< Wall-clock at ack time (diag only). */
-	uint32_t claim_mds_id;      /**< 0 = unclaimed; else owning MDS id. */
 	uint64_t claim_boot;        /**< Owning MDS's boot_epoch. */
 	uint64_t claim_expires_ns;  /**< Lease deadline; 0 if unclaimed. */
+	uint32_t claim_mds_id;      /**< 0 = unclaimed; else owning MDS id. */
 	uint32_t retries;           /**< Incremented on retryable drainer failure. */
 	char     name[MDS_MAX_NAME + 1]; /**< Dirent name being removed. */
 };

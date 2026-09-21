@@ -255,12 +255,14 @@ struct memdb_layout {
     uint32_t            ds_count;
 };
 
-/* Client recovery row.  owner_mds_id / owner_boot_epoch are 0
- * (unassigned) exactly as recovery_put writes them on RonDB; the
- * ownership transfer that would assign them is NOSUPPORT everywhere. */
+/* Client recovery row.  owner_mds_id is the identity of the instance
+ * that wrote the row (the MDS that served the client, as on RonDB);
+ * a single-node in-memory store has no boot epoch, so the epoch is 0. */
 struct memdb_recovery {
     bool     used;
     uint64_t clientid;
+    uint32_t owner_mds_id;
+    uint64_t owner_boot_epoch;
     uint32_t co_ownerid_len;
     uint8_t  co_ownerid[1024];
     uint8_t  verifier[8];
@@ -325,6 +327,10 @@ struct memdb_partition {
 
 struct memdb {
     pthread_mutex_t lock;          /* guards every field below */
+    /* Identity of the MDS this instance serves (cfg->self.id at open;
+     * 0 for the bare test constructor).  Stamped on rows that record
+     * their owning MDS (client recovery).  Immutable after open. */
+    uint32_t        self_mds_id;
 
     /* Namespace */
     struct memdb_inode      *inodes;
@@ -3682,6 +3688,8 @@ static enum mds_status mem_recovery_put(struct mds_catalogue *cat,
     r = &m->recoveries[idx];
     r->used = true;
     r->clientid = clientid;
+    r->owner_mds_id = m->self_mds_id;
+    r->owner_boot_epoch = 0;
     memset(r->co_ownerid, 0, sizeof(r->co_ownerid));
     if (co_ownerid_len > 0) {
         memcpy(r->co_ownerid, co_ownerid, co_ownerid_len);
@@ -3737,19 +3745,26 @@ static enum mds_status mem_recovery_get(struct mds_catalogue *cat,
     return MDS_OK;
 }
 
-/* Rows carry owner 0 (unassigned): recovery_put writes no owner on any
- * backend and the ownership transfer is NOSUPPORT, so an unassigned
- * row is visible to every owner filter -- a promoting standby must be
- * able to load its dead partner's clients.  The callback receives the
- * stored owner (0) and epoch (0), not the filter. */
+/* One materialised recovery row for the paged listing. */
+struct memdb_recovery_page_row {
+    uint64_t clientid;
+    uint32_t owner_mds_id;
+    uint64_t owner_boot_epoch;
+};
+
+/* The rows owned by @owner_mds_id plus the unassigned ones (stored
+ * owner 0: written by an instance without an identity), like the RonDB
+ * scan filter; @owner_mds_id 0 lists every row.  Rows explicitly owned
+ * by another MDS are never returned.  The callback receives the stored
+ * owner and epoch.  A promoting standby lists its dead partner's id; an
+ * MDS matching EXCHANGE_IDs in grace lists its own. */
 static enum mds_status mem_recovery_list(struct mds_catalogue *cat,
     uint32_t owner_mds_id, mds_recovery_list_cb cb, void *ctx)
 {
     struct memdb *m = memdb_of(cat);
-    uint64_t *page;
+    struct memdb_recovery_page_row *page;
     uint32_t cursor = 0;
 
-    (void)owner_mds_id;
     if (cb == NULL) {
         return MDS_ERR_INVAL;
     }
@@ -3762,14 +3777,22 @@ static enum mds_status mem_recovery_list(struct mds_catalogue *cat,
 
         memdb_lock(m);
         while (cursor < MEMDB_MAX_RECOVERY && n < MEMDB_SCAN_PAGE) {
-            if (m->recoveries[cursor].used) {
-                page[n++] = m->recoveries[cursor].clientid;
+            const struct memdb_recovery *r = &m->recoveries[cursor];
+
+            if (r->used &&
+                (owner_mds_id == 0 || r->owner_mds_id == 0 ||
+                 r->owner_mds_id == owner_mds_id)) {
+                page[n].clientid = r->clientid;
+                page[n].owner_mds_id = r->owner_mds_id;
+                page[n].owner_boot_epoch = r->owner_boot_epoch;
+                n++;
             }
             cursor++;
         }
         memdb_unlock(m);
         for (uint32_t i = 0; i < n; i++) {
-            if (cb(page[i], 0, 0, ctx) != 0) {
+            if (cb(page[i].clientid, page[i].owner_mds_id,
+                   page[i].owner_boot_epoch, ctx) != 0) {
                 free(page);
                 return MDS_OK;
             }
@@ -5196,6 +5219,11 @@ enum mds_status catalogue_memdb_open_cfg(const struct mds_config *cfg,
         return st;
     }
 
+    /* The one configuration input: the identity stamped on rows that
+     * record their owning MDS (client recovery).  An in-process store
+     * shared by several MDS contexts carries the opener's id. */
+    m->self_mds_id = cfg->self.id;
+
     cat->backend = MDS_BACKEND_MEMDB;
     /* One in-process store shared by every MDS context that opens it:
      * a cross-subtree rename moves the dirent and keeps the inode.
@@ -5216,8 +5244,9 @@ struct mds_catalogue *catalogue_memdb_open(void)
     struct mds_config cfg;
     struct mds_catalogue *cat = NULL;
 
-    /* The instance takes nothing from the configuration today; an
-     * all-zero block is the documented "defaults" input. */
+    /* The only configuration input is cfg->self.id (the identity
+     * stamped on client recovery rows); the all-zero block gives this
+     * test handle identity 0, i.e. it writes unassigned rows. */
     memset(&cfg, 0, sizeof(cfg));
     cfg.catalogue_backend = MDS_BACKEND_MEMDB;
     if (catalogue_memdb_open_cfg(&cfg, &cat) != MDS_OK) {

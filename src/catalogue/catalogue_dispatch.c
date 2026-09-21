@@ -37,6 +37,12 @@
  * Negligible against a typical RonDB round-trip of 100-300 us, but
  * the kill-switch lets operators verify "no observability" cost
  * profiles without recompiling.
+ *
+ * The enabled variant is a GNU statement expression so `expr` is
+ * evaluated exactly once and its status returned as the macro's
+ * value.  `__extension__` declares that intent to the compiler and
+ * keeps the build clean under -Wpedantic (gcc) and
+ * -Wgnu-statement-expression-from-macro-expansion (clang).
  * ----------------------------------------------------------------------- */
 #if MDS_OP_METRICS_BUILD_ENABLED
 
@@ -50,7 +56,7 @@ static inline uint64_t cat_now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-#define CAT_TIMED(catop, expr) ({                                  \
+#define CAT_TIMED(catop, expr) __extension__ ({                    \
     enum mds_status _cat_st;                                       \
     if (__builtin_expect(mds_op_metrics_enabled(), 1)) {           \
         uint64_t _cat_a = cat_now_ns();                            \

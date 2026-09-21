@@ -384,10 +384,10 @@ void layout_seqid_advance(const uint8_t other[NFS4_OTHER_SIZE],
 	pthread_mutex_lock(&g_layout_seqid_locks[stripe]);
 	for (e = g_layout_seqid_buckets[bucket]; e != NULL; e = e->hash_next) {
 		if (memcmp(e->other, other, NFS4_OTHER_SIZE) == 0) {
-			uint32_t next = e->seqid + 1U;
-			if (next == 0U) {
-				next = 1U;
-			}
+			/* 0xFFFFFFFF -> 1: seqid 0 is reserved (RFC 8881
+			 * S8.2.2). */
+			uint32_t next = (e->seqid == UINT32_MAX)
+				? 1U : e->seqid + 1U;
 			e->seqid = next;
 			*next_seqid = next;
 			*hit = true;
@@ -730,10 +730,9 @@ static void layout_pick_stateid(struct compound_data *cd,
 			&row_seqid);
 		if (st == MDS_OK && cd->current_fh_set &&
 		    row_fileid == cd->current_fh.fileid) {
-			uint32_t next = row_seqid + 1U;
-			if (next == 0U) {
-				next = 1U; /* RFC: skip reserved 0. */
-			}
+			/* RFC: skip reserved 0 on wrap. */
+			uint32_t next = (row_seqid == UINT32_MAX)
+				? 1U : row_seqid + 1U;
 			memset(out, 0, sizeof(*out));
 			out->seqid = next;
 			memcpy(out->other, client_sid->other,
@@ -1427,17 +1426,12 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 		}
 	} else if (cd->lr != NULL && !cd->skip_transient_ndb) {
 		uint32_t recalled = 0;
-		uint32_t req_iomode_for_recall = a->iomode;
-
-		/* Promote READ to RW for the conflict scan when the
-		 * server is granting RW upgrades unconditionally
-		 * (matches the long-lived grant policy below): if we
-		 * are about to grant RW, any conflicting holder must
-		 * see a recall regardless of what the client asked
-		 * for. */
-		if (grant_iomode == LAYOUTIOMODE4_RW) {
-			req_iomode_for_recall = LAYOUTIOMODE4_RW;
-		}
+		/* Scan with the iomode we are about to grant (RW under
+		 * the long-lived grant policy above, see grant_iomode)
+		 * rather than what the client asked for: any holder
+		 * conflicting with an RW grant must see a recall
+		 * regardless of the requested iomode. */
+		const uint32_t req_iomode_for_recall = grant_iomode;
 
 		MDS_TIME_CAT_OP(MDS_CATOP_LAYOUT_RECALL_SCAN,
 			(void)layout_recall_byte_range_for_holders(
@@ -1472,12 +1466,12 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 		 * logical lease range into per-stripe slices and conflict-
 		 * check each one against the lease table.  Slicing fails
 		 * closed -- on error we return TRYLATER. */
-		struct stripe_slice _slt_slices[MDS_MAX_STRIPES];
-		uint32_t _slt_unit = cd->cfg_stripe_unit ? cd->cfg_stripe_unit : 65536U;
-		int _slt_n = lease_range_to_stripe_slices(
-			lease_offset, lease_length, _slt_unit,
-			_slt_slices, MDS_MAX_STRIPES);
-		if (_slt_n < 0) {
+		struct stripe_slice slt_slices[MDS_MAX_STRIPES];
+		uint32_t slt_unit = cd->cfg_stripe_unit ? cd->cfg_stripe_unit : 65536U;
+		int slt_n = lease_range_to_stripe_slices(
+			lease_offset, lease_length, slt_unit,
+			slt_slices, MDS_MAX_STRIPES);
+		if (slt_n < 0) {
 			return NFS4ERR_LAYOUTTRYLATER;
 		}
 		/* Patch 0007: contention-aware grant narrowing.
@@ -1486,19 +1480,19 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 		 * prefix so the client gets a smaller-but-usable layout
 		 * instead of NFS4ERR_LAYOUTTRYLATER.  prefix == 0 keeps
 		 * the legacy TRYLATER behaviour. */
-		uint64_t _slt_prefix = stripe_lease_prefix_conflict_free_length(
+		uint64_t slt_prefix = stripe_lease_prefix_conflict_free_length(
 			cd->slt,
-			_slt_slices, (uint32_t)_slt_n,
-			_slt_unit,
+			slt_slices, (uint32_t)slt_n,
+			slt_unit,
 			lease_offset, lease_length,
 			cd->current_fh.fileid, cd->clientid);
-		if (_slt_prefix == 0) {
+		if (slt_prefix == 0) {
 			return NFS4ERR_LAYOUTTRYLATER;
 		}
-		if (_slt_prefix < lease_length) {
-			lease_length = _slt_prefix;
-			if (grant_length > _slt_prefix) {
-				grant_length = _slt_prefix;
+		if (slt_prefix < lease_length) {
+			lease_length = slt_prefix;
+			if (grant_length > slt_prefix) {
+				grant_length = slt_prefix;
 			}
 		}
 	}
@@ -2675,21 +2669,21 @@ fill_layoutget_result:
 			 * lease entry per stripe slice; best-effort -- the
 			 * conflict check at LAYOUTGET entry already ruled out
 			 * cross-client collisions. */
-			struct stripe_slice _slt_slices[MDS_MAX_STRIPES];
-			uint32_t _slt_unit = cd->cfg_stripe_unit
+			struct stripe_slice slt_slices[MDS_MAX_STRIPES];
+			uint32_t slt_unit = cd->cfg_stripe_unit
 				? cd->cfg_stripe_unit : 65536U;
-			int _slt_n = lease_range_to_stripe_slices(
-				lease_offset, lease_length, _slt_unit,
-				_slt_slices, MDS_MAX_STRIPES);
-			for (int _slt_i = 0; _slt_i < _slt_n; _slt_i++) {
+			int slt_n = lease_range_to_stripe_slices(
+				lease_offset, lease_length, slt_unit,
+				slt_slices, MDS_MAX_STRIPES);
+			for (int slt_i = 0; slt_i < slt_n; slt_i++) {
 				(void)stripe_lease_acquire(
 					cd->slt,
 					cd->current_fh.fileid,
 					cd->clientid,
 					0U, /* ds_id: tracing only */
-					_slt_slices[_slt_i].stripe_index,
-					_slt_slices[_slt_i].ds_offset,
-					_slt_slices[_slt_i].ds_length,
+					slt_slices[slt_i].stripe_index,
+					slt_slices[slt_i].ds_offset,
+					slt_slices[slt_i].ds_length,
 					cd->cfg_stripe_lease_duration_ms);
 			}
 		}

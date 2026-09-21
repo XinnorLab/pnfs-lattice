@@ -392,7 +392,7 @@ enum mds_status cluster_membership_promote_standby(
 /* -----------------------------------------------------------------------
  * Membership population from the catalogue's node registry (Phase 9)
  *
- * Scans the node registry through mds_cluster_node_list() and upserts
+ * Scans the node registry through mds_cluster_node_list() and merges
  * all registered nodes into the local membership array.  Called once
  * at startup and periodically from the heartbeat thread to discover
  * newly-joined peers.
@@ -403,12 +403,17 @@ struct mds_catalogue;
 /**
  * @brief Populate membership from the catalogue's node registry.
  *
- * Scans every registry row via mds_cluster_node_list() and upserts
- * each as a cluster_member (role ACTIVE, lifecycle ACTIVE_SERVING).
- * Existing entries are updated; new entries are inserted.  This
- * node's own row is not skipped: it is upserted like any other, so
- * the registry row's role/lifecycle stamp replaces the init-time one
- * (behaviour carried over unchanged from the RonDB-specific version).
+ * Scans every registry row via mds_cluster_node_list() and merges it
+ * into the local table.  The registry is authoritative for a node's
+ * address only, so for a member that already exists (this node itself,
+ * registered by cluster_membership_init from the configuration, or a
+ * peer that joined through the transport) only hostname, nfs_port and
+ * grpc_port are refreshed; role, lifecycle, failover partner, cluster
+ * address, wire-compat version and join time are local state and are
+ * preserved -- a configured standby therefore stays NODE_STANDBY.  A
+ * node seen only through the registry is inserted as ACTIVE /
+ * ACTIVE_SERVING with no partner and the legacy wire-compat version 1
+ * (the registry carries no version).  Nothing is ever removed here.
  *
  * @param ctx  Membership handle.
  * @param cat  Catalogue handle whose backend populates the node_list

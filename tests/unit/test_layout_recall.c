@@ -289,7 +289,7 @@ struct mock_cb_server_args {
 
 static bool test_xdr_skip_opaque_body(XDR *xdrs, uint32_t max_len)
 {
-    uint32_t len;
+    uint32_t len = 0;
     uint32_t pos;
     uint32_t padded;
 

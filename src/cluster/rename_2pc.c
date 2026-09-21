@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <time.h>
@@ -45,6 +46,10 @@ enum rename_2pc_role {
  * Internal rename_2pc_ctx -- used for coordination journal record conversion
  * ----------------------------------------------------------------------- */
 
+/* Stripe-map entries that fit in one journal payload (inode + 12-byte
+ * stripe header + entries). */
+#define R2PC_MAX_PAYLOAD_ENTRIES 16
+
 struct rename_2pc_ctx {
 	uint64_t            txn_id;
 	enum rename_2pc_state state;
@@ -57,7 +62,8 @@ struct rename_2pc_ctx {
 	uint64_t            src_child_fileid;
 	uint32_t            inode_data_len;
 	uint8_t             inode_data[sizeof(struct mds_inode) + 12 +
-	                               sizeof(struct mds_ds_map_entry) * 16];
+	                               sizeof(struct mds_ds_map_entry) *
+	                                   R2PC_MAX_PAYLOAD_ENTRIES];
 };
 
 /* struct rename_2pc_transport is defined in cluster_transport.h. */
@@ -572,8 +578,17 @@ int rename_2pc_on_prepare(struct mds_catalogue *cat,
 	    ctx.inode_data_len = (uint32_t)data_len;
 	}
 	if (data_len >= sizeof(struct mds_inode)) {
-	    const struct mds_inode *src_inode = inode_data;
-	    ctx.src_child_fileid = src_inode->fileid;
+	    /* The payload sits at an arbitrary offset inside the wire
+	     * buffer (after a 2-byte name length and the name), so it is
+	     * not aligned for struct mds_inode: copy the field out instead
+	     * of dereferencing a misaligned struct pointer. */
+	    uint64_t src_fileid;
+
+	    memcpy(&src_fileid,
+	           (const uint8_t *)inode_data +
+	               offsetof(struct mds_inode, fileid),
+	           sizeof(src_fileid));
+	    ctx.src_child_fileid = src_fileid;
 	}
 
 	st = rename_2pc_journal_put(cat, ct, &ctx);
@@ -627,8 +642,11 @@ enum mds_status rename_2pc_on_commit(struct mds_catalogue *cat,
 	    mds_cat_txn_abort(ct);
 	    return MDS_ERR_INVAL;
 	}
-	const struct mds_inode *src_inode =
-	    (const struct mds_inode *)ctx.inode_data;
+	/* ctx.inode_data is a byte array; copy the snapshot into an
+	 * aligned object before reading it as a struct. */
+	struct mds_inode src_inode_copy;
+	memcpy(&src_inode_copy, ctx.inode_data, sizeof(src_inode_copy));
+	const struct mds_inode *src_inode = &src_inode_copy;
 
 	if (rename_2pc_cat_shared_authority(cat)) {
 	    uint64_t existing = 0;
@@ -722,21 +740,29 @@ enum mds_status rename_2pc_on_commit(struct mds_catalogue *cat,
 	    return st;
 	}
 
-	/* Write stripe map if present in the inode_data payload. */
+	/* Write stripe map if present in the inode_data payload.  The
+	 * payload is a byte array, so the entries are copied into an
+	 * aligned local array before use; the journal payload bounds the
+	 * count to R2PC_MAX_PAYLOAD_ENTRIES and the size check below keeps
+	 * a malformed count from reading past the payload. */
 	if (ctx.inode_data_len > sizeof(struct mds_inode) + 12) {
 	    const uint8_t *smp = ctx.inode_data + sizeof(struct mds_inode);
 	    uint32_t sm_sc, sm_su, sm_mc;
 	    memcpy(&sm_sc, smp, 4);
 	    memcpy(&sm_su, smp + 4, 4);
 	    memcpy(&sm_mc, smp + 8, 4);
-	    uint32_t total = sm_sc * sm_mc;
-	    size_t expected = sizeof(struct mds_inode) + 12 +
-	                      total * sizeof(struct mds_ds_map_entry);
-	    if (ctx.inode_data_len >= expected && total > 0) {
-	        const struct mds_ds_map_entry *sme =
-	            (const struct mds_ds_map_entry *)(smp + 12);
-	        (void)mds_cat_stripe_map_put(cat, ct, new_fileid,
-	                                     sm_sc, sm_su, sm_mc, sme);
+	    uint64_t total = (uint64_t)sm_sc * sm_mc;
+	    if (total > 0 && total <= R2PC_MAX_PAYLOAD_ENTRIES) {
+	        size_t expected = sizeof(struct mds_inode) + 12 +
+	                          (size_t)total * sizeof(struct mds_ds_map_entry);
+	        if (ctx.inode_data_len >= expected) {
+	            struct mds_ds_map_entry sme[R2PC_MAX_PAYLOAD_ENTRIES];
+
+	            memcpy(sme, smp + 12,
+	                   (size_t)total * sizeof(sme[0]));
+	            (void)mds_cat_stripe_map_put(cat, ct, new_fileid,
+	                                         sm_sc, sm_su, sm_mc, sme);
+	        }
 	    }
 	}
 

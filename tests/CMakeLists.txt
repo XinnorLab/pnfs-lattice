@@ -487,3 +487,54 @@ set_tests_properties(daemon_smoke PROPERTIES
     SKIP_RETURN_CODE 77
     TIMEOUT 180)
 # --- end harness track ---
+
+# -------------------------------------------------------------------
+# rondb-fix track -- backend-neutral pins for the namespace / recovery
+# semantics the RonDB shim decides inside its transactions (RMDIR
+# emptiness, one-step LINK, recovery-row ownership), run on the memdb
+# reference backend so both backends stay at parity.  Appended block.
+# -------------------------------------------------------------------
+add_executable(test_rondb_ns_semantics unit/test_rondb_ns_semantics.c)
+target_include_directories(test_rondb_ns_semantics PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src/catalogue
+    ${PROJECT_SOURCE_DIR}/tests
+)
+target_link_libraries(test_rondb_ns_semantics PRIVATE
+    pnfs_mds_core
+    pnfs_cluster
+    pnfs_fsal_obj
+    pnfs_common
+    pnfs_mds_core
+    pnfs_cluster
+    pnfs_mds_core
+    rondb_schema
+    pthread
+)
+add_test(NAME test_rondb_ns_semantics COMMAND test_rondb_ns_semantics)
+set_tests_properties(test_rondb_ns_semantics PROPERTIES LABELS "unit")
+# End of rondb-fix track block.
+
+# -------------------------------------------------------------------
+# Proxy SEEK_HOLE regression (mds_proxy_seek over fully written stripe
+# units).  Same fixture shape and link line as test_proxy_io.
+# -------------------------------------------------------------------
+add_executable(test_proxy_seek_hole unit/test_proxy_seek_hole.c)
+target_include_directories(test_proxy_seek_hole PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src/tools
+    ${PROJECT_SOURCE_DIR}/src/catalogue
+    ${PROJECT_SOURCE_DIR}/tests
+)
+target_link_libraries(test_proxy_seek_hole PRIVATE
+    pnfs_mds_core
+    pnfs_cluster
+    pnfs_fsal_obj
+    pnfs_common
+    pnfs_mds_core
+    pnfs_cluster
+    pnfs_mds_core
+    pthread
+)
+add_test(NAME test_proxy_seek_hole COMMAND test_proxy_seek_hole)
+set_tests_properties(test_proxy_seek_hole PROPERTIES LABELS "unit")

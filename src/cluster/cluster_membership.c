@@ -8,11 +8,9 @@
  * (local in-memory).
  *
  * Lock contract:
- *   - apply_member_upsert() / apply_member_remove() are private
- *     helpers that take the write lock internally and mutate the
- *     local cache.  They are called by watch handlers and init.
- *   - Backend vtable join/leave do catalogue I/O OUTSIDE the rwlock,
- *     then wait for the watch handler to apply the change locally.
+ *   - apply_registry_member() is a private helper that takes the
+ *     write lock internally and merges one node-registry row into the
+ *     local cache.  It is called by cluster_membership_populate().
  *   - Local backend join/leave are called with write lock held
  *     (unchanged from before).
  *   - cluster_membership_populate() reads the node registry through
@@ -128,69 +126,69 @@ static uint32_t lowest_mds_id(const struct cluster_membership *ctx)
 }
 
 /* -----------------------------------------------------------------------
- * apply_member_upsert / apply_member_remove
+ * apply_registry_member
  *
- * Private helpers that mutate the local array under write lock.
- * Called by: watch handlers, init snapshot loading, local backend.
+ * Merge one node-registry row into the local array under write lock.
  *
- * Returns true if this was a new insert (not an update).
+ * The registry is authoritative for a node's address only: mds_id,
+ * hostname, nfs_port, grpc_port (the row carries nothing else the
+ * callback exposes).  Role, lifecycle, failover partner, cluster
+ * address, wire-compat version and join time are LOCAL state -- set by
+ * cluster_membership_init for self from the configuration and by
+ * cluster_node_join (transport JOIN) for peers -- so an existing member
+ * keeps them and only its address fields are refreshed.  Replacing the
+ * whole entry, as the previous populate did, stamped this node's own
+ * row ACTIVE/ACTIVE_SERVING/partner 0, so a configured standby never
+ * matched main.c's `role == NODE_STANDBY` check and failover never
+ * armed; it likewise flipped transport-joined standby peers to ACTIVE.
+ *
+ * A node seen only through the registry is inserted with the defaults
+ * the registry path always gave it (ACTIVE, ACTIVE_SERVING, no partner,
+ * no cluster address), except wire_compat_version: the registry does
+ * not carry it, and this codebase's convention for an unknown version
+ * is the legacy value 1 (test_rolling_upgrade: a member record without
+ * the field decodes as 1), not 0 -- with self now keeping its real
+ * PNFS_MDS_WIRE_COMPAT_VERSION, a 0 here would make
+ * failover_promote's compat gate refuse every promotion.
  * ----------------------------------------------------------------------- */
 
-static bool apply_member_upsert(struct cluster_membership *ctx,
-                                const struct cluster_member *member)
-{
-    bool is_new = false;
+/* Legacy wire-compat version assumed for a peer whose record does not
+ * carry one (see above). */
+#define REGISTRY_WIRE_COMPAT_UNKNOWN 1U
 
+static void apply_registry_member(struct cluster_membership *ctx,
+                                  const struct cluster_member *reg)
+{
     pthread_rwlock_wrlock(&ctx->lock);
 
-    int idx = find_member(ctx, member->mds_id);
+    int idx = find_member(ctx, reg->mds_id);
     if (idx >= 0) {
-        /* Update existing member -- preserve join_time if not set. */
-        uint64_t old_join_time = ctx->members[idx].join_time_sec;
-        ctx->members[idx] = *member;
-        if (ctx->members[idx].join_time_sec == 0) {
-            ctx->members[idx].join_time_sec = old_join_time;
+        struct cluster_member *m = &ctx->members[idx];
+
+        if (reg->hostname[0] != '\0') {
+            memcpy(m->hostname, reg->hostname, sizeof(m->hostname));
         }
-    } else {
-        /* New member -- grow and insert. */
-        if (grow_members(ctx) == MDS_OK) {
-            ctx->members[ctx->count] = *member;
-            ctx->count++;
-            is_new = true;
-        }
+        m->nfs_port = reg->nfs_port;
+        m->grpc_port = reg->grpc_port;
+    } else if (grow_members(ctx) == MDS_OK) {
+        struct cluster_member *m = &ctx->members[ctx->count];
+
+        *m = *reg;
+        m->role = NODE_ACTIVE;
+        m->lifecycle = NODE_ACTIVE_SERVING;
+        m->failover_partner_id = 0;
+        m->cluster_addr[0] = '\0';
+        m->wire_compat_version = REGISTRY_WIRE_COMPAT_UNKNOWN;
+        m->join_time_sec = (uint64_t)time(NULL);
+        ctx->count++;
     }
 
     pthread_rwlock_unlock(&ctx->lock);
 
     /* Register hostname in subtree map (outside our lock). */
-    if (ctx->smap != NULL && member->hostname[0] != '\0') {
-        (void)subtree_map_register_node(ctx->smap, member->mds_id,
-                                        member->hostname);
-    }
-
-    return is_new;
-}
-
-static void apply_member_remove(struct cluster_membership *ctx,
-                                uint32_t mds_id)
-{
-    pthread_rwlock_wrlock(&ctx->lock);
-
-    int idx = find_member(ctx, mds_id);
-    if (idx >= 0) {
-        if ((uint32_t)(idx + 1) < ctx->count) {
-            memmove(&ctx->members[idx], &ctx->members[idx + 1],
-                    (ctx->count - (uint32_t)idx - 1) *
-                    sizeof(ctx->members[0]));
-        }
-        ctx->count--;
-    }
-
-    pthread_rwlock_unlock(&ctx->lock);
-
-    /* Unregister hostname from subtree map (outside our lock). */
-    if (ctx->smap != NULL) {
-        (void)subtree_map_unregister_node(ctx->smap, mds_id);
+    if (ctx->smap != NULL && reg->hostname[0] != '\0') {
+        (void)subtree_map_register_node(ctx->smap, reg->mds_id,
+                                        reg->hostname);
     }
 }
 
@@ -410,6 +408,9 @@ struct registry_populate_ctx {
     uint32_t upserted;
 };
 
+/* boot_epoch and last_heartbeat_ns are deliberately not interpreted:
+ * liveness is the failover watchdog's business (failover_watchdog.h),
+ * and the timestamp's clock domain is not this consumer's to judge. */
 static int registry_member_cb(uint32_t mds_id, uint64_t boot_epoch,
                               const char *hostname,
                               uint16_t nfs_port, uint16_t grpc_port,
@@ -419,19 +420,16 @@ static int registry_member_cb(uint32_t mds_id, uint64_t boot_epoch,
     (void)boot_epoch;
     (void)last_heartbeat_ns;
 
-    struct cluster_member m;
-    memset(&m, 0, sizeof(m));
-    m.mds_id = mds_id;
+    struct cluster_member reg;
+    memset(&reg, 0, sizeof(reg));
+    reg.mds_id = mds_id;
     if (hostname != NULL) {
-        (void)snprintf(m.hostname, sizeof(m.hostname), "%s", hostname);
+        (void)snprintf(reg.hostname, sizeof(reg.hostname), "%s", hostname);
     }
-    m.nfs_port = nfs_port;
-    m.grpc_port = grpc_port;
-    m.role = NODE_ACTIVE;
-    m.lifecycle = NODE_ACTIVE_SERVING;
-    m.join_time_sec = (uint64_t)time(NULL);
+    reg.nfs_port = nfs_port;
+    reg.grpc_port = grpc_port;
 
-    (void)apply_member_upsert(rc->cm, &m);
+    apply_registry_member(rc->cm, &reg);
     rc->upserted++;
     return 0;
 }

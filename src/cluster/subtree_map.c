@@ -5,12 +5,9 @@
  * subtree_map.c -- Subtree ownership map.
  *
  * Lock contract:
- *   - apply_subtree_upsert() / apply_subtree_remove() are private
- *     helpers that take the write lock internally and mutate the
- *     local cache.  Called by watch handlers and init.
- *   - Backend vtable set_owner/set_state/add_entry/remove_entry
- *     do catalogue I/O OUTSIDE the rwlock, then wait for the watch
- *     handler to apply the change locally.
+ *   - apply_subtree_upsert() is a private helper that takes the write
+ *     lock internally and mutates the local cache.  Called by the
+ *     partition-map load (init and refresh).
  *   - Local backend vtable functions are called with write lock
  *     held (unchanged).
  *   - The catalogue-backed init / refresh / seed paths reach the
@@ -41,8 +38,14 @@
 
 #define SUBTREE_MAP_INIT_CAP   16
 #define NODE_INFO_INIT_CAP     8
-#define WAIT_FOR_REV_TIMEOUT_SEC 10
 #define SUBTREE_JSON_BUF       512
+
+/* Startup load of the partition map (subtree_map_init_from_catalogue):
+ * a failed list or root claim is retried this many times, this far
+ * apart, and is then fatal for the caller.  Small and fixed: the whole
+ * budget (0.5 s) stays well inside the daemon's startup deadline. */
+#define PM_INIT_ATTEMPTS        3
+#define PM_INIT_RETRY_DELAY_MS  250U
 
 /* -----------------------------------------------------------------------
  * Backend vtable
@@ -96,11 +99,6 @@ struct subtree_map {
     /* Change callback */
     subtree_change_cb     change_cb;
     void                 *change_arg;
-
-    /* Wait-for-revision */
-    int64_t               applied_revision;
-    pthread_mutex_t       rev_mutex;
-    pthread_cond_t        rev_cond;
 };
 
 /* -----------------------------------------------------------------------
@@ -209,32 +207,31 @@ int subtree_map_owner_for_root_fileid(const struct subtree_map *map,
                                       uint64_t fileid,
                                       uint32_t *owner_out)
 {
-    struct subtree_map *m = (struct subtree_map *)(uintptr_t)map;
     int found = 0;
 
-    if (m == NULL || fileid == 0) { return 0;
+    if (map == NULL || fileid == 0) { return 0;
 }
-    pthread_rwlock_rdlock(&m->lock);
-    for (uint32_t i = 0; i < m->count; i++) {
-        if (m->entries[i].root_fileid != fileid) { continue;
+    pthread_rwlock_rdlock((pthread_rwlock_t *)&map->lock);
+    for (uint32_t i = 0; i < map->count; i++) {
+        if (map->entries[i].root_fileid != fileid) { continue;
 }
-        if (m->entries[i].path[0] == '/' &&
-            m->entries[i].path[1] == '\0') { continue;
+        if (map->entries[i].path[0] == '/' &&
+            map->entries[i].path[1] == '\0') { continue;
 }
-        if (owner_out != NULL) { *owner_out = m->entries[i].owner_mds_id;
+        if (owner_out != NULL) { *owner_out = map->entries[i].owner_mds_id;
 }
         found = 1;
         break;
     }
-    pthread_rwlock_unlock(&m->lock);
+    pthread_rwlock_unlock((pthread_rwlock_t *)&map->lock);
     return found;
 }
 
 /* -----------------------------------------------------------------------
- * apply_subtree_upsert / apply_subtree_remove
+ * apply_subtree_upsert
  *
- * Private helpers that mutate the local array under write lock.
- * Called by: watch handlers, init snapshot loading.
+ * Private helper that mutates the local array under write lock.
+ * Called by the partition-map load (init and refresh).
  * ----------------------------------------------------------------------- */
 
 static void apply_subtree_upsert(struct subtree_map *m,
@@ -263,56 +260,6 @@ static void apply_subtree_upsert(struct subtree_map *m,
     }
 
     pthread_rwlock_unlock(&m->lock);
-}
-
-static void apply_subtree_remove(struct subtree_map *m, const char *path)
-{
-    pthread_rwlock_wrlock(&m->lock);
-
-    int idx = find_exact(m, path);
-    if (idx >= 0) {
-        if ((uint32_t)(idx + 1) < m->count) {
-            memmove(&m->entries[idx], &m->entries[idx + 1],
-                    (m->count - (uint32_t)idx - 1) *
-                    sizeof(m->entries[0]));
-        }
-        m->count--;
-    }
-
-    pthread_rwlock_unlock(&m->lock);
-}
-
-/* -----------------------------------------------------------------------
- * Wait-for-revision (subtree)
- * ----------------------------------------------------------------------- */
-
-static void subtree_signal_revision(struct subtree_map *m, int64_t rev)
-{
-    pthread_mutex_lock(&m->rev_mutex);
-    if (rev > m->applied_revision) {
-        m->applied_revision = rev;
-    }
-    pthread_cond_broadcast(&m->rev_cond);
-    pthread_mutex_unlock(&m->rev_mutex);
-}
-
-static enum mds_status subtree_wait_for_revision(struct subtree_map *m,
-                                                  int64_t target_rev)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += WAIT_FOR_REV_TIMEOUT_SEC;
-
-    pthread_mutex_lock(&m->rev_mutex);
-    while (m->applied_revision < target_rev) {
-        int rc = pthread_cond_timedwait(&m->rev_cond, &m->rev_mutex, &ts);
-        if (rc != 0) {
-            pthread_mutex_unlock(&m->rev_mutex);
-            return MDS_ERR_IO;
-        }
-    }
-    pthread_mutex_unlock(&m->rev_mutex);
-    return MDS_OK;
 }
 
 /* -----------------------------------------------------------------------
@@ -453,9 +400,6 @@ enum mds_status subtree_map_init(const char *etcd_endpoints,
         return MDS_ERR_NOMEM;
     }
 
-    pthread_mutex_init(&m->rev_mutex, NULL);
-    pthread_cond_init(&m->rev_cond, NULL);
-
     /* --- Local path --- */
     m->backend = &local_subtree_backend;
 
@@ -469,8 +413,6 @@ enum mds_status subtree_map_init(const char *etcd_endpoints,
     if (self_hostname != NULL) {
         enum mds_status st = register_node(m, self_id, self_hostname);
         if (st != MDS_OK) {
-            pthread_mutex_destroy(&m->rev_mutex);
-            pthread_cond_destroy(&m->rev_cond);
             pthread_rwlock_destroy(&m->lock);
             free(m->nodes); free(m->entries); free(m);
             return st;
@@ -506,13 +448,80 @@ static int pm_load_cb(uint32_t partition_id, uint32_t owner_mds_id,
     return 0;
 }
 
+/* One startup attempt at obtaining an authoritative map: load every
+ * partition row; when no root row exists afterwards, claim root with
+ * an insert-only put.  The local root entry is added only after the
+ * store accepted the insert, so a transient error never leaves this
+ * node believing it owns root.
+ *
+ * Returns MDS_OK when the map holds a root entry; MDS_ERR_EXISTS when
+ * another node claimed root between the list and the put (the caller
+ * re-lists to learn the owner); otherwise the failing dispatcher status
+ * (a partially delivered list is harmless: re-listing re-upserts). */
+static enum mds_status pm_init_attempt(struct subtree_map *m,
+                                       struct mds_catalogue *cat)
+{
+    struct pm_load_ctx lc = { .map = m, .loaded = 0 };
+    enum mds_status st;
+
+    st = mds_cluster_partition_list(cat, pm_load_cb, &lc);
+    if (st != MDS_OK) {
+        return st;
+    }
+    if (find_exact(m, "/") >= 0) {
+        return MDS_OK;
+    }
+    st = mds_cluster_partition_put(cat, 0, m->self_id,
+                                   MDS_PARTITION_STATE_ACTIVE, "/", true);
+    if (st == MDS_OK) {
+        apply_subtree_upsert(m, "/", m->self_id, SUBTREE_ACTIVE, 1);
+    }
+    return st;
+}
+
+static void pm_init_log_attempt(int attempt, enum mds_status st)
+{
+    if (st == MDS_ERR_EXISTS) {
+        MDS_LOG_INFO(LOG_COMP_CLUSTER,
+            "partition_map root claimed by another node; "
+            "reloading the map");
+    } else {
+        MDS_LOG_WARN(LOG_COMP_CLUSTER,
+            "partition_map load attempt %d/%d failed (%d)",
+            attempt, PM_INIT_ATTEMPTS, (int)st);
+    }
+}
+
+/* The partition map is the authority for root ownership.  A failed
+ * list is never treated as an empty map (that is what would make this
+ * node claim root); it is retried a bounded number of times and the
+ * last status is returned, so the caller fails the init and the daemon
+ * exits instead of serving from a map it could not read. */
+static enum mds_status pm_init_load(struct subtree_map *m,
+                                    struct mds_catalogue *cat)
+{
+    int attempt;
+
+    for (attempt = 1; ; attempt++) {
+        enum mds_status st = pm_init_attempt(m, cat);
+
+        if (st == MDS_OK) {
+            return MDS_OK;
+        }
+        pm_init_log_attempt(attempt, st);
+        if (attempt >= PM_INIT_ATTEMPTS) {
+            return st;
+        }
+        usleep(PM_INIT_RETRY_DELAY_MS * 1000U);
+    }
+}
+
 enum mds_status subtree_map_init_from_catalogue(struct mds_catalogue *cat,
                                                 uint32_t self_id,
                                                 const char *self_hostname,
                                                 struct subtree_map **out)
 {
     struct subtree_map *m;
-    struct pm_load_ctx lc;
     enum mds_status st;
 
     if (cat == NULL || out == NULL) {
@@ -537,51 +546,28 @@ enum mds_status subtree_map_init_from_catalogue(struct mds_catalogue *cat,
         free(m->nodes); free(m->entries); free(m);
         return MDS_ERR_NOMEM;
     }
-    pthread_mutex_init(&m->rev_mutex, NULL);
-    pthread_cond_init(&m->rev_cond, NULL);
+    m->backend = &local_subtree_backend;
 
-    /* Load subtree entries from the catalogue's partition map. */
-    lc.map = m;
-    lc.loaded = 0;
-    st = mds_cluster_partition_list(cat, pm_load_cb, &lc);
+    st = pm_init_load(m, cat);
     if (st != MDS_OK) {
-        /* Carried over unchanged from the RonDB-specific init: a
-         * failed list is treated as an empty map and root is claimed
-         * below with an upsert.  A transient error at boot can
-         * therefore rewrite the real root owner; the target contract
-         * (mds_cluster.h: fatal list failure, insert-only root claim)
-         * replaces this in its own reviewed change. */
-        MDS_LOG_WARN(LOG_COMP_CLUSTER,
-            "partition_map load failed (%d), "
-            "seeding root entry", (int)st);
-    }
-
-    /* Ensure root "/" exists. */
-    if (find_exact(m, "/") < 0) {
-        (void)snprintf(m->entries[m->count].path,
-                 sizeof(m->entries[0].path), "/");
-        m->entries[m->count].owner_mds_id = self_id;
-        m->entries[m->count].version = 1;
-        m->entries[m->count].state = SUBTREE_ACTIVE;
-        m->count++;
-
-        /* Claim root in the partition map (upsert, see above). */
-        (void)mds_cluster_partition_put(
-            cat, 0, self_id, MDS_PARTITION_STATE_ACTIVE, "/", false);
+        MDS_LOG_ERROR(LOG_COMP_CLUSTER,
+            "partition_map unavailable after %d attempts (%d); "
+            "refusing to start without an authoritative map",
+            PM_INIT_ATTEMPTS, (int)st);
+        subtree_map_destroy(m);
+        return st;
     }
 
     /* Load node hostnames from node_registry. */
     /* (done separately via main.c heartbeat registration) */
-
-    m->backend = &local_subtree_backend;
 
     if (self_hostname != NULL) {
         (void)register_node(m, self_id, self_hostname);
     }
 
     MDS_LOG_INFO(LOG_COMP_CLUSTER,
-        "subtree_map_init_from_catalogue: loaded %u entries from "
-        "partition_map", lc.loaded);
+        "subtree_map_init_from_catalogue: %u entries from partition_map",
+        m->count);
 
     *out = m;
     return MDS_OK;
@@ -601,6 +587,82 @@ enum mds_status subtree_map_refresh_from_catalogue(struct subtree_map *map,
     return mds_cluster_partition_list(cat, pm_load_cb, &lc);
 }
 
+/* Seed logging: the catalogue put failed (@pst); @ast is the local
+ * add's status (MDS_OK == newly added this boot). */
+static void seed_log_put_failed(const char *spath, uint32_t mds_id,
+				enum mds_status ast, enum mds_status pst)
+{
+	MDS_LOG_WARN(LOG_COMP_CLUSTER,
+		"partition_map put %s (id=%u) failed: %d "
+		"(in-memory seed kept for this boot)",
+		spath, (unsigned)mds_id, (int)pst);
+	if (ast == MDS_OK) {
+		MDS_LOG_INFO(LOG_COMP_CLUSTER,
+			"seeded partition %s -> MDS %u (memory only)",
+			spath, (unsigned)mds_id);
+	}
+}
+
+/* Seed logging: the catalogue put succeeded. */
+static void seed_log_persisted(const char *spath, uint32_t mds_id,
+			       enum mds_status ast)
+{
+	if (ast == MDS_OK) {
+		MDS_LOG_INFO(LOG_COMP_CLUSTER,
+			"seeded partition %s -> MDS %u "
+			"(persisted to partition_map)",
+			spath, (unsigned)mds_id);
+	} else {
+		MDS_LOG_INFO(LOG_COMP_CLUSTER,
+			"persisted existing partition %s -> "
+			"MDS %u to partition_map",
+			spath, (unsigned)mds_id);
+	}
+}
+
+/* Seed one /shardN row: local cache first, then the catalogue.
+ * Every outcome is logged and none fails the caller (see
+ * subtree_map_seed_shards). */
+static void seed_one_shard(struct subtree_map *map,
+			   struct mds_catalogue *cat,
+			   uint32_t mds_id, const char *host)
+{
+	char spath[64];
+	enum mds_status ast;
+	enum mds_status pst;
+
+	(void)snprintf(spath, sizeof(spath), "/shard%u", (unsigned)mds_id);
+
+	/*
+	 * Membership is not wired yet, so owner_role_ok allows
+	 * any owner_id.  Add to the local cache first so this
+	 * boot can serve referrals even if the catalogue put fails.
+	 */
+	ast = subtree_map_add(map, spath, mds_id, host, SUBTREE_ACTIVE, 1);
+	if (ast != MDS_OK && ast != MDS_ERR_EXISTS) {
+		MDS_LOG_WARN(LOG_COMP_CLUSTER,
+			"partition seed %s failed: %d", spath, (int)ast);
+		return;
+	}
+
+	/*
+	 * Persist with partition_id == mds_id (root uses 0).
+	 * Upsert (insert_only == false) is deliberate and is the ONLY
+	 * upsert in the partition map: the initial shard layout is
+	 * never-owned -- every MDS racing the seed writes identical rows
+	 * (/shardK owned by K) -- so there is no owner to protect.  Root
+	 * is claimed insert-only (pm_init_attempt) because it does have
+	 * one.
+	 */
+	pst = mds_cluster_partition_put(
+		cat, mds_id, mds_id, MDS_PARTITION_STATE_ACTIVE, spath, false);
+	if (pst != MDS_OK) {
+		seed_log_put_failed(spath, mds_id, ast, pst);
+		return;
+	}
+	seed_log_persisted(spath, mds_id, ast);
+}
+
 enum mds_status subtree_map_seed_shards(
 	struct subtree_map *map,
 	struct mds_catalogue *cat,
@@ -616,67 +678,13 @@ enum mds_status subtree_map_seed_shards(
 	}
 
 	for (uint32_t si = 0; si < cluster_size; si++) {
-		char spath[64];
-		uint32_t mds_id = si + 1;
 		const char *host = NULL;
-		enum mds_status ast;
-		enum mds_status pst;
 
-		(void)snprintf(spath, sizeof(spath),
-			       "/shard%u", (unsigned)mds_id);
 		if (peer_hosts != NULL && si < peer_count &&
 		    peer_hosts[si] != NULL && peer_hosts[si][0] != '\0') {
 			host = peer_hosts[si];
 		}
-
-		/*
-		 * Membership is not wired yet, so owner_role_ok allows
-		 * any owner_id.  Add to the local cache first so this
-		 * boot can serve referrals even if the catalogue put fails.
-		 */
-		ast = subtree_map_add(map, spath, mds_id, host,
-				      SUBTREE_ACTIVE, 1);
-		if (ast != MDS_OK && ast != MDS_ERR_EXISTS) {
-			MDS_LOG_WARN(LOG_COMP_CLUSTER,
-				"partition seed %s failed: %d",
-				spath, (int)ast);
-			continue;
-		}
-
-		/*
-		 * Persist with partition_id == mds_id (root uses 0).
-		 * Upsert (insert_only == false): the initial shard layout
-		 * is never-owned, so every MDS racing the seed writes the
-		 * same rows.
-		 */
-		pst = mds_cluster_partition_put(
-			cat, mds_id, mds_id, MDS_PARTITION_STATE_ACTIVE, spath,
-			false);
-		if (pst != MDS_OK) {
-			MDS_LOG_WARN(LOG_COMP_CLUSTER,
-				"partition_map put %s (id=%u) failed: %d "
-				"(in-memory seed kept for this boot)",
-				spath, (unsigned)mds_id, (int)pst);
-			if (ast == MDS_OK) {
-				MDS_LOG_INFO(LOG_COMP_CLUSTER,
-					"seeded partition %s -> MDS %u "
-					"(memory only)",
-					spath, (unsigned)mds_id);
-			}
-			continue;
-		}
-
-		if (ast == MDS_OK) {
-			MDS_LOG_INFO(LOG_COMP_CLUSTER,
-				"seeded partition %s -> MDS %u "
-				"(persisted to partition_map)",
-				spath, (unsigned)mds_id);
-		} else {
-			MDS_LOG_INFO(LOG_COMP_CLUSTER,
-				"persisted existing partition %s -> "
-				"MDS %u to partition_map",
-				spath, (unsigned)mds_id);
-		}
+		seed_one_shard(map, cat, si + 1, host);
 	}
 
 	return MDS_OK;
@@ -1030,11 +1038,6 @@ void subtree_map_destroy(struct subtree_map *map)
     if (map->backend != NULL) { map->backend->destroy(map);
 }
     pthread_rwlock_destroy(&map->lock);
-    /* Both init paths (subtree_map_init and
-     * subtree_map_init_from_catalogue) initialise rev_mutex/rev_cond,
-     * so the teardown is unconditional and symmetric. */
-    pthread_mutex_destroy(&map->rev_mutex);
-    pthread_cond_destroy(&map->rev_cond);
     free(map->frozen_fids);
     free(map->nodes);
     free(map->entries);

@@ -9,7 +9,8 @@
  *   2. Self-fencing guard + replication health gate
  *   3. detect_cb confirmation (if non-NULL)
  *   4. Transfer subtree ownership via failover_take_over
- *   5. Load client recovery records from the coordination backend
+ *   5. Load the partner's client recovery records from the
+ *      coordination backend and re-own them (best-effort)
  *   6. Enter grace period
  *   7. Publish self as ACTIVE + ACTIVE_SERVING via promote_standby
  *   8. Set internal role -> PRIMARY
@@ -207,6 +208,45 @@ static int failover_collect_recovery_cb(uint64_t clientid,
     return 0;
 }
 
+/**
+ * Re-own the partner's recovery rows.
+ *
+ * Recovery rows record the MDS that served the client, and
+ * mds_coord_recovery_list(owner) returns only that owner's rows.  The
+ * grace-period EXCHANGE_ID matching in session.c lists the rows owned
+ * by THIS node, so after promotion the partner's clients would never
+ * be matched to their old clientids (and CLAIM_PREVIOUS would fail)
+ * unless their rows are re-owned.  Rewriting a row through this node's
+ * catalogue handle stamps this node as its owner; the payload is
+ * unchanged.  Exceptional path only (one read + one write per client
+ * at promotion), best-effort: a row that cannot be adopted is left to
+ * the partner's ownership and its client simply gets a fresh clientid,
+ * exactly as before this step existed.
+ *
+ * @return Number of rows that could NOT be adopted.
+ */
+static uint32_t failover_adopt_recovery_rows(
+    struct mds_catalogue *cat,
+    const struct client_recovery_rec *recs, uint32_t count)
+{
+    uint32_t failed = 0;
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint8_t co_ownerid[1024];
+        uint32_t co_len = 0;
+        uint8_t verifier[8];
+
+        if (mds_coord_recovery_get(cat, recs[i].clientid, co_ownerid,
+                                   &co_len, verifier) != MDS_OK ||
+            co_len > sizeof(co_ownerid) ||
+            mds_coord_recovery_put(cat, NULL, recs[i].clientid,
+                                   co_ownerid, co_len, verifier) != MDS_OK) {
+            failed++;
+        }
+    }
+    return failed;
+}
+
 static enum mds_status failover_load_recovery_clients(
     struct mds_catalogue *cat, uint32_t owner_mds_id,
     struct client_recovery_rec **out_recs, uint32_t *out_count)
@@ -316,16 +356,33 @@ enum mds_status failover_promote(struct failover_ctx *ctx)
         return MDS_ERR_IO;
     }
 
-    /* Phase 5: Load recovering clientids via the coordination API.
-     * grace_enter_with_clients() currently tracks only clientid;
-     * the full recovery payload remains in the coordination backend
-     * for EXCHANGE_ID matching during grace. */
+    /* Phase 5: Load the partner's recovering clientids via the
+     * coordination API (rows are owned by the MDS that served the
+     * client).  grace_enter_with_clients() currently tracks only
+     * clientid; the full recovery payload remains in the coordination
+     * backend for EXCHANGE_ID matching during grace. */
     st = failover_load_recovery_clients(ctx->cat, ctx->partner_id,
                                         &recs, &rec_count);
     if (st != MDS_OK) {
         rollback_taken_paths(ctx);
         ctx->role = FAILOVER_STANDBY;
         return st;
+    }
+
+    /* Phase 5b: adopt those rows so this node's own grace matching
+     * (which lists rows owned by self) sees them.  Best-effort. */
+    {
+        uint32_t not_adopted =
+            failover_adopt_recovery_rows(ctx->cat, recs, rec_count);
+
+        if (not_adopted != 0) {
+            MDS_LOG_WARN(LOG_COMP_CLUSTER,
+                    "failover: %u of %u recovery rows of partner %u "
+                    "could not be re-owned; those clients will not "
+                    "be matched to their old clientids in grace",
+                    (unsigned)not_adopted, (unsigned)rec_count,
+                    (unsigned)ctx->partner_id);
+        }
     }
 
     /* Phase 6: Enter grace period with client list. */
