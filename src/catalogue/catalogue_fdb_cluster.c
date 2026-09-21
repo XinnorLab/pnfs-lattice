@@ -718,10 +718,11 @@ static enum mds_status fdb_partition_put(struct mds_catalogue *cat, uint32_t par
     return st;
 }
 
-/* cppcheck-suppress constParameterPointer ; the slot signature takes a mutable handle */
-enum mds_status fdb_cluster_partition_cas(struct mds_catalogue *cat, uint32_t partition_id,
-                                          uint32_t expected_owner, uint32_t new_owner,
-                                          uint8_t new_state)
+/* The failover takeover's persistence step (mds_cluster.h): the owner
+ * moves only while the row still names @p expected_owner. */
+static enum mds_status fdb_partition_cas(struct mds_catalogue *cat, uint32_t partition_id,
+                                         uint32_t expected_owner, uint32_t new_owner,
+                                         uint8_t new_state)
 {
     struct partition_ctx *c;
     enum mds_status st;
@@ -756,5 +757,5 @@ const struct mds_cluster_ops fdb_cluster_ops = {
     .node_scan_stale = fdb_node_scan_stale,
     .partition_list  = fdb_partition_list,
     .partition_put   = fdb_partition_put,
-    .partition_cas   = fdb_cluster_partition_cas,
+    .partition_cas   = fdb_partition_cas,
 };

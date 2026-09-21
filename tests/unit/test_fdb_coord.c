@@ -1222,21 +1222,21 @@ static void test_cluster_contract(void)
               MDS_ERR_INVAL);
 
     /* partition_cas: expected owner checked inside the transaction. */
-    ASSERT_EQ(fdb_cluster_partition_cas(g_cat, 0, 1, 3, MDS_PARTITION_STATE_ACTIVE),
+    ASSERT_EQ(mds_cluster_partition_cas(g_cat, 0, 1, 3, MDS_PARTITION_STATE_ACTIVE),
               MDS_ERR_STALE);
     memset(&pl, 0, sizeof(pl));
     ASSERT_EQ(mds_cluster_partition_list(g_cat, part_list_cb, &pl), MDS_OK);
     ASSERT_EQ(pl.rows[0].owner, 2);
     ASSERT_EQ(pl.rows[0].state, MDS_PARTITION_STATE_MIGRATING);
-    ASSERT_EQ(fdb_cluster_partition_cas(g_cat, 0, 2, 3, MDS_PARTITION_STATE_ACTIVE), MDS_OK);
+    ASSERT_EQ(mds_cluster_partition_cas(g_cat, 0, 2, 3, MDS_PARTITION_STATE_ACTIVE), MDS_OK);
     memset(&pl, 0, sizeof(pl));
     ASSERT_EQ(mds_cluster_partition_list(g_cat, part_list_cb, &pl), MDS_OK);
     ASSERT_EQ(pl.rows[0].owner, 3);
     ASSERT_EQ(pl.rows[0].state, MDS_PARTITION_STATE_ACTIVE);
     ASSERT_EQ(strcmp(pl.rows[0].path, "/"), 0);
-    ASSERT_EQ(fdb_cluster_partition_cas(g_cat, 7, 0, 3, MDS_PARTITION_STATE_ACTIVE),
+    ASSERT_EQ(mds_cluster_partition_cas(g_cat, 7, 0, 3, MDS_PARTITION_STATE_ACTIVE),
               MDS_ERR_NOTFOUND);
-    ASSERT_EQ(fdb_cluster_partition_cas(NULL, 0, 3, 4, MDS_PARTITION_STATE_ACTIVE),
+    ASSERT_EQ(mds_cluster_partition_cas(NULL, 0, 3, 4, MDS_PARTITION_STATE_ACTIVE),
               MDS_ERR_INVAL);
 }
 

@@ -152,22 +152,8 @@ struct mds_cluster_ops;
 extern const struct mds_coordination_ops fdb_coordination_ops;
 
 /** Cluster slots (catalogue_fdb_cluster.c); installed as
- *  cat->cluster_ops by catalogue_fdb_open(). */
+ *  cat->cluster_ops by catalogue_fdb_open().  Every slot, partition_cas
+ *  included, is reached through the mds_cluster_* dispatchers. */
 extern const struct mds_cluster_ops fdb_cluster_ops;
-
-/**
- * Compare-and-swap of a partition's owner in ONE transaction: read the
- * PARTITION_MAP row, MDS_ERR_NOTFOUND when absent, MDS_ERR_STALE when
- * its owner is not @p expected_owner (nothing written), else set the
- * owner and state (the subtree path is kept).  Registered as
- * mds_cluster_ops.partition_cas in fdb_cluster_ops
- * (catalogue_fdb_cluster.c); reached through mds_cluster_partition_cas.
- *
- * @return MDS_OK; MDS_ERR_NOTFOUND; MDS_ERR_STALE; MDS_ERR_INVAL for a
- *         non-fdb handle; the transaction runner's status otherwise.
- */
-enum mds_status fdb_cluster_partition_cas(struct mds_catalogue *cat, uint32_t partition_id,
-                                          uint32_t expected_owner, uint32_t new_owner,
-                                          uint8_t new_state);
 
 #endif /* CATALOGUE_FDB_H */
