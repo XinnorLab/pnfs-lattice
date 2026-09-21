@@ -364,8 +364,8 @@ catalogue_backend_conf = /etc/pnfs-mds/rondb.conf
 
 # Data servers
 ds_count = 2
-ds_0     = ds0.internal:/srv/ds0
-ds_1     = ds1.internal:/srv/ds1
+ds[0]    = ds0.internal:/srv/ds0
+ds[1]    = ds1.internal:/srv/ds1
 
 # Layout
 stripe_unit_bytes    = 1048576
@@ -383,17 +383,18 @@ schema_name    = pnfs_mds
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `catalogue_backend` | `rondb` | Catalogue backend: `rondb`, `memdb` (in-memory reference, single node) or `fdb` (FoundationDB, `ENABLE_FDB` builds) |
+| `catalogue_backend` | `rondb` when built with `ENABLE_RONDB`, otherwise mandatory | Catalogue backend: `rondb`, `memdb` (in-memory reference, single node) or `fdb` (FoundationDB, `ENABLE_FDB` builds); a backend not compiled in is refused at startup |
 | `catalogue_backend_conf` | — | Path to backend-specific config (rondb) |
 | `fdb_cluster_file` / `fdb_key_prefix` | — | FoundationDB cluster file and per-catalogue key prefix (fdb) |
-| `worker_threads` | auto | RPC worker count |
+| `worker_threads` | 16 | COMPOUND dispatch worker count |
 | `lease_time_sec` | 90 | NFSv4 lease time |
 | `grace_period_sec` | 90 | Grace period duration |
 | `workload_profile` | `default` | Tuning preset: `default`, `hpc`, `ai_training`, `genomics`, `media` |
 | `inline_enabled` | `false` | Small-file acceleration (must be false in RonDB mode) |
 | `catalog_image_mode` | `off` | Hot-read image: `off`, `shadow`, `compare`, `primary` |
 
-See `docs/architecture.md` for the full configuration reference.
+See `docs/config-keys.md` and the `mds.conf(5)` man page
+(`docs/man/mds.conf.5`) for the full configuration reference.
 
 
 ### Running Tests

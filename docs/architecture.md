@@ -83,14 +83,14 @@ threads sharing one address space.
 | Cluster transport | `src/cluster/cluster_transport.c` | gRPC peer messaging for cross-MDS cache invalidation, hard-link 2PC, etc. |
 | Sessions / DRC | `src/mds/session.c` | NFSv4.1 session table, slot tables, replay cache. |
 | Backchannel | `src/mds/nfs4_cb.c` | CB_COMPOUND encoder + transport for CB_RECALL, CB_LAYOUTRECALL, CB_NOTIFY. |
-| Metrics | `src/mds/metrics_http.c` | HTTP `/metrics` endpoint (Prometheus text format). |
+| Metrics | `src/modules/observability/metrics_http_lite.c` | HTTP `/metrics` endpoint (Prometheus text format). |
 The worker pool is sized by `worker_threads` (config); the listener pool by
 `listener_threads`.  All other threads are singletons or small fixed pools.
 ## 4. Source layout
 ```text path=null start=null
 src/
 ├── mds/         # NFSv4.1/4.2 protocol surface and per-op handlers
-├── catalogue/   # Pluggable metadata backends (RonDB, in-memory memdb)
+├── catalogue/   # Pluggable metadata backends (RonDB, in-memory memdb, FoundationDB)
 ├── cluster/     # Cross-MDS coordination (transport, membership, 2PC)
 ├── common/      # Shared utilities: config, fh codec, endian helpers
 ├── fsal_obj/    # FSAL-style object abstractions used by the MDS
@@ -100,7 +100,8 @@ include/         # Public-facing headers; one per logical subsystem
 proto/           # gRPC service definitions for cluster transport
 tests/
 ├── unit/        # Per-module C unit tests
-└── integration/ # End-to-end tests against a memdb catalogue
+├── integration/ # End-to-end tests against a memdb catalogue
+└── catalogue_conformance/ # Backend contract suite (memdb / rondb / fdb)
 ```
 The boundary between `mds/` and the rest is intentional.  `mds/` knows about
 NFSv4 ops; everything below is protocol-agnostic and could in principle be
@@ -381,7 +382,8 @@ gRPC over TCP for the cluster transport (`src/cluster/cluster_transport.c`,
   multi-cluster deployments.
 ## 10. Observability
 - **Metrics.**  Prometheus text format on a configurable HTTP endpoint
-  (`metrics_http.c`).  Counters cover NFS op rates, catalogue txn rates,
+  (`src/modules/observability/metrics_http_lite.c`).  Counters cover NFS
+  op rates, catalogue txn rates,
   placement decisions, GC backlog, layout error counts, branch-level
   latency histograms.
 - **Structured logs.**  Journald via systemd by default; one line per
@@ -392,15 +394,24 @@ gRPC over TCP for the cluster transport (`src/cluster/cluster_transport.c`,
   smoke + soak workflow against a lab fleet for regression testing.
 ## 11. Build and test
 - **Build.**  CMake-based; `cmake -S . -B build && cmake --build build`.
-  The RonDB backend is gated by `-DHAVE_RONDB=ON` and links against
-  `libndbclient`.
+  The RonDB backend is enabled with `-DENABLE_RONDB=ON` (the option
+  defines `HAVE_RONDB` for the sources) and links against `libndbclient`;
+  the FoundationDB backend with `-DENABLE_FDB=ON` (`HAVE_FDB`, links
+  `libfdb_c`).  memdb is always built.
 - **Unit tests.**  `tests/unit/` against the memdb backend; one binary per
   module.  No external services required.
 - **Integration tests.**  `tests/integration/` exercises multi-component
   flows still against memdb.
+- **Conformance tests.**  `tests/catalogue_conformance/` runs one contract
+  against every backend; `CATALOGUE_TEST_BACKEND=memdb|rondb|fdb` selects
+  the store (memdb by default; a backend that is not built or not
+  reachable exits 77 = skipped).
 - **QA gates.**  `scripts/qa-check.sh --quick` runs style, gcc + clang
-  builds, cppcheck, clang-tidy, and unit tests.  The full mode adds
-  Valgrind and the integration suite.
+  builds, cppcheck, clang-tidy, and the `unit`-labelled ctest suite.  The
+  full mode adds Valgrind over every `test_*` binary.  The script's
+  `integration` gate is unconditionally skipped (it stands for a run
+  against a deployed MDS + DS fleet); the in-tree suites are run by label
+  instead: `ctest -L unit`, `ctest -L integration`, `ctest -L conformance`.
 - **Smoke.**  `scripts/pnfs-smoke.sh` runs a 17-step real-NFS smoke against
   a deployed lab.
 - **Soak.**  `tests/soak/pnfs-soak.sh` produces an iter / pass / fail log
@@ -499,3 +510,26 @@ an existing child's stripe map.  The daemon invalidates its local inode and
 HPC layout-cache entries after a real transition.  Active-active peers
 observe the authoritative catalogue update on their configured cache-TTL
 boundary, matching other cross-MDS metadata mutations.
+## 17. Status
+Implementation status of the major pieces, as of the source tree.  This
+is the section `CONTRIBUTING.md` asks commits to keep current when a
+change moves an item between the states below.
+- **Production:** the NFSv4.1/4.2 front end (§5), the RonDB catalogue
+  (§6), flex-files and file layouts with byte-range recall (§7), final-
+  unlink GC, the DS health / capacity / I/O-limit probes, sessions with
+  slot replay cache, back-channel recalls, the referral-based
+  active-active namespace and its cluster transport (§8–§9), and the
+  metadata search tools (§15).
+- **Shipped, off by default:** file and directory delegations
+  (`file_delegations_enabled`, `dir_delegations_enabled`), the deferred
+  parent-touch and async-REMOVE mutation paths, `transient_state_cache`,
+  the inode / dirent / layout caches, the LAYOUTGET new-file fast path,
+  auto-split, sharding, POSIX DAC enforcement and HPC-Shared layout
+  serving (§16; needs Linux 6.18+ clients).  See `config-keys.md`.
+- **Backends:** memdb is the in-tree reference and test backend
+  (non-durable, single node).  FoundationDB (`ENABLE_FDB`) passes the
+  conformance suite (slot matrix, contract, fault injection) and runs the
+  daemon; it has not had the production soak the RonDB backend has.
+- **Feature-gated / not a supported configuration:** the hard-link 2PC
+  path (cross-subtree LINK returns `NFS4ERR_XDEV`) and the multi-cluster
+  rename 2PC module, which exists as a building block only (§6, §13).

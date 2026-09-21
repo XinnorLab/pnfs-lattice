@@ -240,7 +240,7 @@ Enable image-vs-authority compare reads.
 .B ndb_conn_pool_size
 .IR uint ,
 range
-.I "1..32"
+.I "1..64"
 (default: auto-sized from worker count).
 NDB connections per MDS.
 .TP
@@ -396,8 +396,12 @@ design.
 .B inline_enabled
 .I bool
 (default
-.BR true ).
-Enable inline-data acceleration.
+.BR false ;
+the
+.IR hpc ", " ai_training ", " genomics " and " media
+profiles set it true).
+Enable inline-data acceleration.  The RonDB backend refuses
+.BR true .
 .TP
 .B inline_max_size
 .IR uint ,
