@@ -510,13 +510,20 @@ void metrics_http_stop(struct metrics_http_ctx *ctx)
 
     atomic_store_explicit(&ctx->shutdown, true, memory_order_release);
 
-    /* Closing the listen fd kicks accept() out of its block. */
+    /* Wake the accept thread with shutdown(): a blocked accept() on a
+     * shut-down listening socket returns an error, and the descriptor
+     * number stays allocated, so no other thread can reuse it while
+     * accept_loop may still pass it to a syscall.  The accept thread
+     * reads listen_fd on every iteration; close() and the -1 store
+     * therefore happen only after the join, when this thread is the
+     * sole owner (same ordering as cluster_transport_server_stop). */
     if (ctx->listen_fd >= 0) {
-        shutdown(ctx->listen_fd, SHUT_RDWR);
+        (void)shutdown(ctx->listen_fd, SHUT_RDWR);
+    }
+    (void)pthread_join(ctx->thread, NULL);
+    if (ctx->listen_fd >= 0) {
         close(ctx->listen_fd);
         ctx->listen_fd = -1;
     }
-
-    (void)pthread_join(ctx->thread, NULL);
     free(ctx);
 }

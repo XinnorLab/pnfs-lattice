@@ -190,7 +190,10 @@ static int parse_response(const char *buf, size_t len, int *status,
     const char *hdr_end;
     const char *cl;
 
-    if (len < 12 || memcmp(buf, "HTTP/1.0 ", 9) != 0) {
+    /* Validate before the searches: the buffer comes from the caller's
+     * malloc, and gcc's -Wnonnull (under -fsanitize=undefined) wants the
+     * NULL case decided before memmem() sees the pointer. */
+    if (buf == NULL || len < 12 || memcmp(buf, "HTTP/1.0 ", 9) != 0) {
         return -1;
     }
     *status = atoi(buf + 9);
