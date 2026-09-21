@@ -390,27 +390,35 @@ enum mds_status cluster_membership_promote_standby(
     struct cluster_membership *ctx, uint32_t mds_id);
 
 /* -----------------------------------------------------------------------
- * RonDB-native membership population (Phase 9)
+ * Membership population from the catalogue's node registry (Phase 9)
  *
- * Scans mds_node_registry and upserts all registered nodes into the
- * local membership array.  Called once at startup and periodically
- * from the heartbeat thread to discover newly-joined peers.
+ * Scans the node registry through mds_cluster_node_list() and upserts
+ * all registered nodes into the local membership array.  Called once
+ * at startup and periodically from the heartbeat thread to discover
+ * newly-joined peers.
  * ----------------------------------------------------------------------- */
 
 struct mds_catalogue;
 
 /**
- * @brief Populate membership from RonDB node_registry.
+ * @brief Populate membership from the catalogue's node registry.
  *
- * Scans all rows in mds_node_registry and upserts each as a
- * cluster_member.  Existing entries are updated; new entries
- * are inserted.  Self is skipped (already registered by init).
+ * Scans every registry row via mds_cluster_node_list() and upserts
+ * each as a cluster_member (role ACTIVE, lifecycle ACTIVE_SERVING).
+ * Existing entries are updated; new entries are inserted.  This
+ * node's own row is not skipped: it is upserted like any other, so
+ * the registry row's role/lifecycle stamp replaces the init-time one
+ * (behaviour carried over unchanged from the RonDB-specific version).
  *
  * @param ctx  Membership handle.
- * @param cat  Catalogue handle (RonDB backend).
- * @return MDS_OK on success, MDS_ERR_INVAL, MDS_ERR_IO.
+ * @param cat  Catalogue handle whose backend populates the node_list
+ *             cluster slot.
+ * @return MDS_OK on success; MDS_ERR_INVAL for NULL arguments;
+ *         otherwise the dispatcher's status unchanged
+ *         (MDS_ERR_NOSUPPORT when the backend has no node registry,
+ *         MDS_ERR_IO on a failed scan).
  */
-enum mds_status cluster_membership_populate_rondb(
-    struct cluster_membership *ctx, struct mds_catalogue *cat);
+enum mds_status cluster_membership_populate(struct cluster_membership *ctx,
+                                            struct mds_catalogue *cat);
 
 #endif /* CLUSTER_MEMBERSHIP_H */

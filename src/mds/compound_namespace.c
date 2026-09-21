@@ -3130,6 +3130,9 @@ static int readdir_plus_cat_cb(const struct mds_cat_dirent *entry,
 
 	dst = &f->rd->entries[f->rd->count];
 	dst->fileid = entry->fileid;
+	/* The wire cookie is the backend's, never derived from fileid
+	 * (mds_catalogue.h, struct mds_cat_dirent). */
+	dst->cookie = entry->cookie;
 	dst->type = entry->type;
 	memcpy(dst->name, entry->name, sizeof(dst->name));
 
@@ -3257,13 +3260,16 @@ enum nfs4_status op_readdir(struct compound_data *cd,
 				? READDIR_ATTR_EST_FULL
 				: READDIR_ATTR_EST_MIN;
 
-		/* O(1)-per-page resume: the READDIR cookie IS the last child
-		 * fileid seen (0 = first page).  Entries return in ascending
-		 * fileid order; the client re-sorts for display (RFC 8881
-		 * §3.2 — cookies are server-opaque).  A deleted cookie is
-		 * safe because resume is a strict child_fileid > cookie range.
-		 * Pass ceiling + 1 so the fill callback -- not the backend --
-		 * is the page boundary, which keeps eof exact. */
+		/* O(1)-per-page resume: the READDIR cookie is the backend-
+		 * assigned cookie of the last entry the client received
+		 * (0 = first page); every entry carries its own cookie in
+		 * struct mds_cat_dirent and the encoder emits it unchanged.
+		 * Entries return in the backend's cookie order; the client
+		 * re-sorts for display (RFC 8881 §3.2 — cookies are
+		 * server-opaque).  A deleted cookie is safe because resume is
+		 * a strict cookie > last range.  Pass ceiling + 1 so the fill
+		 * callback -- not the backend -- is the page boundary, which
+		 * keeps eof exact. */
 		st = cat_readdir_plus_from_cookie(cd, cd->current_fh.fileid,
 						  op->arg.readdir.cookie,
 						  NFS4_READDIR_MAX + 1u,
@@ -3273,7 +3279,7 @@ enum nfs4_status op_readdir(struct compound_data *cd,
 			return mds_status_to_nfs4(st);
 }
 
-		res->res.readdir.cookie_base = 0; /* Cookies are fileids now */
+		res->res.readdir.cookie_base = 0; /* Backend cookies, no offset */
 		/* eof is true only when the scan actually drained -- not when
 		 * we stopped on the entry ceiling or the byte budget. */
 		res->res.readdir.eof = !fill.truncated;

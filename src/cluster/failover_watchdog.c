@@ -2,16 +2,16 @@
  * Copyright (c) 2026 PeakAIO
  * SPDX-License-Identifier: MIT
  *
- * failover_rondb.c -- RonDB-native partner-liveness watchdog.
+ * failover_watchdog.c -- Partner-liveness watchdog.
  *
  * Replaces the removed LMDB-delta-shipping health signal that used
- * to tell the standby when its partner died.  RonDB already has a
- * per-MDS heartbeat thread (see catalogue_rondb_mds_heartbeat +
- * rondb_hb_fn in main.c) that updates mds_node_registry.last_heartbeat_ns
- * every 5 seconds.  The watchdog here is the reader side: on the
- * standby, a background thread periodically scans the registry for
- * stale rows and fires failover_promote when the partner has missed
- * ceil(stale_timeout_ms / heartbeat_interval_ms) intervals.
+ * to tell the standby when its partner died.  Every MDS runs a
+ * heartbeat thread (cluster_hb_fn in main.c, over
+ * mds_cluster_node_heartbeat) that refreshes its node-registry row's
+ * last_heartbeat_ns every 5 seconds.  The watchdog here is the reader
+ * side: on the standby, a background thread periodically scans the
+ * registry for stale rows and fires failover_promote when the partner
+ * has missed ceil(stale_timeout_ms / heartbeat_interval_ms) intervals.
  *
  * Design
  *
@@ -24,9 +24,12 @@
  *   - After a successful promotion, the thread self-exits -- there is
  *     nothing left to watch (a promoted node is the primary and has
  *     no partner).
- *   - Uses the existing catalogue_rondb_mds_scan_stale(threshold_ns)
- *     shim which returns rows where last_heartbeat_ns < threshold.
- *     No new RonDB wire calls required.
+ *   - Uses the backend-neutral mds_cluster_node_scan_stale(threshold_ns)
+ *     dispatcher (mds_cluster.h), which reports rows where
+ *     last_heartbeat_ns < threshold.  A backend without that cluster
+ *     slot cannot host the watchdog: failover_watchdog_start refuses
+ *     with MDS_ERR_NOSUPPORT instead of starting a thread that would
+ *     never observe anything.
  *
  * Safety
  *
@@ -41,9 +44,12 @@
  *     we refuse to promote even if the partner's row is missing or
  *     stale.  Covers the case where the standby came up before the
  *     primary finished initial heartbeat insertion.
+ *   - Clock domain: the threshold is derived from this host's
+ *     CLOCK_REALTIME.  The heartbeat writer's clock domain is the
+ *     backend's business (mds_cluster.h documents the target contract
+ *     and the current RonDB deviation); this file is deliberately
+ *     left unchanged in that respect.
  */
-
-#ifdef HAVE_RONDB
 
 #include <errno.h>
 #include <pthread.h>
@@ -57,8 +63,8 @@
 
 #include "pnfs_mds.h"
 #include "failover.h"
-#include "failover_rondb.h"
-#include "catalogue_rondb.h"
+#include "failover_watchdog.h"
+#include "mds_cluster.h"
 
 /* -----------------------------------------------------------------------
  * Tunables (compile-time defaults; can be overridden via the cfg struct)
@@ -167,8 +173,8 @@ static void *watchdog_fn(void *arg)
 		memset(&sctx, 0, sizeof(sctx));
 		sctx.partner_id = wd->partner_id;
 
-		st = catalogue_rondb_mds_scan_stale(wd->cat, threshold_ns,
-						    watchdog_scan_cb, &sctx);
+		st = mds_cluster_node_scan_stale(wd->cat, threshold_ns,
+						 watchdog_scan_cb, &sctx);
 		if (st != MDS_OK) {
 			/* Transient scan failure: skip this tick. */
 			continue;
@@ -179,7 +185,7 @@ static void *watchdog_fn(void *arg)
 		}
 
 		MDS_LOG_INFO(LOG_COMP_CLUSTER,
-			"failover_rondb: partner %u heartbeat stale > %u ms, "
+			"failover_watchdog: partner %u heartbeat stale > %u ms, "
 			"attempting promotion",
 			(unsigned)wd->partner_id,
 			(unsigned)wd->stale_timeout_ms);
@@ -187,13 +193,13 @@ static void *watchdog_fn(void *arg)
 		st = failover_promote(wd->fo);
 		if (st == MDS_OK) {
 			MDS_LOG_INFO(LOG_COMP_CLUSTER,
-				"failover_rondb: promotion succeeded; "
+				"failover_watchdog: promotion succeeded; "
 				"watchdog exiting");
 			break;
 		}
 
 		MDS_LOG_INFO(LOG_COMP_CLUSTER,
-			"failover_rondb: promotion refused (st=%d); "
+			"failover_watchdog: promotion refused (st=%d); "
 			"will retry next tick",
 			(int)st);
 		/* Loop and re-poll.  The precheck guards in
@@ -213,8 +219,16 @@ enum mds_status failover_watchdog_start(const struct failover_watchdog_cfg *cfg,
 	if (cfg == NULL || out == NULL) {
 		return MDS_ERR_INVAL;
 	}
+	*out = NULL;
 	if (cfg->fo == NULL || cfg->cat == NULL || cfg->partner_id == 0) {
 		return MDS_ERR_INVAL;
+	}
+	/* The only catalogue dependency is the stale-node scan.  Without
+	 * it every tick would be a NOSUPPORT skip and the standby would
+	 * silently never promote, so refuse up front (C5: no fallback
+	 * that weakens what the caller believes is armed). */
+	if (!mds_cluster_stale_scan_supported(cfg->cat)) {
+		return MDS_ERR_NOSUPPORT;
 	}
 
 	wd = calloc(1, sizeof(*wd));
@@ -259,30 +273,3 @@ void failover_watchdog_stop(struct failover_watchdog *wd)
 	}
 	free(wd);
 }
-
-#else /* !HAVE_RONDB */
-
-/* ISO C forbids an empty TU; keep this anchor for ENABLE_RONDB=OFF
- * builds.  Callers never reach these stubs at runtime because main.c
- * guards the watchdog wire-up with #ifdef HAVE_RONDB. */
-#include <stddef.h>
-#include "pnfs_mds.h"
-#include "failover_rondb.h"
-
-enum mds_status failover_watchdog_start(
-	const struct failover_watchdog_cfg *cfg,
-	struct failover_watchdog **out)
-{
-	(void)cfg;
-	if (out != NULL) {
-		*out = NULL;
-	}
-	return MDS_ERR_NOSUPPORT;
-}
-
-void failover_watchdog_stop(struct failover_watchdog *wd)
-{
-	(void)wd;
-}
-
-#endif /* HAVE_RONDB */

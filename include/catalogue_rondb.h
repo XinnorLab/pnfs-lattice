@@ -901,35 +901,17 @@ int catalogue_rondb_poller_start(struct mds_catalogue *cat,
 void catalogue_rondb_poller_stop(struct mds_catalogue *cat);
 
 /* -----------------------------------------------------------------------
- * Phase 9A -- Node registry C wrappers
+ * Phase 9A -- Node registry
+ *
+ * The catalogue-level register / heartbeat / deregister / list /
+ * scan_stale operations are struct mds_cluster_ops slots registered by
+ * catalogue_rondb.c and reached only through the mds_cluster_*
+ * dispatchers (mds_cluster.h); they have no direct C entry point here
+ * so callers cannot bypass the backend-neutral interface.  The shim
+ * callback typedefs (rondb_stale_node_cb, rondb_partition_map_cb,
+ * rondb_mds_list_cb) stay: the slots forward the backend-neutral
+ * mds_cluster_* callbacks, which have identical shapes, to the shim.
  * ----------------------------------------------------------------------- */
-
-/** Register this MDS in the node registry. */
-enum mds_status catalogue_rondb_mds_register(struct mds_catalogue *cat,
-                                             uint32_t mds_id,
-                                             uint64_t boot_epoch,
-                                             const char *hostname,
-                                             uint16_t nfs_port,
-                                             uint16_t grpc_port);
-
-/** Update heartbeat timestamp. */
-enum mds_status catalogue_rondb_mds_heartbeat(struct mds_catalogue *cat,
-                                              uint32_t mds_id,
-                                              uint64_t boot_epoch);
-
-/** Deregister from node registry. */
-enum mds_status catalogue_rondb_mds_deregister(struct mds_catalogue *cat,
-                                               uint32_t mds_id);
-
-/**
- * Scan mds_node_registry for nodes whose last_heartbeat_ns is
- * older than @a threshold_ns.  Callback receives
- * (mds_id, boot_epoch, last_heartbeat_ns).
- */
-enum mds_status catalogue_rondb_mds_scan_stale(
-    struct mds_catalogue *cat,
-    uint64_t threshold_ns,
-    rondb_stale_node_cb cb, void *ctx);
 
 /* -----------------------------------------------------------------------
  * Partition map shim (subtree ownership in mds_partition_map)
@@ -961,12 +943,10 @@ int rondb_shim_partition_map_cas(void *handle, uint32_t partition_id,
                                 uint32_t expected_owner,
                                 uint32_t new_owner, uint8_t new_state);
 
-/** C wrappers for partition_map. */
-enum mds_status catalogue_rondb_partition_map_list(
-    struct mds_catalogue *cat, rondb_partition_map_cb cb, void *ctx);
-enum mds_status catalogue_rondb_partition_map_put(
-    struct mds_catalogue *cat, uint32_t partition_id,
-    uint32_t owner_mds_id, uint8_t state, const char *subtree_path);
+/** C wrapper for the partition_map CAS.  list / put are cluster slots
+ *  (mds_cluster_partition_list / mds_cluster_partition_put); the CAS has
+ *  no vtable slot yet because nothing outside the RonDB wrapper calls
+ *  it -- it is added when a consumer exists. */
 enum mds_status catalogue_rondb_partition_map_cas(
     struct mds_catalogue *cat, uint32_t partition_id,
     uint32_t expected_owner, uint32_t new_owner, uint8_t new_state);
@@ -984,67 +964,22 @@ typedef int (*rondb_mds_list_cb)(uint32_t mds_id, uint64_t boot_epoch,
 /** Scan all node_registry rows. */
 int rondb_shim_mds_list(void *handle, rondb_mds_list_cb cb, void *ctx);
 
-/** C wrapper. */
-enum mds_status catalogue_rondb_mds_list(
-    struct mds_catalogue *cat, rondb_mds_list_cb cb, void *ctx);
-
 /* -----------------------------------------------------------------------
  * Phase 2/3 fused operation C wrappers
  *
  * These combine multiple NDB operations into fewer round-trips.
+ *
+ * The fused LAYOUTGET (stripe_get + layout_grant) and fused CREATE +
+ * layout pre-grant are vtable slots (coordination layoutget_fused,
+ * authority ns_create_with_layout) reached through
+ * mds_coord_layoutget_fused() / mds_cat_ns_create_with_layout(); they
+ * have no direct C entry point here so callers cannot bypass the
+ * backend-neutral interface.
  * ----------------------------------------------------------------------- */
 
 struct mds_ds_map_entry;
 struct nfs4_stateid;
 struct ds_prealloc_ctx;
-
-/** Phase 2: Fused stripe_get + layout_grant in one NDB transaction.
- *  Reads stripe map header+entries, then writes layout_state + indexes.
- *  Returns MDS_OK, MDS_ERR_NOTFOUND (no stripe map), or MDS_ERR_IO. */
-enum mds_status catalogue_rondb_layoutget_fused(
-    struct mds_catalogue *cat, uint64_t fileid,
-    uint32_t *stripe_count, uint32_t *stripe_unit,
-    uint32_t *mirror_count, struct mds_ds_map_entry **entries,
-    const struct nfs4_stateid *stateid,
-    uint64_t clientid, uint32_t iomode, uint64_t offset,
-    uint64_t length, uint32_t mds_id);
-
-/** Phase 3: ns_create with optional layout pre-grant.
- *  When layout_clientid != 0, piggybacks layout_state + indexes into the
- *  same NDB transaction.  Sets *layout_ok to true if grant succeeded.
- *
- *  When `layout_entry_out` is non-NULL and a prealloc entry was popped
- *  (DS placement happened), the popped entry is mirrored into
- *  *layout_entry_out so the caller can stash DS_id + nfs_fh in its
- *  per-compound stripe cache and let the immediately-following
- *  LAYOUTGET skip the now-redundant stripe_map_get NDB read.  When the
- *  pop produced no FH (proxy unavailable / pre-Phase-12 path) the
- *  out's nfs_fh_len stays 0; the caller treats that as "no cache,
- *  fall back to NDB" and the legacy DS_PENDING flow takes over.
- *  Pass NULL for layout_entry_out to opt out (older callers).
- *
- *  `layout_pop_stripe_unit_out` (optional) reports the pop-once
- *  placement decision: 0 when no prealloc entry was popped; else the
- *  popped entry's stripe unit exactly as persisted in the fused
- *  stripe-map header.  Callers use it both as the "a pop happened"
- *  indicator and as the authoritative stripe unit for their
- *  per-compound stripe cache -- never a separately-peeked value,
- *  which can diverge from the pop under concurrent CREATEs.
- */
-enum mds_status catalogue_rondb_ns_create_with_layout(
-    struct mds_catalogue *cat,
-    uint64_t parent_fileid, const char *name,
-    enum mds_file_type type,
-    uint32_t mode, uint64_t uid, uint64_t gid,
-    struct ds_prealloc_ctx *prealloc,
-    struct mds_inode *out,
-    uint64_t layout_clientid, uint32_t layout_iomode,
-    uint64_t layout_offset, uint64_t layout_length,
-    const struct nfs4_stateid *layout_stateid,
-    uint32_t layout_mds_id,
-    bool *layout_ok,
-    struct mds_ds_map_entry *layout_entry_out,
-    uint32_t *layout_pop_stripe_unit_out);
 
 /** Fused final-unlink: ns_remove_known semantics PLUS the caller's
  *  unique-DS mds_gc_queue rows committed in the same NDB transaction.

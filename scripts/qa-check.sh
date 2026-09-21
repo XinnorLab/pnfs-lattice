@@ -328,9 +328,9 @@ if should_run "valgrind"; then
         VALGRIND_LOG_DIR="${BUILD_DIR_GCC}/valgrind-logs"
         mkdir -p "${VALGRIND_LOG_DIR}"
 
-        # Suppress known leaks inside the in-memory test backend
-        # (tests/catalogue_memdb.c); production source is not covered
-        # by this file.
+        # Suppress known leaks of memdb handles abandoned by test
+        # fixtures (src/catalogue/catalogue_memdb.c constructors); no
+        # other production source is covered by this file.
         VALGRIND_SUPP_ARGS=()
         if [[ -f "${PROJECT_DIR}/tests/memdb.supp" ]]; then
             VALGRIND_SUPP_ARGS+=("--suppressions=${PROJECT_DIR}/tests/memdb.supp")

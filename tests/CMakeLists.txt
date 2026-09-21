@@ -3,14 +3,6 @@
 
 enable_testing()
 
-# In-memory catalogue backend for unit tests (no external dependencies).
-add_library(test_memdb STATIC catalogue_memdb.c)
-target_include_directories(test_memdb PRIVATE
-    ${PROJECT_SOURCE_DIR}/include
-    ${PROJECT_SOURCE_DIR}/src/catalogue
-)
-target_link_libraries(test_memdb PRIVATE pthread)
-
 # --- Unit tests ---
 
 add_executable(test_layout       unit/test_layout.c)
@@ -177,7 +169,6 @@ foreach(test_target
         ${PROJECT_SOURCE_DIR}/tests
     )
     target_link_libraries(${test_target} PRIVATE
-        test_memdb
         pnfs_mds_core
         pnfs_cluster
         pnfs_fsal_obj
@@ -211,12 +202,16 @@ target_include_directories(test_xdr_layout_form PRIVATE
     ${PROJECT_SOURCE_DIR}/src/catalogue
     ${PROJECT_SOURCE_DIR}/tests
 )
+# pnfs_cluster (subtree_map.c, cluster_membership.c) calls back into
+# the RonDB C wrappers that live in pnfs_mds_core, so the core archive
+# must be scanned again after pnfs_cluster -- same ordering the main
+# unit-test loop above uses.
 target_link_libraries(test_xdr_layout_form PRIVATE
-    test_memdb
     pnfs_mds_core
     pnfs_cluster
     pnfs_fsal_obj
     pnfs_common
+    pnfs_mds_core
     rondb_schema
     ${NTIRPC_LIB}
     pthread
@@ -226,7 +221,6 @@ set_tests_properties(test_xdr_layout_form PROPERTIES LABELS "unit")
 
 # XDR codec test needs ntirpc (provided transitively by pnfs_mds_core)
 target_link_libraries(test_xdr_codec PRIVATE
-    test_memdb
     pnfs_mds_core
     pnfs_cluster
     pnfs_fsal_obj
@@ -242,7 +236,6 @@ add_test(NAME test_xdr_codec COMMAND test_xdr_codec)
 set_tests_properties(test_xdr_codec PROPERTIES LABELS "unit")
 # GSS test needs ntirpc + gssapi
 target_link_libraries(test_mds_gss PRIVATE
-    test_memdb
     pnfs_mds_core
     pnfs_cluster
     pnfs_fsal_obj
@@ -258,7 +251,6 @@ target_link_libraries(test_mds_gss PRIVATE
 
 # nfs4_cb test needs ntirpc (CB_COMPOUND encoding uses XDR)
 target_link_libraries(test_nfs4_cb PRIVATE
-    test_memdb
     pnfs_mds_core
     pnfs_cluster
     pnfs_fsal_obj
@@ -281,7 +273,6 @@ target_include_directories(test_proxy_io PRIVATE
     ${PROJECT_SOURCE_DIR}/tests
 )
 target_link_libraries(test_proxy_io PRIVATE
-    test_memdb
     pnfs_mds_core
     pnfs_cluster
     pnfs_fsal_obj
@@ -307,7 +298,6 @@ target_include_directories(test_rpc_server PRIVATE
     ${PROJECT_SOURCE_DIR}/tests
 )
 target_link_libraries(test_rpc_server PRIVATE
-    test_memdb
     pnfs_mds_core
     pnfs_cluster
     pnfs_fsal_obj
@@ -348,7 +338,6 @@ foreach(test_target test_cluster test_failover test_client_lifecycle
         ${PROJECT_SOURCE_DIR}/tests
     )
     target_link_libraries(${test_target} PRIVATE
-        test_memdb
         pnfs_mds_core
         pnfs_cluster
         pnfs_fsal_obj
@@ -364,7 +353,6 @@ foreach(test_target test_cluster test_failover test_client_lifecycle
 endforeach()
 # set_tests_properties(test_failover PROPERTIES TIMEOUT 120)
 target_link_libraries(test_layout_recall PRIVATE
-    test_memdb
     pnfs_mds_core
     pnfs_cluster
     pnfs_fsal_obj
@@ -410,3 +398,92 @@ target_include_directories(test_lease_table PRIVATE
 target_link_libraries(test_lease_table PRIVATE pthread)
 add_test(NAME test_lease_table COMMAND test_lease_table)
 set_tests_properties(test_lease_table PROPERTIES LABELS "unit")
+
+# -------------------------------------------------------------------
+# cluster track (begin) -- backend-neutral cluster services extraction.
+#
+# test_cluster_extract drives subtree_map / cluster_membership /
+# failover_watchdog / the image-feed dispatchers through fabricated
+# struct mds_cluster_ops and exercises the backend registration table
+# and the config parser's use of it.  It needs no backend beyond the
+# memdb built into pnfs_mds_core.
+# -------------------------------------------------------------------
+add_executable(test_cluster_extract unit/test_cluster_extract.c)
+target_include_directories(test_cluster_extract PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src/catalogue
+    ${PROJECT_SOURCE_DIR}/tests
+)
+target_link_libraries(test_cluster_extract PRIVATE
+    pnfs_mds_core
+    pnfs_cluster
+    pnfs_fsal_obj
+    pnfs_common
+    pnfs_mds_core
+    pnfs_cluster
+    pnfs_mds_core
+    rondb_schema
+    pthread
+)
+add_test(NAME test_cluster_extract COMMAND test_cluster_extract)
+set_tests_properties(test_cluster_extract PROPERTIES LABELS "unit")
+# cluster track (end)
+
+# -------------------------------------------------------------------
+# memdb track -- in-memory backend contract tests (concurrency,
+# re-entrancy, isolation, capacity atomicity, cookies, layout union,
+# lock_test, cluster contract).  Appended block; the backend itself is
+# part of pnfs_mds_core.
+# -------------------------------------------------------------------
+
+add_executable(test_memdb_backend unit/test_memdb_backend.c)
+target_include_directories(test_memdb_backend PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src/catalogue
+    ${PROJECT_SOURCE_DIR}/tests
+)
+target_link_libraries(test_memdb_backend PRIVATE
+    pnfs_mds_core
+    pnfs_cluster
+    pnfs_fsal_obj
+    pnfs_common
+    pnfs_mds_core
+    pnfs_cluster
+    pnfs_mds_core
+    rondb_schema
+    pthread
+)
+add_test(NAME test_memdb_backend COMMAND test_memdb_backend)
+set_tests_properties(test_memdb_backend PROPERTIES LABELS "unit")
+# End of memdb track block.
+
+# -------------------------------------------------------------------
+# harness track (Phase 6a/6b) -- backend-parameterised conformance
+# suite and the catalogue tests that open their backend through it.
+#
+# The four catalogue unit tests select the backend from
+# CATALOGUE_TEST_BACKEND (default memdb) via conformance_open(); an
+# unavailable backend exits 77, which ctest maps to "Not Run".
+# -------------------------------------------------------------------
+add_subdirectory(catalogue_conformance)
+
+foreach(harness_test test_catalogue test_rename_2pc test_open_state
+                     test_layout_recall)
+    target_sources(${harness_test} PRIVATE
+        $<TARGET_OBJECTS:conformance_harness>)
+    target_include_directories(${harness_test} PRIVATE
+        ${PROJECT_SOURCE_DIR}/tests/catalogue_conformance)
+    set_tests_properties(${harness_test} PROPERTIES SKIP_RETURN_CODE 77)
+endforeach()
+
+# Unprivileged daemon smoke: starts pnfs-mds on catalogue_backend=memdb
+# on a high port and probes it.  Exits 77 (skipped) when the daemon
+# refuses the memdb backend or no probe client is available.
+add_test(NAME daemon_smoke
+    COMMAND ${PROJECT_SOURCE_DIR}/tests/integration/daemon_smoke.sh
+            ${CMAKE_BINARY_DIR})
+set_tests_properties(daemon_smoke PROPERTIES
+    LABELS "integration"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 180)
+# --- end harness track ---

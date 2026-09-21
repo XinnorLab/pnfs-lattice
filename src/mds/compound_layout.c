@@ -27,7 +27,6 @@
 #include "ds_health.h"
 #include "commit_queue.h"
 #include "io_tracker.h"
-#include "catalogue_rondb.h"
 #include "mds_metrics.h"
 #include "layout_ds_ids.h"
 #include "layout_cache.h"  /* Phase D of docs/hpc-nto1-plan.md */
@@ -37,7 +36,7 @@
 #include "lease_table.h"
 #include "lease_stripe_map.h"    /* stripe lease table (Phase 2) */
 #include "synth_uid.h"           /* RFC 8435 §2.2.1 synthetic UID derivation */
-#include "mds_op_metrics.h" /* CAT_TIMED-equivalent for direct fused call */
+#include "mds_op_metrics.h" /* MDS_TIME_CAT_OP probes on the LAYOUTGET path */
 
 
 /* -----------------------------------------------------------------------
@@ -760,8 +759,8 @@ static void layout_pick_stateid(struct compound_data *cd,
  * the newest window and the byte-range recall scanner -- which skips
  * holders whose row is disjoint from a recalled range -- would lose
  * coverage of earlier windows the client still holds (under-recall).
- * Backends without a union slot fall back to the overwrite inside the
- * dispatch wrapper, which is exactly the pre-change behaviour.
+ * A backend without a union slot gets MDS_ERR_NOSUPPORT from the
+ * dispatch wrapper (C5); there is no overwrite fallback.
  */
 static void layout_persist_grant(struct compound_data *cd,
 				 bool is_renewal,
@@ -1787,44 +1786,27 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 			}
 		}
 
-		/* Phase 2: Use fused stripe_get + layout_grant when
-		 * RonDB backend is active.  Saves 1 NDB round-trip.
-		 * Renewals are excluded: the fused write is a blind
-		 * overwrite of the layout_state row, which would narrow
-		 * the persisted range; they take the read + union path
-		 * below instead (same round-trip count). */
-#ifdef HAVE_RONDB
-		if (cd->cat != NULL &&
-		    mds_catalogue_backend_type(cd->cat) == MDS_BACKEND_RONDB &&
+		/* Phase 2: Use the fused stripe_get + layout_grant slot
+		 * when the backend implements it (RonDB: one NDB
+		 * transaction, saves 1 round-trip).  Renewals are
+		 * excluded: the fused write is a blind overwrite of the
+		 * layout_state row, which would narrow the persisted
+		 * range; they take the read + union path below instead
+		 * (same round-trip count). */
+		if (mds_coord_layoutget_fused_supported(cd->cat) &&
 		    !cd->skip_transient_ndb && !is_renewal) {
 			struct nfs4_stateid fused_sid;
 			layout_pick_stateid(cd, &client_sid, &fused_sid);
 
-		/* Direct-from-compound call: not in the catalogue vtable
-		 * (CAT_TIMED only wraps vtable dispatch), so we time it
-		 * inline.  Skipped cleanly when observability is off. */
-		{
-			bool _t = mds_op_metrics_enabled();
-			uint64_t _t0 = 0;
-
-			if (_t) {
-				_t0 = mds_op_metrics_now_ns();
-				mds_phase_enter(MDS_PHASE_CATALOGUE);
-			}
-			st = catalogue_rondb_layoutget_fused(
+			/* Dispatcher wraps the call in CAT_TIMED
+			 * (MDS_CATOP_LAYOUTGET_FUSED, CATALOGUE phase). */
+			st = mds_coord_layoutget_fused(
 				cd->cat, cd->current_fh.fileid,
 				&stripe_count, &stripe_unit,
 				&mirror_count, &entries,
 				&fused_sid, cd->clientid,
 				grant_iomode, grant_offset, grant_length,
 				cd->mds_id);
-			if (_t) {
-				mds_phase_leave();
-				mds_cat_op_observe(
-					MDS_CATOP_LAYOUTGET_FUSED,
-					mds_op_metrics_now_ns() - _t0);
-			}
-		}
 
 		if (st == MDS_OK) {
 			/* Layout grant already persisted in the fused txn. */
@@ -1859,9 +1841,11 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 			goto fill_layoutget_result;
 		}
 		/* Fused path failed.  Fall back to non-fused
-		 * (separate txns) for any transient or non-fatal error. */
+		 * (separate txns) for any transient or non-fatal error;
+		 * NOSUPPORT cannot happen after the capability check
+		 * above but is treated the same way for robustness. */
 		if (st == MDS_ERR_DELAY || st == MDS_ERR_IO ||
-		    st == MDS_ERR_INVAL) {
+		    st == MDS_ERR_INVAL || st == MDS_ERR_NOSUPPORT) {
 			st = cat_stripe_map_get(
 				cd, cd->current_fh.fileid,
 				&stripe_count, &stripe_unit,
@@ -1871,9 +1855,7 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 			/* NOTFOUND: fall through to placement. */
 			return mds_status_to_nfs4(st);
 		}
-		} else
-#endif /* HAVE_RONDB */
-		{
+		} else {
 			st = cat_stripe_map_get(cd, cd->current_fh.fileid,
 						     &stripe_count, &stripe_unit,
 						     &mirror_count, &entries);

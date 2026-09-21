@@ -16,18 +16,18 @@
 #include <time.h>
 #include "pnfs_mds.h"
 #include "mds_catalogue.h"
+#include "catalogue_memdb.h"
 
 /**
- * Open a test catalogue backed by the in-memory memdb backend.
+ * Open a test catalogue backed by the in-memory memdb backend
+ * (src/catalogue/catalogue_memdb.c, part of pnfs_mds_core).
  *
- * Always succeeds -- no external dependencies required.
- * Each call returns a fresh, independent catalogue with a
- * pre-seeded root inode (fileid 2).
+ * No external dependencies required.  Each call returns a fresh,
+ * independent catalogue with a pre-seeded root inode (fileid 2);
+ * NULL only when memory is exhausted.
  *
- * @return Catalogue handle (never NULL).
+ * @return Catalogue handle, or NULL on allocation failure.
  */
-extern struct mds_catalogue *catalogue_memdb_open(void);
-
 static inline struct mds_catalogue *open_test_catalogue(void)
 {
 	return catalogue_memdb_open();

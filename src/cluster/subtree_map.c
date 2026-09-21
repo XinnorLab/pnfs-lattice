@@ -9,10 +9,14 @@
  *     helpers that take the write lock internally and mutate the
  *     local cache.  Called by watch handlers and init.
  *   - Backend vtable set_owner/set_state/add_entry/remove_entry
- *     do RonDB I/O OUTSIDE the rwlock, then wait for the watch
+ *     do catalogue I/O OUTSIDE the rwlock, then wait for the watch
  *     handler to apply the change locally.
  *   - Local backend vtable functions are called with write lock
  *     held (unchanged).
+ *   - The catalogue-backed init / refresh / seed paths reach the
+ *     partition map only through the backend-neutral
+ *     mds_cluster_partition_* dispatchers (mds_cluster.h) and never
+ *     hold the rwlock across one of those calls.
  *
  * Thread safety: all public API calls acquire the internal rwlock.
  */
@@ -29,6 +33,7 @@
 #include "pnfs_mds.h"
 #include "subtree_map.h"
 #include "cluster_membership.h"
+#include "mds_cluster.h"
 
 /* -----------------------------------------------------------------------
  * Tunables
@@ -79,7 +84,6 @@ struct subtree_map {
     uint32_t              frozen_cap;
 
     const struct subtree_backend *backend;
-    enum cluster_mode     mode;
     char                  key_prefix[256];    /**< key namespace (legacy, unused). */
     char                  subtrees_prefix[280]; /**< "{prefix}/subtrees" */
     char                  subtrees_scan[284];   /**< "{prefix}/subtrees/" (for prefix scans) */
@@ -454,7 +458,6 @@ enum mds_status subtree_map_init(const char *etcd_endpoints,
 
     /* --- Local path --- */
     m->backend = &local_subtree_backend;
-    m->mode = CLUSTER_MODE_LOCAL;
 
     /* Seed root entry: "/" owned by self. */
     (void)snprintf(m->entries[0].path, sizeof(m->entries[0].path), "/");
@@ -479,14 +482,8 @@ enum mds_status subtree_map_init(const char *etcd_endpoints,
 }
 
 /* -----------------------------------------------------------------------
- * RonDB backend
+ * Catalogue-backed partition map (mds_cluster_partition_list / _put)
  * ----------------------------------------------------------------------- */
-
-#ifdef HAVE_RONDB
-#include "catalogue_rondb.h"
-/* RONDB_PM_STATE_ACTIVE from rondb_schema.h -- inlined to avoid
- * adding src/catalogue to the cluster include path. */
-#define PM_STATE_ACTIVE 0
 
 struct pm_load_ctx {
     struct subtree_map *map;
@@ -509,10 +506,10 @@ static int pm_load_cb(uint32_t partition_id, uint32_t owner_mds_id,
     return 0;
 }
 
-enum mds_status subtree_map_init_rondb(struct mds_catalogue *cat,
-                                      uint32_t self_id,
-                                      const char *self_hostname,
-                                      struct subtree_map **out)
+enum mds_status subtree_map_init_from_catalogue(struct mds_catalogue *cat,
+                                                uint32_t self_id,
+                                                const char *self_hostname,
+                                                struct subtree_map **out)
 {
     struct subtree_map *m;
     struct pm_load_ctx lc;
@@ -543,11 +540,17 @@ enum mds_status subtree_map_init_rondb(struct mds_catalogue *cat,
     pthread_mutex_init(&m->rev_mutex, NULL);
     pthread_cond_init(&m->rev_cond, NULL);
 
-    /* Load subtree entries from RonDB partition_map. */
+    /* Load subtree entries from the catalogue's partition map. */
     lc.map = m;
     lc.loaded = 0;
-    st = catalogue_rondb_partition_map_list(cat, pm_load_cb, &lc);
+    st = mds_cluster_partition_list(cat, pm_load_cb, &lc);
     if (st != MDS_OK) {
+        /* Carried over unchanged from the RonDB-specific init: a
+         * failed list is treated as an empty map and root is claimed
+         * below with an upsert.  A transient error at boot can
+         * therefore rewrite the real root owner; the target contract
+         * (mds_cluster.h: fatal list failure, insert-only root claim)
+         * replaces this in its own reviewed change. */
         MDS_LOG_WARN(LOG_COMP_CLUSTER,
             "partition_map load failed (%d), "
             "seeding root entry", (int)st);
@@ -562,30 +565,30 @@ enum mds_status subtree_map_init_rondb(struct mds_catalogue *cat,
         m->entries[m->count].state = SUBTREE_ACTIVE;
         m->count++;
 
-        /* Claim root in RonDB. */
-        (void)catalogue_rondb_partition_map_put(
-            cat, 0, self_id, PM_STATE_ACTIVE, "/");
+        /* Claim root in the partition map (upsert, see above). */
+        (void)mds_cluster_partition_put(
+            cat, 0, self_id, MDS_PARTITION_STATE_ACTIVE, "/", false);
     }
 
     /* Load node hostnames from node_registry. */
     /* (done separately via main.c heartbeat registration) */
 
     m->backend = &local_subtree_backend;
-    m->mode = CLUSTER_MODE_RONDB;
 
     if (self_hostname != NULL) {
         (void)register_node(m, self_id, self_hostname);
     }
 
     MDS_LOG_INFO(LOG_COMP_CLUSTER,
-        "subtree_map_init_rondb: loaded %u entries from "
+        "subtree_map_init_from_catalogue: loaded %u entries from "
         "partition_map", lc.loaded);
 
     *out = m;
     return MDS_OK;
 }
-enum mds_status subtree_map_refresh_rondb(struct subtree_map *map,
-                                          struct mds_catalogue *cat)
+
+enum mds_status subtree_map_refresh_from_catalogue(struct subtree_map *map,
+                                                   struct mds_catalogue *cat)
 {
     struct pm_load_ctx lc;
 
@@ -595,10 +598,10 @@ enum mds_status subtree_map_refresh_rondb(struct subtree_map *map,
 
     lc.map = map;
     lc.loaded = 0;
-    return catalogue_rondb_partition_map_list(cat, pm_load_cb, &lc);
+    return mds_cluster_partition_list(cat, pm_load_cb, &lc);
 }
 
-enum mds_status subtree_map_seed_shards_rondb(
+enum mds_status subtree_map_seed_shards(
 	struct subtree_map *map,
 	struct mds_catalogue *cat,
 	uint32_t cluster_size,
@@ -629,7 +632,7 @@ enum mds_status subtree_map_seed_shards_rondb(
 		/*
 		 * Membership is not wired yet, so owner_role_ok allows
 		 * any owner_id.  Add to the local cache first so this
-		 * boot can serve referrals even if RonDB put fails.
+		 * boot can serve referrals even if the catalogue put fails.
 		 */
 		ast = subtree_map_add(map, spath, mds_id, host,
 				      SUBTREE_ACTIVE, 1);
@@ -642,10 +645,13 @@ enum mds_status subtree_map_seed_shards_rondb(
 
 		/*
 		 * Persist with partition_id == mds_id (root uses 0).
-		 * writeTuple upsert — safe if every MDS races the seed.
+		 * Upsert (insert_only == false): the initial shard layout
+		 * is never-owned, so every MDS racing the seed writes the
+		 * same rows.
 		 */
-		pst = catalogue_rondb_partition_map_put(
-			cat, mds_id, mds_id, PM_STATE_ACTIVE, spath);
+		pst = mds_cluster_partition_put(
+			cat, mds_id, mds_id, MDS_PARTITION_STATE_ACTIVE, spath,
+			false);
 		if (pst != MDS_OK) {
 			MDS_LOG_WARN(LOG_COMP_CLUSTER,
 				"partition_map put %s (id=%u) failed: %d "
@@ -675,7 +681,6 @@ enum mds_status subtree_map_seed_shards_rondb(
 
 	return MDS_OK;
 }
-#endif /* HAVE_RONDB */
 
 /* -----------------------------------------------------------------------
  * Change callback setter
@@ -1025,10 +1030,11 @@ void subtree_map_destroy(struct subtree_map *map)
     if (map->backend != NULL) { map->backend->destroy(map);
 }
     pthread_rwlock_destroy(&map->lock);
-    if (map->mode == CLUSTER_MODE_LOCAL) {
-        pthread_mutex_destroy(&map->rev_mutex);
-        pthread_cond_destroy(&map->rev_cond);
-    }
+    /* Both init paths (subtree_map_init and
+     * subtree_map_init_from_catalogue) initialise rev_mutex/rev_cond,
+     * so the teardown is unconditional and symmetric. */
+    pthread_mutex_destroy(&map->rev_mutex);
+    pthread_cond_destroy(&map->rev_cond);
     free(map->frozen_fids);
     free(map->nodes);
     free(map->entries);

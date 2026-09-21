@@ -14,9 +14,13 @@
 #include <ctype.h>
 
 #include "pnfs_mds.h"
+#include "catalogue_backend_names.h"
 
 /* Maximum config file line length */
 #define CFG_LINE_MAX 512
+
+/* Buffer for the "(known: a, b, c)" suffix of backend diagnostics. */
+#define CFG_BACKEND_NAMES_MAX 128
 
 /* -----------------------------------------------------------------------
  * Workload tuning profiles
@@ -200,7 +204,18 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
     (void)snprintf(cfg->self.hostname, sizeof(cfg->self.hostname), "localhost");
     cfg->self.nfs_port = 2049;
     cfg->self.grpc_port = 50051;
+    /* catalogue_backend default: rondb whenever it is compiled in, so
+     * existing configs keep working.  Otherwise there is NO default --
+     * MDS_BACKEND_NONE is not constructible and mds_catalogue_open()
+     * refuses it with the list of available backends.  Never fall
+     * back to whatever backend happens to be built.  (HAVE_RONDB is
+     * the global build definition; this file must not depend on the
+     * catalogue core to learn what it was built with.) */
+#ifdef HAVE_RONDB
     cfg->catalogue_backend = MDS_BACKEND_RONDB;
+#else
+    cfg->catalogue_backend = MDS_BACKEND_NONE;
+#endif
     cfg->worker_threads = 16;
     cfg->rpc_listener_threads = 0;   /* 0 = auto: min(worker_threads, 4) */
     cfg->max_inflight_per_conn = 0;  /* 0 = RPC_DEFAULT_MAX_INFLIGHT (8) */
@@ -473,23 +488,27 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
         } else if (strcmp(key, "workload_profile") == 0) {
             /* Already handled in first pass. */
         } else if (strcmp(key, "catalogue_backend") == 0) {
-            if (strcmp(val, "rondb") == 0) {
-#ifdef HAVE_RONDB
-                cfg->catalogue_backend = MDS_BACKEND_RONDB;
-#else
-                (void)fprintf(stderr,
-                    "ERROR: catalogue_backend=rondb but "
-                    "binary built without ENABLE_RONDB\n");
-                (void)fclose(fp);
-                return MDS_ERR_INVAL;
-#endif
-            } else {
+            /* An unknown name is a parse error.  A KNOWN name is
+             * accepted here even when this binary was built without
+             * that backend: availability is a property of the
+             * catalogue core, which this library must not depend on,
+             * and mds_catalogue_open() refuses such a backend with
+             * "not compiled in; available: ..." before the daemon has
+             * any side effect. */
+            enum mds_catalogue_backend be = MDS_BACKEND_NONE;
+
+            if (mds_catalogue_backend_from_name(val, &be) != MDS_OK) {
+                char known[CFG_BACKEND_NAMES_MAX];
+
+                (void)mds_catalogue_backend_known_names(known,
+                                                        sizeof(known));
                 (void)fprintf(stderr,
                     "ERROR: unknown catalogue_backend '%s' "
-                    "(expected rondb)\n", val);
+                    "(known: %s)\n", val, known);
                 (void)fclose(fp);
                 return MDS_ERR_INVAL;
             }
+            cfg->catalogue_backend = be;
         } else if (strcmp(key, "catalogue_backend_conf") == 0) {
             (void)snprintf(cfg->catalogue_backend_conf,
                 sizeof(cfg->catalogue_backend_conf), "%s", val);

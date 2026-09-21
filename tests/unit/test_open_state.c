@@ -24,6 +24,7 @@
 
 #include "pnfs_mds.h"
 #include "test_helpers.h"
+#include "harness.h"        /* conformance_open_checked */
 #include "compound.h"
 #include "session.h"
 #include "open_state.h"
@@ -968,7 +969,7 @@ static void test_compound_open_create_close(void)
 	char *path;
 
 	path = make_temp_db_path();
-	db = open_test_catalogue(); VERIFY(db != NULL);
+	db = conformance_open_checked(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
 	/* SEQUENCE + PUTROOTFH + OPEN(create "doc.txt") + GETATTR + CLOSE */
@@ -1030,7 +1031,7 @@ static void test_compound_open_existing(void)
 	char *path;
 
 	path = make_temp_db_path();
-	db = open_test_catalogue(); VERIFY(db != NULL);
+	db = conformance_open_checked(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
 	/* First: create the file via CREATE. */
@@ -1086,7 +1087,7 @@ static void test_compound_open_noent(void)
 	char *path;
 
 	path = make_temp_db_path();
-	db = open_test_catalogue(); VERIFY(db != NULL);
+	db = conformance_open_checked(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
 	compound_init(&cd);
@@ -1120,7 +1121,7 @@ static void test_compound_open_guarded_exist(void)
 	char *path;
 
 	path = make_temp_db_path();
-	db = open_test_catalogue(); VERIFY(db != NULL);
+	db = conformance_open_checked(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
 	/* Create the file first. */
@@ -1201,7 +1202,7 @@ static void test_compound_share_conflict(void)
 	static const uint8_t owner_b[] = { 'B', 'B', 'B', 'B' };
 
 	path = make_temp_db_path();
-	db = open_test_catalogue(); VERIFY(db != NULL);
+	db = conformance_open_checked(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
 	/* First open: read, deny_write, owner A. */
@@ -1255,7 +1256,7 @@ static void test_compound_open_claim_fh(void)
 	char *path;
 
 	path = make_temp_db_path();
-	db = open_test_catalogue(); VERIFY(db != NULL);
+	db = conformance_open_checked(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
 	/* Create file via namespace. */
@@ -1312,7 +1313,7 @@ static void test_compound_close_bad_stateid(void)
 	char *path;
 
 	path = make_temp_db_path();
-	db = open_test_catalogue(); VERIFY(db != NULL);
+	db = conformance_open_checked(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
 	compound_init(&cd);
@@ -1346,7 +1347,7 @@ static void test_compound_reopen_after_close(void)
 	char *path;
 
 	path = make_temp_db_path();
-	db = open_test_catalogue(); VERIFY(db != NULL);
+	db = conformance_open_checked(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
 	/* Open with DENY_BOTH. */
@@ -1407,7 +1408,7 @@ static void test_compound_open_directory(void)
 	char *path;
 
 	path = make_temp_db_path();
-	db = open_test_catalogue(); VERIFY(db != NULL);
+	db = conformance_open_checked(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
 	/* Create a directory. */

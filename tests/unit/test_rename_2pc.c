@@ -20,6 +20,7 @@
 #include "pnfs_mds.h"
 #include "mds_catalogue.h"
 #include "test_helpers.h"
+#include "harness.h"        /* conformance_open_checked */
 #include "mds_coordination.h"
 #include "rename_2pc.h"
 #include "cluster_transport.h"
@@ -124,9 +125,13 @@ static int loopback_abort(uint32_t remote_mds_id, uint64_t txn_id,
  * Catalogue setup / teardown
  * ------------------------------------------------------------------- */
 
+/* Backend selected by CATALOGUE_TEST_BACKEND (memdb by default); an
+ * unavailable backend exits 77 before the first test.  Each test opens
+ * its own handle and the loopback transport shares that one handle, so
+ * coordinator and participant see ONE store. */
 static struct mds_catalogue *open_test_db(void)
 {
-    return open_test_catalogue();
+    return conformance_open_checked();
 }
 
 static uint64_t create_test_reg(struct mds_catalogue *db, const char *name)
@@ -147,14 +152,21 @@ static uint64_t create_test_dir(struct mds_catalogue *db, const char *name)
 }
 
 /* -------------------------------------------------------------------
- * Journal scan helper -- counts entries matching a txn_id
+ * Journal scan helper -- counts entries matching a txn_id and picks
+ * out the COORDINATOR's record explicitly.  The loopback transport
+ * makes coordinator and participant share one store, so a txn_id has
+ * two journal rows; a scan's delivery order is backend-specific
+ * (arbitrary on RonDB), so the assertion must never depend on which
+ * row arrives last.
  * ------------------------------------------------------------------- */
+
+#define JOURNAL_ROLE_COORDINATOR 0  /* R2PC_COORDINATOR (rename_2pc.c) */
 
 struct journal_scan_ctx {
     uint64_t target_txn_id;
-    uint32_t count;
-    uint8_t  found_state;
-    uint8_t  found_role;
+    uint32_t count;            /* rows with target_txn_id, any role */
+    bool     coord_found;      /* coordinator row seen */
+    uint8_t  coord_state;      /* its state, valid when coord_found */
 };
 
 static int journal_count_cb(const struct mds_coord_journal_record *rec,
@@ -163,9 +175,11 @@ static int journal_count_cb(const struct mds_coord_journal_record *rec,
     struct journal_scan_ctx *ctx = arg;
 
     if (rec->txn_id == ctx->target_txn_id) {
-        ctx->found_state = rec->state;
-        ctx->found_role = rec->role;
         ctx->count++;
+        if (rec->role == JOURNAL_ROLE_COORDINATOR) {
+            ctx->coord_found = true;
+            ctx->coord_state = rec->state;
+        }
     }
     return 0;
 }
@@ -421,15 +435,16 @@ static void test_2pc_commit_delivery_failure(void)
                             &child, &type);
     ASSERT_EQ(st, MDS_OK);
 
-    /* COMMITTED journal entry MUST still exist -- scan via coord API. */
+    /* The coordinator's COMMITTED journal entry MUST still exist --
+     * scan via coord API and select it by (txn_id, role). */
     struct journal_scan_ctx sc;
     memset(&sc, 0, sizeof(sc));
     sc.target_txn_id = lc.last_txn_id;
     st = mds_coord_journal_scan(cat, journal_count_cb, &sc);
     ASSERT_EQ(st, MDS_OK);
     ASSERT_TRUE(sc.count > 0);
-    ASSERT_EQ(sc.found_state, 2);  /* R2PC_COMMITTED */
-    ASSERT_EQ(sc.found_role, 0);   /* R2PC_COORDINATOR */
+    ASSERT_TRUE(sc.coord_found);
+    ASSERT_EQ(sc.coord_state, 2);  /* R2PC_COMMITTED */
 
     /* Recovery must keep it (returns MDS_ERR_DELAY). */
     st = rename_2pc_recover(cat, NULL, NULL);

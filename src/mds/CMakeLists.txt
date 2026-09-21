@@ -93,6 +93,23 @@ if(ENABLE_RONDB)
     endif()
 endif()
 
+# In-memory reference backend (non-durable, single-node, bounded
+# capacity).  Compiled into the core archive so the daemon can run on
+# `catalogue_backend = memdb` and the tests get it from pnfs_mds_core;
+# the same TU must never live in a second archive.  HAVE_MEMDB_BACKEND
+# is PUBLIC so the backend factory registers memdb only when it exists.
+# The test suites open their catalogues through this backend.
+if(ENABLE_MEMDB_BACKEND)
+    target_sources(pnfs_mds_core PRIVATE
+        ${PROJECT_SOURCE_DIR}/src/catalogue/catalogue_memdb.c
+    )
+    target_compile_definitions(pnfs_mds_core PUBLIC HAVE_MEMDB_BACKEND=1)
+elseif(ENABLE_TESTS)
+    message(FATAL_ERROR
+        "ENABLE_TESTS=ON requires ENABLE_MEMDB_BACKEND=ON: the unit and "
+        "integration tests open their catalogues through the in-memory backend")
+endif()
+
 target_include_directories(pnfs_mds_core
     PUBLIC ${PROJECT_SOURCE_DIR}/include
     PRIVATE ${PROJECT_SOURCE_DIR}/src/catalogue

@@ -42,6 +42,7 @@ option(ENABLE_EBPF       "Build eBPF replication monitoring programs" ON)
 option(ENABLE_ADMIN_CLI  "Build the mds-admin CLI tool"               ON)
 option(ENABLE_TESTS      "Build unit and integration tests"           ON)
 option(ENABLE_RONDB      "Build RonDB catalogue backend"              ON)
+option(ENABLE_MEMDB_BACKEND "Build the in-memory catalogue backend"   ON)
 # Compile-time kill-switch for per-op latency / phase / cat-op
 # histograms.  OFF removes every observation site from the binary
 # (defines MDS_OP_METRICS_DISABLE), leaving only the dispatcher

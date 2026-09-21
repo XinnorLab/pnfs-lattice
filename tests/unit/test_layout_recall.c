@@ -29,6 +29,7 @@
 #include "layout_recall.h"
 #include "mds_catalogue.h"
 #include "test_helpers.h"
+#include "harness.h"        /* conformance_open_checked */
 #include "mds_coordination.h"
 #include "commit_queue.h"
 #include "xdr_codec.h"
@@ -116,7 +117,7 @@ static void test_recall_lifecycle(void)
     struct layout_recall *lr = NULL;
     char *path = make_temp_db_path();
 
-    db = open_test_catalogue(); VERIFY(db != NULL);
+    db = conformance_open_checked(); VERIFY(db != NULL);
 	cat = db;
 
     ASSERT_EQ(layout_recall_init(cat, NULL, 0, &lr), 0);
@@ -142,7 +143,7 @@ static void test_recall_no_layouts(void)
     struct layout_recall *lr = NULL;
     char *path = make_temp_db_path();
 
-    db = open_test_catalogue(); VERIFY(db != NULL);
+    db = conformance_open_checked(); VERIFY(db != NULL);
 	cat = db;
     ASSERT_EQ(layout_recall_init(cat, NULL, 0, &lr), 0);
 
@@ -170,7 +171,7 @@ static void test_recall_revoke_no_session(void)
     struct nfs4_stateid sid;
     struct scan_result sr;
 
-    db = open_test_catalogue(); VERIFY(db != NULL);
+    db = conformance_open_checked(); VERIFY(db != NULL);
 	cat = db;
 
     ASSERT_EQ(layout_recall_init(cat, NULL, 1000, &lr), 0);
@@ -226,7 +227,7 @@ static void test_recall_for_file_no_layouts(void)
     struct layout_recall *lr = NULL;
     char *path = make_temp_db_path();
 
-    db = open_test_catalogue(); VERIFY(db != NULL);
+    db = conformance_open_checked(); VERIFY(db != NULL);
 	cat = db;
     ASSERT_EQ(layout_recall_init(cat, NULL, 0, &lr), 0);
 
@@ -490,7 +491,7 @@ static void test_recall_with_cb_success(void)
     struct nfs4_stateid sid;
     struct scan_result sr;
 
-    db = open_test_catalogue(); VERIFY(db != NULL);
+    db = conformance_open_checked(); VERIFY(db != NULL);
 	cat = db;
     ASSERT_EQ(layout_recall_init(cat, NULL, 2000, &lr), 0);
 
@@ -590,7 +591,7 @@ static void test_recall_cb_fail_still_revokes(void)
     struct nfs4_stateid sid;
     struct scan_result sr;
 
-    db = open_test_catalogue(); VERIFY(db != NULL);
+    db = conformance_open_checked(); VERIFY(db != NULL);
 	cat = db;
     ASSERT_EQ(layout_recall_init(cat, NULL, 500, &lr), 0);
 
@@ -747,7 +748,7 @@ static void test_byte_range_recall_uses_latest_seqid(void)
     uint32_t recalled = 0;
     int sv[2];
 
-    db = open_test_catalogue(); VERIFY(db != NULL);
+    db = conformance_open_checked(); VERIFY(db != NULL);
     cat = db;
     ASSERT_EQ(layout_recall_init(cat, NULL, 3000, &lr), 0);
     ASSERT_EQ(session_table_init(0, 90, &st), 0);
@@ -832,7 +833,7 @@ static void test_byte_range_recall_sends_overlap_range(void)
     uint32_t recalled = 0;
     int sv[2];
 
-    db = open_test_catalogue(); VERIFY(db != NULL);
+    db = conformance_open_checked(); VERIFY(db != NULL);
     cat = db;
     ASSERT_EQ(layout_recall_init(cat, NULL, 3000, &lr), 0);
     ASSERT_EQ(session_table_init(0, 90, &st), 0);
@@ -902,7 +903,7 @@ static void test_byte_range_recall_dedupes_clientid(void)
     uint32_t ds_ids[] = {10};
     uint32_t recalled = 0;
 
-    db = open_test_catalogue(); VERIFY(db != NULL);
+    db = conformance_open_checked(); VERIFY(db != NULL);
     cat = db;
     ASSERT_EQ(layout_recall_init(cat, NULL, 0, &lr), 0);
 
@@ -973,7 +974,7 @@ static void test_byte_range_recall_revokes_on_recallconflict(void)
     uint32_t recalled = 0;
     int sv[2];
 
-    db = open_test_catalogue(); VERIFY(db != NULL);
+    db = conformance_open_checked(); VERIFY(db != NULL);
     cat = db;
     ASSERT_EQ(layout_recall_init(cat, NULL, 3000, &lr), 0);
     ASSERT_EQ(session_table_init(0, 90, &st), 0);
@@ -1074,7 +1075,7 @@ static void test_byte_range_recall_revokes_on_delay(void)
     uint32_t recalled = 0;
     int sv[2];
 
-    db = open_test_catalogue(); VERIFY(db != NULL);
+    db = conformance_open_checked(); VERIFY(db != NULL);
     cat = db;
     ASSERT_EQ(layout_recall_init(cat, NULL, 3000, &lr), 0);
     ASSERT_EQ(session_table_init(0, 90, &st), 0);
@@ -1165,7 +1166,7 @@ static void test_byte_range_recall_revokes_on_terminal_status(void)
     uint32_t recalled = 0;
     int sv[2];
 
-    db = open_test_catalogue(); VERIFY(db != NULL);
+    db = conformance_open_checked(); VERIFY(db != NULL);
     cat = db;
     ASSERT_EQ(layout_recall_init(cat, NULL, 3000, &lr), 0);
     ASSERT_EQ(session_table_init(0, 90, &st), 0);
@@ -1261,7 +1262,7 @@ static void test_byte_range_recall_revokes_on_nomatching_layout(void)
     uint32_t recalled = 0;
     int sv[2];
 
-    db = open_test_catalogue(); VERIFY(db != NULL);
+    db = conformance_open_checked(); VERIFY(db != NULL);
     cat = db;
     ASSERT_EQ(layout_recall_init(cat, NULL, 3000, &lr), 0);
     ASSERT_EQ(session_table_init(0, 90, &st), 0);
@@ -1371,7 +1372,7 @@ static void test_unlink_revoke_forces_revoke(uint32_t reply_status,
 
     ds_ids[0] = ds_id;
 
-    db = open_test_catalogue(); VERIFY(db != NULL);
+    db = conformance_open_checked(); VERIFY(db != NULL);
     cat = db;
     ASSERT_EQ(layout_recall_init(cat, NULL, 3000, &lr), 0);
     ASSERT_EQ(session_table_init(0, 90, &st), 0);

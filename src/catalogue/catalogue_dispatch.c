@@ -16,6 +16,7 @@
 
 #include "mds_catalogue.h"
 #include "mds_coordination.h"
+#include "mds_cluster.h"
 #include "catalogue_internal.h"
 #include "commit_queue.h"
 #include "migration.h"
@@ -86,12 +87,73 @@ void mds_catalogue_close(struct mds_catalogue *cat)
     free(cat);
 }
 
-/* Default implementation -- overridden by RonDB backend. */
-__attribute__((weak))
 void *mds_catalogue_backend_handle(const struct mds_catalogue *cat)
 {
-    (void)cat;
-    return NULL;
+    if (cat == NULL || cat->ops == NULL ||
+        cat->ops->backend_handle == NULL) {
+        return NULL;
+    }
+    return cat->ops->backend_handle(cat);
+}
+
+enum mds_status mds_catalogue_bootstrap(struct mds_catalogue *cat)
+{
+    if (cat == NULL || cat->ops == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (cat->ops->bootstrap == NULL) {
+        return MDS_ERR_NOSUPPORT;
+    }
+    return cat->ops->bootstrap(cat);
+}
+
+bool mds_catalogue_bootstrap_supported(const struct mds_catalogue *cat)
+{
+    return cat != NULL && cat->ops != NULL &&
+           cat->ops->bootstrap != NULL;
+}
+
+/* Changefeed / catalog-image feed lifecycle: argument validation
+ * (INVAL), then slot presence (NOSUPPORT), then the slot's own status
+ * untouched (C4). */
+enum mds_status mds_catalogue_image_feed_start(struct mds_catalogue *cat,
+                                               struct catalog_image *image,
+                                               uint32_t self_mds_id,
+                                               uint32_t poll_interval_ms)
+{
+    if (cat == NULL || image == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (cat->ops == NULL || cat->ops->image_feed_start == NULL) {
+        return MDS_ERR_NOSUPPORT;
+    }
+    return cat->ops->image_feed_start(cat, image, self_mds_id,
+                                      poll_interval_ms);
+}
+
+enum mds_status mds_catalogue_image_feed_stop(struct mds_catalogue *cat)
+{
+    if (cat == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (cat->ops == NULL || cat->ops->image_feed_stop == NULL) {
+        return MDS_ERR_NOSUPPORT;
+    }
+    cat->ops->image_feed_stop(cat);
+    return MDS_OK;
+}
+
+bool mds_catalogue_image_feed_supported(const struct mds_catalogue *cat)
+{
+    return cat != NULL && cat->ops != NULL &&
+           cat->ops->image_feed_start != NULL &&
+           cat->ops->image_feed_stop != NULL;
+}
+
+bool mds_catalogue_shared_authority(const struct mds_catalogue *cat)
+{
+    return cat != NULL &&
+           (cat->caps & MDS_CAT_CAP_SHARED_AUTHORITY) != 0;
 }
 
 struct catalog_stats *mds_catalogue_stats(struct mds_catalogue *cat)
@@ -105,8 +167,11 @@ struct catalog_stats *mds_catalogue_stats(struct mds_catalogue *cat)
 enum mds_catalogue_backend mds_catalogue_backend_type(
     const struct mds_catalogue *cat)
 {
+    /* A NULL handle is "no catalogue", never a guess at one backend:
+     * every in-tree caller passes a handle that mds_catalogue_open()
+     * already returned, so nothing relies on the old RONDB default. */
     if (cat == NULL) {
-        return MDS_BACKEND_RONDB;
+        return MDS_BACKEND_NONE;
     }
     return cat->backend;
 }
@@ -136,11 +201,15 @@ struct commit_queue *mds_catalogue_get_cq(const struct mds_catalogue *cat)
 }
 
 /* -----------------------------------------------------------------------
- * Transaction control
+ * Transaction control (contract C6, catalogue_internal.h)
  *
- * RonDB operations are self-contained.  The transaction handle is a
- * lightweight grouping context (txn_private == NULL) that lets callers
- * use the catalogue API uniformly.
+ * struct mds_cat_txn is a grouping context and nothing more: begin
+ * allocates it, commit and abort free it, and no backend ever joins
+ * operations to it (txn_private stays NULL on every backend).  Each
+ * write a caller issues with the token has already been committed by
+ * the backend individually; multi-record atomicity exists only inside
+ * the fused slots.  A backend must not implement anything stronger for
+ * the token -- mds_catalogue.h documents this to callers.
  * ----------------------------------------------------------------------- */
 
 enum mds_status mds_cat_txn_begin(struct mds_catalogue *cat,
@@ -161,7 +230,7 @@ enum mds_status mds_cat_txn_begin(struct mds_catalogue *cat,
     ct->cat = cat;
     ct->txn_backend = cat->backend;
     ct->flags = flags;
-    ct->txn_private = NULL; /* RonDB: no raw txn handle */
+    ct->txn_private = NULL; /* C6: never a raw backend transaction */
     *out = ct;
     return MDS_OK;
 }
@@ -224,6 +293,57 @@ enum mds_status mds_cat_ns_create_wide(
         cat->auth_ops->ns_create_wide(cat, parent_fileid, name, child,
                                       stripe_count, stripe_unit, mirror_count,
                                       entries, safe_to_discard));
+}
+
+enum mds_status mds_cat_ns_create_with_layout(
+    struct mds_catalogue *cat,
+    uint64_t parent_fileid, const char *name,
+    enum mds_file_type type,
+    uint32_t mode, uint64_t uid, uint64_t gid,
+    struct ds_prealloc_ctx *prealloc,
+    struct mds_inode *out,
+    uint64_t layout_clientid, uint32_t layout_iomode,
+    uint64_t layout_offset, uint64_t layout_length,
+    const struct nfs4_stateid *layout_stateid,
+    uint32_t layout_mds_id,
+    bool *layout_ok,
+    struct mds_ds_map_entry *layout_entry_out,
+    uint32_t *layout_pop_stripe_unit_out)
+{
+    /* Every out-param is in its documented "nothing happened" state
+     * before any early return, so callers never read stale data. */
+    if (layout_ok != NULL) {
+        *layout_ok = false;
+    }
+    if (layout_entry_out != NULL) {
+        memset(layout_entry_out, 0, sizeof(*layout_entry_out));
+    }
+    if (layout_pop_stripe_unit_out != NULL) {
+        *layout_pop_stripe_unit_out = 0;
+    }
+    if (cat == NULL || cat->auth_ops == NULL || name == NULL ||
+        out == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (cat->auth_ops->ns_create_with_layout == NULL) {
+        return MDS_ERR_NOSUPPORT;
+    }
+    return CAT_TIMED(MDS_CATOP_NS_CREATE,
+        cat->auth_ops->ns_create_with_layout(
+            cat, parent_fileid, name, type, mode, uid, gid,
+            prealloc, out,
+            layout_clientid, layout_iomode,
+            layout_offset, layout_length,
+            layout_stateid, layout_mds_id,
+            layout_ok, layout_entry_out,
+            layout_pop_stripe_unit_out));
+}
+
+bool mds_cat_ns_create_with_layout_supported(
+    const struct mds_catalogue *cat)
+{
+    return cat != NULL && cat->auth_ops != NULL &&
+           cat->auth_ops->ns_create_with_layout != NULL;
 }
 
 enum mds_status mds_cat_ns_remove(struct mds_catalogue *cat,
@@ -398,6 +518,63 @@ enum mds_status mds_cat_ns_setattr(struct mds_catalogue *cat,
         cat->auth_ops->ns_setattr(cat, txn, fileid, attrs, mask));
 }
 
+/* -----------------------------------------------------------------------
+ * READDIR cookie contract guard
+ *
+ * struct mds_cat_dirent.cookie must never be 0, 1 or 2 (mds_catalogue.h):
+ * a producer that delivered one would put a reserved cookie on the wire.
+ * Wherever assert() is live (every build unless ENABLE_RELEASE_ASSERTS is
+ * OFF) the dispatcher interposes on the readdir callbacks and, on the
+ * first offending entry, stops the scan without delivering it and
+ * returns MDS_ERR_INVAL.  MDS_ERR_INVAL was chosen over assert(): a
+ * producer bug in one directory must not take the daemon down, and the
+ * outcome is unit-testable.  With NDEBUG defined the guard compiles
+ * away and the caller's callback is handed to the backend directly.
+ * ----------------------------------------------------------------------- */
+
+#ifndef NDEBUG
+#define CAT_COOKIE_GUARD 1
+#else
+#define CAT_COOKIE_GUARD 0
+#endif
+
+/** Smallest cookie a producer may assign (0, 1, 2 are reserved). */
+#define MDS_READDIR_COOKIE_MIN 3U
+
+#if CAT_COOKIE_GUARD
+struct readdir_cookie_guard {
+    mds_readdir_cb       cb;       /**< Caller's callback (plain form). */
+    mds_readdir_plus_cb  plus_cb;  /**< Caller's callback (plus form). */
+    void                *ctx;
+    enum mds_status      status;   /**< MDS_OK or MDS_ERR_INVAL. */
+};
+
+static int readdir_cookie_guard_cb(const struct mds_cat_dirent *entry,
+                                   void *arg)
+{
+    struct readdir_cookie_guard *g = arg;
+
+    if (entry != NULL && entry->cookie < MDS_READDIR_COOKIE_MIN) {
+        g->status = MDS_ERR_INVAL;
+        return 1; /* stop: never deliver a reserved cookie */
+    }
+    return g->cb(entry, g->ctx);
+}
+
+static int readdir_plus_cookie_guard_cb(const struct mds_cat_dirent *entry,
+                                        const struct mds_inode *inode,
+                                        bool inode_valid, void *arg)
+{
+    struct readdir_cookie_guard *g = arg;
+
+    if (entry != NULL && entry->cookie < MDS_READDIR_COOKIE_MIN) {
+        g->status = MDS_ERR_INVAL;
+        return 1; /* stop: never deliver a reserved cookie */
+    }
+    return g->plus_cb(entry, inode, inode_valid, g->ctx);
+}
+#endif /* CAT_COOKIE_GUARD */
+
 enum mds_status mds_cat_ns_readdir(struct mds_catalogue *cat,
                                    uint64_t parent_fileid,
                                    const char *start_after,
@@ -405,12 +582,25 @@ enum mds_status mds_cat_ns_readdir(struct mds_catalogue *cat,
                                    struct mds_cat_txn *txn,
                                    mds_readdir_cb cb, void *ctx)
 {
-    if (cat == NULL || cat->auth_ops == NULL) {
+    if (cat == NULL || cat->auth_ops == NULL || cb == NULL) {
         return MDS_ERR_INVAL;
     }
+#if CAT_COOKIE_GUARD
+    {
+        struct readdir_cookie_guard g = {
+            .cb = cb, .plus_cb = NULL, .ctx = ctx, .status = MDS_OK,
+        };
+        enum mds_status st = CAT_TIMED(MDS_CATOP_NS_READDIR,
+            cat->auth_ops->ns_readdir(cat, parent_fileid, start_after,
+                                      max_entries, txn,
+                                      readdir_cookie_guard_cb, &g));
+        return (st != MDS_OK) ? st : g.status;
+    }
+#else
     return CAT_TIMED(MDS_CATOP_NS_READDIR,
         cat->auth_ops->ns_readdir(cat, parent_fileid, start_after,
                                   max_entries, txn, cb, ctx));
+#endif
 }
 
 enum mds_status mds_cat_ns_dirent_name_for_child(
@@ -465,6 +655,15 @@ static int ns_readdir_plus_fallback_cb(const struct mds_cat_dirent *entry,
 
     if (entry == NULL) { return 0; }
 
+#if CAT_COOKIE_GUARD
+    /* The entry (and its cookie) is passed through from the backend's
+     * ns_readdir unchanged; guard it here exactly like the fast paths. */
+    if (entry->cookie < MDS_READDIR_COOKIE_MIN) {
+        fctx->last_status = MDS_ERR_INVAL;
+        return 1; /* stop scan */
+    }
+#endif
+
     gst = fctx->cat->auth_ops->ns_getattr(fctx->cat, entry->fileid,
                                           &inode);
     if (gst == MDS_OK) {
@@ -499,13 +698,27 @@ enum mds_status mds_cat_ns_readdir_plus(struct mds_catalogue *cat,
 
     /* Fast path: backend implements the fused op. */
     if (cat->auth_ops->ns_readdir_plus != NULL) {
+#if CAT_COOKIE_GUARD
+        struct readdir_cookie_guard g = {
+            .cb = NULL, .plus_cb = cb, .ctx = ctx, .status = MDS_OK,
+        };
+        st = CAT_TIMED(MDS_CATOP_NS_READDIR_PLUS,
+            cat->auth_ops->ns_readdir_plus(cat, parent_fileid,
+                                           start_after, max_entries,
+                                           txn,
+                                           readdir_plus_cookie_guard_cb,
+                                           &g));
+        return (st != MDS_OK) ? st : g.status;
+#else
         return CAT_TIMED(MDS_CATOP_NS_READDIR_PLUS,
             cat->auth_ops->ns_readdir_plus(cat, parent_fileid,
                                            start_after, max_entries,
                                            txn, cb, ctx));
+#endif
     }
 
-    /* Fallback: ns_readdir + ns_getattr per entry. */
+    /* Fallback: ns_readdir + ns_getattr per entry.  The fallback
+     * callback applies the cookie guard itself. */
     fctx.cat         = cat;
     fctx.caller_cb   = cb;
     fctx.caller_ctx  = ctx;
@@ -538,19 +751,32 @@ enum mds_status mds_cat_ns_readdir_plus_from_cookie(
         return MDS_ERR_INVAL;
     }
 
-    /* Fast path: indexed range scan resumed by child fileid.
-     * O(log N + page) per page and inherently safe across a deleted
-     * cookie (the resume is a strict child_fileid > cookie range). */
+    /* Fast path: indexed range scan resumed by cookie.  O(log N +
+     * page) per page and inherently safe across a deleted cookie (the
+     * resume is a strict cookie > @cookie range). */
     if (cat->auth_ops->ns_readdir_plus_from != NULL) {
+#if CAT_COOKIE_GUARD
+        struct readdir_cookie_guard g = {
+            .cb = NULL, .plus_cb = cb, .ctx = ctx, .status = MDS_OK,
+        };
+        st = CAT_TIMED(MDS_CATOP_NS_READDIR_PLUS,
+            cat->auth_ops->ns_readdir_plus_from(
+                cat, parent_fileid, cookie, max_entries, txn,
+                readdir_plus_cookie_guard_cb, &g));
+        return (st != MDS_OK) ? st : g.status;
+#else
         return CAT_TIMED(MDS_CATOP_NS_READDIR_PLUS,
             cat->auth_ops->ns_readdir_plus_from(cat, parent_fileid,
                                                 cookie, max_entries,
                                                 txn, cb, ctx));
+#endif
     }
 
-    /* Fallback: translate the fileid cookie back to a name and resume
-     * in name order via the existing readdir_plus path.  Preserves
-     * behaviour on backends without the fileid cursor. */
+    /* Fallback: translate the cookie back to a name and resume in name
+     * order via the existing readdir_plus path (which carries its own
+     * cookie guard).  Valid only while the backend assigns cookie =
+     * child fileid, i.e. for every in-tree backend without the cursor
+     * slot today. */
     if (cookie != 0) {
         st = mds_cat_ns_dirent_name_for_child(cat, parent_fileid, cookie,
                                               start_name,
@@ -1705,18 +1931,60 @@ enum mds_status mds_coord_layout_grant_union(struct mds_catalogue *cat,
         (ds_count > 0 && ds_ids == NULL)) {
         return MDS_ERR_INVAL;
     }
-    /* Portable fallback: backends without a native union slot keep
-     * the plain overwrite (pre-change behaviour, used by the memdb
-     * test fixture). */
+    /* C5: no overwrite fallback.  A plain grant on renewal would narrow
+     * the persisted range to the newest window and the byte-range recall
+     * scanner would silently lose coverage of earlier windows; a backend
+     * that cannot union must say so.  Every in-tree backend populates the
+     * slot, so NULL here is a missing implementation, not a degraded
+     * mode. */
     if (cat->coord_ops->layout_grant_union == NULL) {
-        return mds_coord_layout_grant(cat, txn, clientid, fileid,
-                                      iomode, offset, length,
-                                      stateid, ds_ids, ds_count);
+        return MDS_ERR_NOSUPPORT;
     }
     return CAT_TIMED(MDS_CATOP_LAYOUT_GRANT,
         cat->coord_ops->layout_grant_union(cat, txn, clientid, fileid,
                                            iomode, offset, length,
                                            stateid, ds_ids, ds_count));
+}
+
+enum mds_status mds_coord_layoutget_fused(
+    struct mds_catalogue *cat, uint64_t fileid,
+    uint32_t *stripe_count, uint32_t *stripe_unit,
+    uint32_t *mirror_count, struct mds_ds_map_entry **entries,
+    const struct nfs4_stateid *stateid,
+    uint64_t clientid, uint32_t iomode, uint64_t offset,
+    uint64_t length, uint32_t mds_id)
+{
+    if (entries != NULL) {
+        *entries = NULL;
+    }
+    if (cat == NULL || cat->coord_ops == NULL || stateid == NULL ||
+        stripe_count == NULL || stripe_unit == NULL ||
+        mirror_count == NULL || entries == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (cat->coord_ops->layoutget_fused == NULL) {
+        return MDS_ERR_NOSUPPORT;
+    }
+    return CAT_TIMED(MDS_CATOP_LAYOUTGET_FUSED,
+        cat->coord_ops->layoutget_fused(cat, fileid,
+                                        stripe_count, stripe_unit,
+                                        mirror_count, entries,
+                                        stateid, clientid, iomode,
+                                        offset, length, mds_id));
+}
+
+bool mds_coord_layoutget_fused_supported(const struct mds_catalogue *cat)
+{
+    return cat != NULL && cat->coord_ops != NULL &&
+           cat->coord_ops->layoutget_fused != NULL;
+}
+
+bool mds_coord_shared_state_supported(const struct mds_catalogue *cat)
+{
+    return cat != NULL && cat->coord_ops != NULL &&
+           cat->coord_ops->open_put != NULL &&
+           cat->coord_ops->lock_put != NULL &&
+           cat->coord_ops->deleg_put != NULL;
 }
 
 enum mds_status mds_coord_layout_return(struct mds_catalogue *cat,
@@ -2331,4 +2599,140 @@ enum mds_status mds_cat_ns_remove_info_verified_flags(
 	(void)expected_child_fid; (void)expected_generation;
 	(void)out; (void)ns_flags;
 	return MDS_ERR_NOSUPPORT;
+}
+
+/* -----------------------------------------------------------------------
+ * Cluster ops dispatch -- node registry / partition map (mds_cluster.h)
+ *
+ * Argument validation first (NULL handle, callback or string ->
+ * MDS_ERR_INVAL), then slot presence (NULL table or NULL slot ->
+ * MDS_ERR_NOSUPPORT), then the slot's own status untouched (C4).  These
+ * are cold paths -- startup, one heartbeat per interval, watchdog
+ * ticks -- so they carry no CAT_TIMED instrumentation: no catalogue-op
+ * metric id exists for them and one would only dilute the hot-path
+ * histograms.
+ * ----------------------------------------------------------------------- */
+
+enum mds_status mds_cluster_node_register(struct mds_catalogue *cat,
+                                          uint32_t mds_id,
+                                          uint64_t boot_epoch,
+                                          const char *hostname,
+                                          uint16_t nfs_port,
+                                          uint16_t grpc_port)
+{
+    if (cat == NULL || hostname == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (cat->cluster_ops == NULL || cat->cluster_ops->node_register == NULL) {
+        return MDS_ERR_NOSUPPORT;
+    }
+    return cat->cluster_ops->node_register(cat, mds_id, boot_epoch,
+                                           hostname, nfs_port, grpc_port);
+}
+
+enum mds_status mds_cluster_node_heartbeat(struct mds_catalogue *cat,
+                                           uint32_t mds_id,
+                                           uint64_t boot_epoch)
+{
+    if (cat == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (cat->cluster_ops == NULL || cat->cluster_ops->node_heartbeat == NULL) {
+        return MDS_ERR_NOSUPPORT;
+    }
+    return cat->cluster_ops->node_heartbeat(cat, mds_id, boot_epoch);
+}
+
+enum mds_status mds_cluster_node_deregister(struct mds_catalogue *cat,
+                                            uint32_t mds_id,
+                                            uint64_t boot_epoch)
+{
+    if (cat == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (cat->cluster_ops == NULL ||
+        cat->cluster_ops->node_deregister == NULL) {
+        return MDS_ERR_NOSUPPORT;
+    }
+    return cat->cluster_ops->node_deregister(cat, mds_id, boot_epoch);
+}
+
+enum mds_status mds_cluster_node_list(struct mds_catalogue *cat,
+                                      mds_cluster_node_cb cb, void *ctx)
+{
+    if (cat == NULL || cb == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (cat->cluster_ops == NULL || cat->cluster_ops->node_list == NULL) {
+        return MDS_ERR_NOSUPPORT;
+    }
+    return cat->cluster_ops->node_list(cat, cb, ctx);
+}
+
+enum mds_status mds_cluster_node_scan_stale(struct mds_catalogue *cat,
+                                            uint64_t threshold_ns,
+                                            mds_cluster_stale_cb cb,
+                                            void *ctx)
+{
+    if (cat == NULL || cb == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (cat->cluster_ops == NULL ||
+        cat->cluster_ops->node_scan_stale == NULL) {
+        return MDS_ERR_NOSUPPORT;
+    }
+    return cat->cluster_ops->node_scan_stale(cat, threshold_ns, cb, ctx);
+}
+
+enum mds_status mds_cluster_partition_list(struct mds_catalogue *cat,
+                                           mds_cluster_partition_cb cb,
+                                           void *ctx)
+{
+    if (cat == NULL || cb == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (cat->cluster_ops == NULL ||
+        cat->cluster_ops->partition_list == NULL) {
+        return MDS_ERR_NOSUPPORT;
+    }
+    return cat->cluster_ops->partition_list(cat, cb, ctx);
+}
+
+enum mds_status mds_cluster_partition_put(struct mds_catalogue *cat,
+                                          uint32_t partition_id,
+                                          uint32_t owner_mds_id,
+                                          uint8_t state,
+                                          const char *subtree_path,
+                                          bool insert_only)
+{
+    if (cat == NULL || subtree_path == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (cat->cluster_ops == NULL || cat->cluster_ops->partition_put == NULL) {
+        return MDS_ERR_NOSUPPORT;
+    }
+    return cat->cluster_ops->partition_put(cat, partition_id, owner_mds_id,
+                                           state, subtree_path, insert_only);
+}
+
+bool mds_cluster_supported(const struct mds_catalogue *cat)
+{
+    const struct mds_cluster_ops *ops;
+
+    if (cat == NULL || cat->cluster_ops == NULL) {
+        return false;
+    }
+    ops = cat->cluster_ops;
+    return ops->node_register != NULL &&
+           ops->node_heartbeat != NULL &&
+           ops->node_list != NULL &&
+           ops->partition_list != NULL &&
+           ops->partition_put != NULL &&
+           (cat->caps & MDS_CAT_CAP_MULTI_PROCESS) != 0;
+}
+
+bool mds_cluster_stale_scan_supported(const struct mds_catalogue *cat)
+{
+    return cat != NULL && cat->cluster_ops != NULL &&
+           cat->cluster_ops->node_scan_stale != NULL;
 }

@@ -90,7 +90,7 @@ The worker pool is sized by `worker_threads` (config); the listener pool by
 ```text path=null start=null
 src/
 ├── mds/         # NFSv4.1/4.2 protocol surface and per-op handlers
-├── catalogue/   # Pluggable metadata backend (RonDB, in-memory test stub)
+├── catalogue/   # Pluggable metadata backends (RonDB, in-memory memdb)
 ├── cluster/     # Cross-MDS coordination (transport, membership, 2PC)
 ├── common/      # Shared utilities: config, fh codec, endian helpers
 ├── fsal_obj/    # FSAL-style object abstractions used by the MDS
@@ -172,9 +172,10 @@ Lattice abstracts its metadata store behind a small C ABI in
   wraps the NDB C++ API behind a narrow C surface.  The shim opens NDB
   cluster connections, manages a per-thread `Ndb` object, and exposes a
   one-call-one-transaction interface to the rest of Lattice.
-- **memdb** (tests) — `src/catalogue/catalogue_memdb.c` is an in-memory
-  hash-table backend used by the unit tests so the suite has no external
-  dependency.
+- **memdb** — `src/catalogue/catalogue_memdb.c` is the in-memory reference
+  backend: bounded tables, non-durable, single node.  The unit tests use it so
+  the suite has no external dependency, and `catalogue_backend = memdb` runs
+  the daemon on it without RonDB.
 Both backends implement the same vtable (`include/catalogue_internal.h`).
 Tables (logical, not literal NDB DDL):
 | Table | Purpose |

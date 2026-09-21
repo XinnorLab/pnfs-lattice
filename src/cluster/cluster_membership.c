@@ -11,10 +11,13 @@
  *   - apply_member_upsert() / apply_member_remove() are private
  *     helpers that take the write lock internally and mutate the
  *     local cache.  They are called by watch handlers and init.
- *   - Backend vtable join/leave do RonDB I/O OUTSIDE the rwlock,
+ *   - Backend vtable join/leave do catalogue I/O OUTSIDE the rwlock,
  *     then wait for the watch handler to apply the change locally.
  *   - Local backend join/leave are called with write lock held
  *     (unchanged from before).
+ *   - cluster_membership_populate() reads the node registry through
+ *     the backend-neutral mds_cluster_node_list() dispatcher and
+ *     never holds the rwlock across that call.
  *
  * Thread safety: all public API calls are internally synchronised
  * via pthread_rwlock_t.
@@ -32,6 +35,7 @@
 #include "pnfs_mds.h"
 #include "cluster_membership.h"
 #include "subtree_map.h"
+#include "mds_cluster.h"
 
 /* -----------------------------------------------------------------------
  * Tunables
@@ -398,23 +402,20 @@ enum mds_status cluster_membership_init(const struct mds_config *cfg,
 }
 
 /* -----------------------------------------------------------------------
- * RonDB-native membership population
+ * Membership population from the catalogue's node registry
  * ----------------------------------------------------------------------- */
 
-#ifdef HAVE_RONDB
-#include "catalogue_rondb.h"
-
-struct rondb_membership_ctx {
+struct registry_populate_ctx {
     struct cluster_membership *cm;
     uint32_t upserted;
 };
 
-static int rondb_member_cb(uint32_t mds_id, uint64_t boot_epoch,
-                           const char *hostname,
-                           uint16_t nfs_port, uint16_t grpc_port,
-                           uint64_t last_heartbeat_ns, void *ctx)
+static int registry_member_cb(uint32_t mds_id, uint64_t boot_epoch,
+                              const char *hostname,
+                              uint16_t nfs_port, uint16_t grpc_port,
+                              uint64_t last_heartbeat_ns, void *ctx)
 {
-    struct rondb_membership_ctx *rc = ctx;
+    struct registry_populate_ctx *rc = ctx;
     (void)boot_epoch;
     (void)last_heartbeat_ns;
 
@@ -434,26 +435,18 @@ static int rondb_member_cb(uint32_t mds_id, uint64_t boot_epoch,
     rc->upserted++;
     return 0;
 }
-#endif /* HAVE_RONDB */
 
-enum mds_status cluster_membership_populate_rondb(
-    struct cluster_membership *ctx, struct mds_catalogue *cat)
+enum mds_status cluster_membership_populate(struct cluster_membership *ctx,
+                                            struct mds_catalogue *cat)
 {
-#ifdef HAVE_RONDB
     if (ctx == NULL || cat == NULL) {
         return MDS_ERR_INVAL;
     }
 
-    struct rondb_membership_ctx rc = { .cm = ctx, .upserted = 0 };
-    enum mds_status st = catalogue_rondb_mds_list(cat, rondb_member_cb, &rc);
-    if (st != MDS_OK) {
-        return st;
-    }
-    return MDS_OK;
-#else
-    (void)ctx; (void)cat;
-    return MDS_ERR_NOSUPPORT;
-#endif
+    struct registry_populate_ctx rc = { .cm = ctx, .upserted = 0 };
+    /* The dispatcher's status passes through unchanged: a backend
+     * without a node registry yields MDS_ERR_NOSUPPORT. */
+    return mds_cluster_node_list(cat, registry_member_cb, &rc);
 }
 
 void cluster_membership_destroy(struct cluster_membership *ctx)

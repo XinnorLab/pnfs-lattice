@@ -1298,7 +1298,9 @@ bool encode_res_readdir(XDR *xdrs, const struct nfs4_result *r)
      * Final entry followed by value_follows=false + eof(bool). */
     for (i = 0; i < rd->count; i++) {
         int32_t value_follows = 1; /* true */
-        uint64_t cookie = rd->entries[i].fileid;
+        /* Backend-assigned cookie (struct mds_cat_dirent.cookie),
+         * carried through op_readdir unchanged; never the fileid. */
+        uint64_t cookie = rd->entries[i].cookie;
         uint32_t name_len = (uint32_t)strlen(rd->entries[i].name);
 
         if (!xdr_putbool(xdrs, value_follows)) {

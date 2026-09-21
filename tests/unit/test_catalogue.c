@@ -17,8 +17,10 @@
 
 #include "pnfs_mds.h"
 #include "test_helpers.h"
+#include "harness.h"        /* conformance_open_checked */
 #include "mds_catalogue.h"
 #include "mds_coordination.h"
+#include "mds_cluster.h"
 #include "commit_queue.h"
 #include "compound.h"      /* struct compound_data */
 #include "compound_internal.h" /* cat_getattr, cat_on_root_db */
@@ -112,16 +114,17 @@ static void cleanup_temp_db(const char *path)
 	}
 }
 
-/** Open a catalogue backed by the in-memory test backend.
- * This avoids a dependency on HAVE_RONDB; path_out is still
- * populated so the existing close_test_cat() cleanup stays stable. */
+/** Open a catalogue on the backend selected by CATALOGUE_TEST_BACKEND
+ * (memdb by default) through the conformance harness; an unavailable
+ * backend exits 77 before any test runs.  path_out is still populated
+ * so the existing close_test_cat() cleanup stays stable. */
 static struct mds_catalogue *open_test_cat(char **path_out)
 {
 	struct mds_catalogue *cat;
 
 	*path_out = make_temp_db_path();
 
-	cat = open_test_catalogue();
+	cat = conformance_open_checked();
 	assert(cat != NULL);
 	return cat;
 }
@@ -699,6 +702,237 @@ static void test_catalogue_dirent_name_for_child(void)
 }
 
 /* -----------------------------------------------------------------------
+ * 5d. test_catalogue_readdir_cookie -- backend-assigned READDIR cookies
+ *
+ * Every dirent a backend delivers carries a cookie (struct
+ * mds_cat_dirent.cookie) that is never 0, 1 or 2 and is unique within
+ * the directory; readdir_plus_from_cookie resumes with the entries
+ * whose cookie is strictly greater.  The cookie a given entry carries
+ * must be the same on the plain readdir, the readdir_plus fallback and
+ * the cookie-resume path.  How a backend derives the cookie (child
+ * fileid on RonDB, a per-dirent sequence on a backend that is hard-link
+ * safe) is not part of this contract -- the conformance suite covers
+ * the hard-link case per backend.
+ * ----------------------------------------------------------------------- */
+
+/* Smallest cookie a producer may hand out (MDS_READDIR_COOKIE_MIN in
+ * catalogue_dispatch.c): 0, 1 and 2 are reserved by RFC 8881. */
+#define TEST_COOKIE_MIN 3U
+
+struct cookie_collect {
+	uint32_t count;
+	uint64_t fileid[READDIR_PLUS_MAX];
+	uint64_t cookie[READDIR_PLUS_MAX];
+	char name[READDIR_PLUS_MAX][MDS_MAX_NAME + 1];
+};
+
+static int cookie_collect_cb(const struct mds_cat_dirent *entry, void *arg)
+{
+	struct cookie_collect *c = arg;
+
+	if (c->count >= READDIR_PLUS_MAX) {
+		return -1;
+	}
+	c->fileid[c->count] = entry->fileid;
+	c->cookie[c->count] = entry->cookie;
+	snprintf(c->name[c->count], sizeof(c->name[c->count]), "%s",
+		 entry->name);
+	c->count++;
+	return 0;
+}
+
+static int cookie_collect_plus_cb(const struct mds_cat_dirent *entry,
+				  const struct mds_inode *inode,
+				  bool inode_valid,
+				  void *arg)
+{
+	(void)inode;
+	(void)inode_valid;
+	return cookie_collect_cb(entry, arg);
+}
+
+/* Cookie contract for one collected listing: never reserved and unique
+ * within the listing. */
+static bool cookies_valid(const struct cookie_collect *c)
+{
+	uint32_t i, j;
+
+	for (i = 0; i < c->count; i++) {
+		if (c->cookie[i] < TEST_COOKIE_MIN) {
+			return false;
+		}
+		for (j = 0; j < i; j++) {
+			if (c->cookie[j] == c->cookie[i]) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+/* Every name of the three-entry fixture delivered exactly once. */
+static bool names_once(const struct cookie_collect *c)
+{
+	unsigned aaa = 0, bbb = 0, ccc = 0;
+	uint32_t i;
+
+	for (i = 0; i < c->count; i++) {
+		if (strcmp(c->name[i], "aaa") == 0) {
+			aaa++;
+		} else if (strcmp(c->name[i], "bbb") == 0) {
+			bbb++;
+		} else if (strcmp(c->name[i], "ccc") == 0) {
+			ccc++;
+		} else {
+			return false;
+		}
+	}
+	return aaa == 1 && bbb == 1 && ccc == 1;
+}
+
+/* The cookie of a given entry (matched by fileid) is the same on every
+ * path that delivers it. */
+static bool cookies_agree(const struct cookie_collect *a,
+			  const struct cookie_collect *b)
+{
+	uint32_t i, j;
+
+	if (a->count != b->count) {
+		return false;
+	}
+	for (i = 0; i < a->count; i++) {
+		bool matched = false;
+
+		for (j = 0; j < b->count; j++) {
+			if (b->fileid[j] == a->fileid[i]) {
+				matched = (b->cookie[j] == a->cookie[i]);
+				break;
+			}
+		}
+		if (!matched) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void test_catalogue_readdir_cookie_contract(void)
+{
+	struct mds_catalogue *cat;
+	struct mds_inode child;
+	struct cookie_collect got;
+	struct cookie_collect plain;
+	uint64_t mid_cookie;
+	uint64_t last_cookie;
+	char *path;
+
+	cat = open_test_cat(&path);
+
+	ASSERT_EQ(mds_cat_ns_create(cat, NULL, MDS_FILEID_ROOT,
+				    "aaa", MDS_FTYPE_DIR, 0755,
+				    0, 0, NULL, &child), MDS_OK);
+	ASSERT_EQ(mds_cat_ns_create(cat, NULL, MDS_FILEID_ROOT,
+				    "bbb", MDS_FTYPE_REG, 0644,
+				    0, 0, NULL, &child), MDS_OK);
+	ASSERT_EQ(mds_cat_ns_create(cat, NULL, MDS_FILEID_ROOT,
+				    "ccc", MDS_FTYPE_DIR, 0755,
+				    0, 0, NULL, &child), MDS_OK);
+
+	/* Plain readdir. */
+	memset(&plain, 0, sizeof(plain));
+	ASSERT_EQ(mds_cat_ns_readdir(cat, MDS_FILEID_ROOT, NULL, 0, NULL,
+				     cookie_collect_cb, &plain), MDS_OK);
+	ASSERT_EQ(plain.count, (uint32_t)3);
+	ASSERT_TRUE(cookies_valid(&plain));
+	ASSERT_TRUE(names_once(&plain));
+
+	/* readdir_plus (fused or the dispatcher fallback): the producer's
+	 * cookie reaches the caller unchanged. */
+	memset(&got, 0, sizeof(got));
+	ASSERT_EQ(mds_cat_ns_readdir_plus(cat, MDS_FILEID_ROOT, NULL, 0,
+					  NULL, cookie_collect_plus_cb, &got),
+		  MDS_OK);
+	ASSERT_EQ(got.count, (uint32_t)3);
+	ASSERT_TRUE(cookies_valid(&got));
+	ASSERT_TRUE(names_once(&got));
+	ASSERT_TRUE(cookies_agree(&plain, &got));
+
+	/* Cookie-resume path, first page: ascending cookies. */
+	memset(&got, 0, sizeof(got));
+	ASSERT_EQ(mds_cat_ns_readdir_plus_from_cookie(cat, MDS_FILEID_ROOT,
+						      0, 0, NULL,
+						      cookie_collect_plus_cb,
+						      &got),
+		  MDS_OK);
+	ASSERT_EQ(got.count, (uint32_t)3);
+	ASSERT_TRUE(cookies_valid(&got));
+	ASSERT_TRUE(names_once(&got));
+	ASSERT_TRUE(cookies_agree(&plain, &got));
+	ASSERT_TRUE(got.cookie[0] < got.cookie[1]);
+	ASSERT_TRUE(got.cookie[1] < got.cookie[2]);
+	mid_cookie = got.cookie[1];
+	last_cookie = got.cookie[2];
+
+	/* Page size 1, resuming with the last delivered cookie: every name
+	 * exactly once and cookies strictly increasing across resumes. */
+	{
+		struct cookie_collect paged;
+		uint64_t cursor = 0;
+		unsigned pages = 0;
+
+		memset(&paged, 0, sizeof(paged));
+		for (;;) {
+			struct cookie_collect one;
+
+			memset(&one, 0, sizeof(one));
+			ASSERT_EQ(mds_cat_ns_readdir_plus_from_cookie(
+					  cat, MDS_FILEID_ROOT, cursor, 1, NULL,
+					  cookie_collect_plus_cb, &one),
+				  MDS_OK);
+			if (one.count == 0) {
+				break;
+			}
+			ASSERT_EQ(one.count, (uint32_t)1);
+			ASSERT_TRUE(one.cookie[0] > cursor);
+			ASSERT_TRUE(paged.count < READDIR_PLUS_MAX);
+			paged.fileid[paged.count] = one.fileid[0];
+			paged.cookie[paged.count] = one.cookie[0];
+			snprintf(paged.name[paged.count],
+				 sizeof(paged.name[0]), "%s", one.name[0]);
+			paged.count++;
+			cursor = one.cookie[0];
+			pages++;
+			ASSERT_TRUE(pages <= 4);
+		}
+		ASSERT_EQ(pages, 3U);
+		ASSERT_TRUE(cookies_valid(&paged));
+		ASSERT_TRUE(names_once(&paged));
+		ASSERT_TRUE(cookies_agree(&plain, &paged));
+	}
+
+	/* Resume after the middle entry: exactly the strictly-greater one. */
+	memset(&got, 0, sizeof(got));
+	ASSERT_EQ(mds_cat_ns_readdir_plus_from_cookie(cat, MDS_FILEID_ROOT,
+						      mid_cookie, 0, NULL,
+						      cookie_collect_plus_cb,
+						      &got),
+		  MDS_OK);
+	ASSERT_EQ(got.count, (uint32_t)1);
+	ASSERT_EQ(got.cookie[0], last_cookie);
+
+	/* Resume after the last entry: drained. */
+	memset(&got, 0, sizeof(got));
+	ASSERT_EQ(mds_cat_ns_readdir_plus_from_cookie(cat, MDS_FILEID_ROOT,
+						      last_cookie, 0, NULL,
+						      cookie_collect_plus_cb,
+						      &got),
+		  MDS_OK);
+	ASSERT_EQ(got.count, (uint32_t)0);
+
+	close_test_cat(cat, path);
+}
+
+/* -----------------------------------------------------------------------
  * 5c. test_catalogue_stripe_map_wide -- Phase A foundation check
  *
  * Verifies that the catalogue can store and retrieve stripe maps at the
@@ -974,17 +1208,14 @@ static void test_catalogue_recovery_put_get_del(void)
  * 8. test_catalogue_txn_commit -- txn begin / commit visibility
  *
  * The original test also exercised the abort path ("create in txn,
- * abort, verify the entry is NOT visible").  That assertion only
- * holds against a backend that implements true transactional
- * rollback -- the production RonDB backend does, but the in-memory
- * test backend (tests/catalogue_memdb.c) writes immediately on
- * mds_cat_ns_create and discards the txn handle.  The abort
- * assertion was therefore testing the BACKEND's transactional
- * semantics, not the catalogue dispatch contract.  Rather than
- * teach memdb how to roll back (significant work for no production
- * coverage), this test now only validates the commit path; the
- * RonDB-backed integration suites cover the abort path against the
- * real transactional backend.
+ * abort, verify the entry is NOT visible").  That assertion described
+ * a rollback no backend provides: struct mds_cat_txn is a grouping
+ * context (contract C6, catalogue_internal.h / mds_catalogue.h) --
+ * every operation is committed by the backend on its own and abort
+ * only frees the token, on RonDB and memdb alike.  This test keeps the
+ * commit path; the conformance suite (tests/catalogue_conformance/
+ * test_token_semantics.c) pins the abort semantics positively (the
+ * create survives the abort) on every backend.
  * ----------------------------------------------------------------------- */
 
 static void test_catalogue_txn_commit_abort(void)
@@ -1303,12 +1534,85 @@ static void test_catalogue_ns_rename_keep_orphan(void)
 }
 
 /* -----------------------------------------------------------------------
+ * test_catalogue_memdb_identity_and_capabilities
+ *
+ * The in-memory backend must report its own identity (no longer
+ * impersonating RonDB), expose no native handle, advertise the shared-
+ * authority capability the cross-subtree rename path relies on, and
+ * degrade every optional slot it does not implement to NOSUPPORT with
+ * the documented out-param state -- exactly what a third backend that
+ * skips the fused fast paths would see.
+ * ----------------------------------------------------------------------- */
+
+static void test_catalogue_memdb_identity_and_capabilities(void)
+{
+	struct mds_catalogue *cat;
+	struct nfs4_stateid sid;
+	struct mds_inode out;
+	struct mds_ds_map_entry entry;
+	struct mds_ds_map_entry *entries;
+	uint32_t sc = 1, su = 1, mc = 1;
+	bool layout_ok = true;
+	uint32_t pop_unit = 1;
+	char *path;
+
+	cat = open_test_cat(&path);
+
+	ASSERT_EQ(mds_catalogue_backend_type(cat), MDS_BACKEND_MEMDB);
+	ASSERT_EQ(mds_catalogue_backend_handle(cat) == NULL, 1);
+	ASSERT_TRUE(mds_catalogue_shared_authority(cat));
+
+	/* No schema to bootstrap. */
+	ASSERT_EQ(mds_catalogue_bootstrap_supported(cat), false);
+	ASSERT_EQ(mds_catalogue_bootstrap(cat), MDS_ERR_NOSUPPORT);
+
+	/* Fused fast paths absent: callers fall back to the split ops. */
+	memset(&sid, 0, sizeof(sid));
+	ASSERT_EQ(mds_coord_layoutget_fused_supported(cat), false);
+	entries = &entry;
+	ASSERT_EQ(mds_coord_layoutget_fused(cat, MDS_FILEID_ROOT, &sc, &su,
+					    &mc, &entries, &sid, 1, 2, 0,
+					    UINT64_MAX, 1),
+		  MDS_ERR_NOSUPPORT);
+	ASSERT_EQ(entries == NULL, 1);
+
+	ASSERT_EQ(mds_cat_ns_create_with_layout_supported(cat), false);
+	memset(&entry, 0xFF, sizeof(entry));
+	ASSERT_EQ(mds_cat_ns_create_with_layout(cat, MDS_FILEID_ROOT,
+						"fused", MDS_FTYPE_REG,
+						0644, 0, 0, NULL, &out,
+						1, 2, 0, UINT64_MAX, &sid, 1,
+						&layout_ok, &entry, &pop_unit),
+		  MDS_ERR_NOSUPPORT);
+	ASSERT_EQ(layout_ok, false);
+	ASSERT_EQ(pop_unit, (uint32_t)0);
+	ASSERT_EQ(entry.nfs_fh_len, (uint32_t)0);
+	/* And nothing was created behind the NOSUPPORT. */
+	ASSERT_EQ(mds_cat_ns_lookup(cat, MDS_FILEID_ROOT, "fused", &out),
+		  MDS_ERR_NOTFOUND);
+
+	/* memdb populates the open/lock/deleg slots (as stubs), so the
+	 * daemon wires write-through and the tables see NOSUPPORT /
+	 * OK from the individual rows -- the documented "nothing to
+	 * persist" outcome. */
+	ASSERT_TRUE(mds_coord_shared_state_supported(cat));
+
+	/* An in-process store is never a multi-process cluster store,
+	 * whatever cluster slots it may grow for in-process tests: the
+	 * daemon must refuse cluster_size > 1 on it by construction. */
+	ASSERT_EQ(mds_cluster_supported(cat), false);
+
+	close_test_cat(cat, path);
+}
+
+/* -----------------------------------------------------------------------
  * Main
  * ----------------------------------------------------------------------- */
 
 int main(void)
 {
-	fprintf(stdout, "test_catalogue:\n");
+	fprintf(stdout, "test_catalogue (backend=%s):\n",
+		conformance_backend_name());
 
 	RUN_TEST(test_catalogue_open_close);
 	RUN_TEST(test_catalogue_ns_create_lookup);
@@ -1320,6 +1624,7 @@ int main(void)
 	RUN_TEST(test_catalogue_ns_readdir_plus_start_after);
 	RUN_TEST(test_catalogue_ns_readdir_max_entries);
 	RUN_TEST(test_catalogue_dirent_name_for_child);
+	RUN_TEST(test_catalogue_readdir_cookie_contract);
 	RUN_TEST(test_catalogue_dirent_insert_only);
 	RUN_TEST(test_catalogue_ns_rename_keep_orphan);
 	RUN_TEST(test_catalogue_stripe_map_wide_round_trip);
@@ -1330,6 +1635,11 @@ int main(void)
 	RUN_TEST(test_catalogue_recovery_put_get_del);
 	RUN_TEST(test_catalogue_txn_commit_abort);
 	RUN_TEST(test_catalogue_escape_hatch);
+	/* Identity assertions are about the in-memory backend itself; on
+	 * any other backend the harness selects they would test nothing. */
+	if (conformance_backend_is("memdb")) {
+		RUN_TEST(test_catalogue_memdb_identity_and_capabilities);
+	}
 	/* test_catalogue_shard_routing_guard and
 	 * test_catalogue_root_global_helper_routing retired -- see
 	 * comment at the function definitions. */

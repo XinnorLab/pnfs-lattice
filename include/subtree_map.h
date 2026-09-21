@@ -90,61 +90,74 @@ enum mds_status subtree_map_init(const char *etcd_endpoints,
 struct mds_catalogue;
 
 /**
- * @brief Initialise the subtree map from RonDB partition_map.
+ * @brief Initialise the subtree map from the catalogue's partition map.
  *
- * Loads subtree entries from mds_partition_map NDB table.  No etcd.
+ * Loads subtree entries through mds_cluster_partition_list() (the
+ * backend-neutral cluster service, mds_cluster.h).  When the map has
+ * no root entry afterwards, "/" is seeded as owned by @p self_id and
+ * written back with mds_cluster_partition_put(); a failed list is
+ * currently treated as an empty map (logged as a warning), which is
+ * the behaviour carried over from the RonDB-specific initialiser until
+ * the cluster-services contract replaces it.
  *
- * @param cat             Catalogue handle (RonDB backend).
+ * @param cat             Catalogue handle whose backend populates the
+ *                        partition_list / partition_put cluster slots
+ *                        (see mds_cluster_supported()).
  * @param self_id         This MDS node's ID.
  * @param self_hostname   This node's hostname (for referrals).
- * @param[out] map        Receives the map handle.
- * @return MDS_OK on success.
+ * @param[out] out        Receives the map handle.
+ * @return MDS_OK on success, MDS_ERR_INVAL for NULL arguments,
+ *         MDS_ERR_NOMEM.
  */
-enum mds_status subtree_map_init_rondb(struct mds_catalogue *cat,
-                                      uint32_t self_id,
-                                      const char *self_hostname,
-                                      struct subtree_map **out);
+enum mds_status subtree_map_init_from_catalogue(struct mds_catalogue *cat,
+                                                uint32_t self_id,
+                                                const char *self_hostname,
+                                                struct subtree_map **out);
 
 /**
- * @brief Refresh the subtree map from RonDB partition_map.
+ * @brief Refresh the subtree map from the catalogue's partition map.
  *
- * Re-reads all entries from the partition_map table and upserts
- * them into the local cache.  New entries are added, changed
- * owners are updated.  Safe to call from background threads.
+ * Re-reads all entries via mds_cluster_partition_list() and upserts
+ * them into the local cache.  New entries are added, changed owners
+ * are updated.  Safe to call from background threads.
  *
- * @param map  Subtree map (must have been init'd with _rondb).
- * @param cat  Catalogue handle (must be RonDB backend).
- * @return MDS_OK on success.
+ * @param map  Subtree map (from either init path).
+ * @param cat  Catalogue handle with the partition_list cluster slot.
+ * @return MDS_OK on success, MDS_ERR_INVAL for NULL arguments, or the
+ *         dispatcher's status unchanged (MDS_ERR_NOSUPPORT when the
+ *         backend has no partition map).
  */
-enum mds_status subtree_map_refresh_rondb(struct subtree_map *map,
-                                          struct mds_catalogue *cat);
+enum mds_status subtree_map_refresh_from_catalogue(struct subtree_map *map,
+                                                   struct mds_catalogue *cat);
 
 /**
  * @brief Seed /shardN partition rows for a multi-MDS cluster.
  *
  * When @p cluster_size > 1 and the map still has only the root entry
- * (fresh RonDB install, or a prior release that never persisted shards),
+ * (fresh install, or a prior release that never persisted shards),
  * register `/shard1` .. `/shard{N}` owned by MDS 1..N in the in-memory
- * map **and** upsert the same rows into RonDB `mds_partition_map` so
- * subsequent restarts load them instead of re-seeding from scratch.
+ * map **and** upsert the same rows into the catalogue's partition map
+ * (mds_cluster_partition_put with insert_only == false) so subsequent
+ * restarts load them instead of re-seeding from scratch.
  *
- * Idempotent: existing in-memory paths are left alone; RonDB puts use
- * write-tuple upsert.  @p partition_id for `/shardK` is K (root uses 0).
+ * Idempotent: existing in-memory paths are left alone; the puts are
+ * upserts because the initial shard layout is never-owned.
+ * @p partition_id for `/shardK` is K (root uses 0).
  *
  * Must run before @c subtree_map_set_membership — remote MDS IDs in the
  * seed are not yet membership-joined.
  *
- * @param map           Subtree map from @c subtree_map_init_rondb.
- * @param cat           RonDB catalogue handle.
+ * @param map           Subtree map from @c subtree_map_init_from_catalogue.
+ * @param cat           Catalogue handle with the partition_put slot.
  * @param cluster_size  Configured MDS count (number of /shardN rows).
  * @param peer_hosts    Optional IB/hostname list (index 0 = MDS 1); may
  *                      be NULL.  Used only to register referral nodes.
  * @param peer_count    Length of @p peer_hosts.
- * @return MDS_OK if every shard was added or already present (RonDB
- *         persist failures are logged as warnings but do not fail the
- *         call — the in-memory seed still enables referrals this boot).
+ * @return MDS_OK if every shard was added or already present (persist
+ *         failures are logged as warnings but do not fail the call —
+ *         the in-memory seed still enables referrals this boot).
  */
-enum mds_status subtree_map_seed_shards_rondb(
+enum mds_status subtree_map_seed_shards(
 	struct subtree_map *map,
 	struct mds_catalogue *cat,
 	uint32_t cluster_size,

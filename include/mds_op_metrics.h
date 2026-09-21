@@ -177,8 +177,7 @@ void mds_cat_op_observe(enum mds_cat_op c, uint64_t ns);
 
 /** CLOCK_MONOTONIC reading, ns resolution.  Cheap helper that callers
  * outside catalogue_dispatch.c use to time isolated catalogue-class
- * calls (e.g. the direct catalogue_rondb_layoutget_fused entry from
- * compound_layout.c, which bypasses the vtable). */
+ * code regions (see MDS_TIME_CAT_OP below). */
 uint64_t mds_op_metrics_now_ns(void);
 
 /* Inline timing macro for ad-hoc probes outside catalogue_dispatch.c.

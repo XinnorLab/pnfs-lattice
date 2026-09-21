@@ -525,8 +525,21 @@ enum mds_workload_profile {
  * Catalogue backend selection
  * ----------------------------------------------------------------------- */
 
+/*
+ * Values are appended, never renumbered: the enum is logged as %d and
+ * compared against config, but never serialised.  MDS_BACKEND_NONE is
+ * what mds_catalogue_backend_type() reports for a NULL handle; it is
+ * not a selectable backend.
+ */
 enum mds_catalogue_backend {
     MDS_BACKEND_RONDB   = 0,  /**< Production: RonDB / NDB Cluster (distributed). */
+    MDS_BACKEND_MEMDB   = 1,  /**< In-memory reference backend
+                               *   (src/catalogue/catalogue_memdb.c); selectable
+                               *   via `catalogue_backend = memdb`.  Non-durable,
+                               *   single node, bounded capacity. */
+    MDS_BACKEND_FDB     = 2,  /**< FoundationDB backend (reserved; not yet built). */
+    MDS_BACKEND_NONE    = 3,  /**< No catalogue: NULL handle sentinel, never
+                               *   selectable. */
 };
 
 /* -----------------------------------------------------------------------

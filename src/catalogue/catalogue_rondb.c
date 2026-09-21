@@ -60,6 +60,16 @@ struct mds_rondb_state {
 	uint32_t                poller_self_mds_id;
 };
 
+/* The backend-neutral partition states (mds_cluster.h) ARE the RonDB
+ * column encoding: a map written through either name must read back
+ * identically. */
+_Static_assert(MDS_PARTITION_STATE_ACTIVE == RONDB_PM_STATE_ACTIVE,
+	       "partition state ACTIVE encoding differs from RonDB");
+_Static_assert(MDS_PARTITION_STATE_MIGRATING == RONDB_PM_STATE_MIGRATING,
+	       "partition state MIGRATING encoding differs from RonDB");
+_Static_assert(MDS_PARTITION_STATE_FROZEN == RONDB_PM_STATE_FROZEN,
+	       "partition state FROZEN encoding differs from RonDB");
+
 /** Persist the changefeed seqno counter every N mutations. */
 #define DELTA_PERSIST_INTERVAL 64
 
@@ -95,13 +105,31 @@ static void rondb_transient_note_exhausted(int rc)
 
 static void catalogue_rondb_close_backend(struct mds_catalogue *cat);
 
-/* Override the weak default from catalogue_dispatch.c. */
-void *mds_catalogue_backend_handle(const struct mds_catalogue *cat)
+/*
+ * Typed access to the backend-private state.
+ *
+ * backend_private is a void* owned by whichever backend opened the
+ * handle, so the cast is only valid when the handle really is ours.
+ * Checking cat->backend first turns a foreign handle (in-memory test
+ * backend, or any future backend linked into the same binary) into a
+ * NULL that every wrapper below already maps to MDS_ERR_INVAL /
+ * MDS_ERR_NOSUPPORT, instead of a type-confused read.
+ */
+static struct mds_rondb_state *rondb_state(const struct mds_catalogue *cat)
 {
-    if (cat == NULL || cat->backend_private == NULL) {
+    if (cat == NULL || cat->backend != MDS_BACKEND_RONDB ||
+        cat->backend_private == NULL) {
         return NULL;
     }
-    return ((struct mds_rondb_state *)cat->backend_private)->handle;
+    return (struct mds_rondb_state *)cat->backend_private;
+}
+
+/* Lifecycle slot: the NDB shim handle for RonDB-specific tools. */
+static void *catalogue_rondb_backend_handle(const struct mds_catalogue *cat)
+{
+    struct mds_rondb_state *state = rondb_state(cat);
+
+    return (state != NULL) ? state->handle : NULL;
 }
 
 /* This MDS's id, used to tag/partition per-MDS catalogue rows (e.g. the
@@ -109,10 +137,9 @@ void *mds_catalogue_backend_handle(const struct mds_catalogue *cat)
  * "unpartitioned" (drain everything). */
 static uint32_t rondb_self_mds_id(struct mds_catalogue *cat)
 {
-    if (cat == NULL || cat->backend_private == NULL) {
-        return 0U;
-    }
-    return ((struct mds_rondb_state *)cat->backend_private)->mds_id;
+    struct mds_rondb_state *state = rondb_state(cat);
+
+    return (state != NULL) ? state->mds_id : 0U;
 }
 static enum mds_status catalogue_rondb_probe_backend(struct mds_catalogue *cat);
 
@@ -120,10 +147,23 @@ static enum mds_status catalogue_rondb_probe_backend(struct mds_catalogue *cat);
 static const struct mds_authority_ops rondb_authority_ops;
 static const struct mds_authority_ops rondb_locked_authority_ops;
 static const struct mds_coordination_ops rondb_coordination_ops;
+static const struct mds_cluster_ops rondb_cluster_ops;
+
+/* Lifecycle slot adapter for the changefeed poller (defined next to
+ * catalogue_rondb_poller_start). */
+static enum mds_status rondb_image_feed_start(struct mds_catalogue *cat,
+                                              struct catalog_image *img,
+                                              uint32_t self_mds_id,
+                                              uint32_t poll_interval_ms);
 
 static const struct mds_catalogue_ops catalogue_rondb_ops = {
-    .close = catalogue_rondb_close_backend,
-    .probe = catalogue_rondb_probe_backend,
+    .close            = catalogue_rondb_close_backend,
+    .probe            = catalogue_rondb_probe_backend,
+    .bootstrap        = mds_rondb_bootstrap,
+    .backend_handle   = catalogue_rondb_backend_handle,
+    /* Changefeed poller feeding a catalog_image (image mode). */
+    .image_feed_start = rondb_image_feed_start,
+    .image_feed_stop  = catalogue_rondb_poller_stop,
 };
 
 
@@ -224,6 +264,15 @@ enum mds_status catalogue_rondb_open(const struct mds_config *cfg,
             "RonDB-native replay journal exists");
         return MDS_ERR_INVAL;
     }
+    /* Backend-specific config validation belongs to the backend: the
+     * RonDB inode row has no inline payload column, so inline data
+     * cannot be served from this store. */
+    if (cfg->inline_enabled) {
+        MDS_LOG_ERROR(LOG_COMP_CAT,
+            "catalogue_backend=rondb requires "
+            "inline_enabled=false.");
+        return MDS_ERR_INVAL;
+    }
     if (cfg->catalogue_backend_conf[0] == '\0') {
         MDS_LOG_ERROR(LOG_COMP_CAT,
             "catalogue_backend=rondb requires "
@@ -278,8 +327,13 @@ enum mds_status catalogue_rondb_open(const struct mds_config *cfg,
         cfg->ndb_async_writes ? "true" : "false");
 
 	cat->backend = MDS_BACKEND_RONDB;
+	/* One NDB cluster is the single authority for every MDS node, and
+	 * it is reachable from every MDS process (registry / heartbeat /
+	 * partition rows written by one daemon are seen by the others). */
+	cat->caps = MDS_CAT_CAP_SHARED_AUTHORITY | MDS_CAT_CAP_MULTI_PROCESS;
 	cat->ops = &catalogue_rondb_ops;
 	cat->coord_ops = &rondb_coordination_ops;
+	cat->cluster_ops = &rondb_cluster_ops;
 	cat->backend_private = state;
 
 	/* Phase 9B: multi-MDS config. */
@@ -353,27 +407,21 @@ static void catalogue_rondb_close_backend(struct mds_catalogue *cat)
 
 static enum mds_status catalogue_rondb_probe_backend(struct mds_catalogue *cat)
 {
-    struct mds_rondb_state *state;
+    struct mds_rondb_state *state = rondb_state(cat);
 
-    if (cat == NULL || cat->backend != MDS_BACKEND_RONDB ||
-        cat->backend_private == NULL) {
+    if (state == NULL) {
         return MDS_ERR_INVAL;
     }
-
-    state = cat->backend_private;
     return rondb_shim_probe(state->handle) == 0 ? MDS_OK : MDS_ERR_IO;
 }
 
 enum mds_status mds_rondb_bootstrap(struct mds_catalogue *cat)
 {
-	struct mds_rondb_state *state;
+	struct mds_rondb_state *state = rondb_state(cat);
 
-	if (cat == NULL || cat->backend != MDS_BACKEND_RONDB ||
-	    cat->backend_private == NULL) {
+	if (state == NULL) {
 		return MDS_ERR_INVAL;
 	}
-
-	state = cat->backend_private;
 
 	/* Bootstrap metadata tables (all 8) + seed rows. */
 	if (rondb_shim_bootstrap_metadata(state->handle,
@@ -392,14 +440,11 @@ enum mds_status mds_rondb_bootstrap(struct mds_catalogue *cat)
 
 enum mds_status mds_rondb_cleanup(struct mds_catalogue *cat)
 {
-	struct mds_rondb_state *state;
+	struct mds_rondb_state *state = rondb_state(cat);
 
-	if (cat == NULL || cat->backend != MDS_BACKEND_RONDB ||
-	    cat->backend_private == NULL) {
+	if (state == NULL) {
 		return MDS_ERR_INVAL;
 	}
-
-	state = cat->backend_private;
 
 	/* Drop metadata tables first, then legacy probe table. */
 	(void)rondb_shim_cleanup_metadata(state->handle,
@@ -419,13 +464,9 @@ enum mds_status mds_rondb_cleanup(struct mds_catalogue *cat)
 
 static void *rondb_handle(const struct mds_catalogue *cat)
 {
-	struct mds_rondb_state *state;
+	struct mds_rondb_state *state = rondb_state(cat);
 
-	if (cat == NULL || cat->backend_private == NULL) {
-		return NULL;
-	}
-	state = cat->backend_private;
-	return state->handle;
+	return (state != NULL) ? state->handle : NULL;
 }
 
 /*
@@ -1492,6 +1533,9 @@ static int rondb_readdir_shim_cb(uint64_t child_fid, uint8_t child_type,
 
 	memset(&ent, 0, sizeof(ent));
 	ent.fileid = child_fid;
+	/* RonDB cookie = child fileid (see ns_readdir_plus_from in
+	 * catalogue_internal.h for the hard-link caveat). */
+	ent.cookie = child_fid;
 	ent.type = child_type;
 	if (name_len > MDS_MAX_NAME) {
 		name_len = MDS_MAX_NAME;
@@ -1584,6 +1628,9 @@ static int rondb_readdir_plus_shim_cb(uint64_t child_fid,
 
 	memset(&ent, 0, sizeof(ent));
 	ent.fileid = child_fid;
+	/* RonDB cookie = child fileid; ns_readdir_plus_from resumes over
+	 * ix_dirents_parent_child in this same order. */
+	ent.cookie = child_fid;
 	ent.type = child_type;
 	if (name_len > MDS_MAX_NAME) {
 		name_len = MDS_MAX_NAME;
@@ -2729,8 +2776,11 @@ static enum mds_status catalogue_rondb_layout_grant_union(
 /**
  * Phase 2: Fused stripe_get + layout_grant in one NDB txn.
  * Saves 1 NDB round-trip compared to separate calls.
+ *
+ * Coordination vtable slot (layoutget_fused); reached only through
+ * mds_coord_layoutget_fused().
  */
-enum mds_status catalogue_rondb_layoutget_fused(
+static enum mds_status catalogue_rondb_layoutget_fused(
 	struct mds_catalogue *cat, uint64_t fileid,
 	uint32_t *stripe_count, uint32_t *stripe_unit,
 	uint32_t *mirror_count, struct mds_ds_map_entry **entries,
@@ -2825,8 +2875,11 @@ enum mds_status catalogue_rondb_layoutget_fused(
  * stripe + layout_state + layout indexes all in one NDB transaction
  * (NoCommit flush + Commit = 2 NDB internal RTs, but 1 user-visible
  * wall-clock NDB transaction).  LAYOUTGET becomes 0 NDB RTs.
+ *
+ * Authority vtable slot (ns_create_with_layout); reached only through
+ * mds_cat_ns_create_with_layout().
  */
-enum mds_status catalogue_rondb_ns_create_with_layout(
+static enum mds_status catalogue_rondb_ns_create_with_layout(
 	struct mds_catalogue *cat,
 	uint64_t parent_fileid,
 	const char *name,
@@ -3656,14 +3709,6 @@ static enum mds_status rondb_auth_ds_del(
  * On contention (acquire returns 1), return MDS_ERR_DELAY.
  * ----------------------------------------------------------------------- */
 
-static struct mds_rondb_state *rondb_state(const struct mds_catalogue *cat)
-{
-    if (cat == NULL || cat->backend_private == NULL) {
-        return NULL;
-    }
-    return (struct mds_rondb_state *)cat->backend_private;
-}
-
 /** Acquire a single lock.  Returns MDS_OK, MDS_ERR_DELAY, or MDS_ERR_IO. */
 static enum mds_status rondb_lock_one(
     void *h, const struct mds_rondb_state *st,
@@ -4095,6 +4140,23 @@ void catalogue_rondb_poller_stop(struct mds_catalogue *cat)
     st->poller_image = NULL;
 }
 
+/* image_feed_start lifecycle slot: the poller keeps its int contract
+ * (0 / -1); the slot reports a status like every other slot.  The
+ * poller's only failure modes are a missing handle/image (INVAL) and
+ * pthread_create failing, so -1 with valid arguments is an IO error. */
+static enum mds_status rondb_image_feed_start(struct mds_catalogue *cat,
+                                              struct catalog_image *img,
+                                              uint32_t self_mds_id,
+                                              uint32_t poll_interval_ms)
+{
+    if (cat == NULL || img == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    return catalogue_rondb_poller_start(cat, img, self_mds_id,
+                                        poll_interval_ms) == 0
+           ? MDS_OK : MDS_ERR_IO;
+}
+
 /* -----------------------------------------------------------------------
  * Phase 8B -- RonDB authority vtable (single-MDS, no locking)
  * ----------------------------------------------------------------------- */
@@ -4102,6 +4164,7 @@ void catalogue_rondb_poller_stop(struct mds_catalogue *cat)
 static const struct mds_authority_ops rondb_authority_ops = {
 	.ns_create         = rondb_auth_ns_create,
 	.ns_create_wide    = rondb_auth_ns_create_wide,
+	.ns_create_with_layout = catalogue_rondb_ns_create_with_layout,
 	.ns_remove         = rondb_auth_ns_remove,
 	.ns_remove_known   = rondb_auth_ns_remove_known,
 	.ns_remove_known_gc = rondb_auth_ns_remove_known_gc,
@@ -4207,6 +4270,7 @@ static const struct mds_authority_ops rondb_authority_ops = {
 static const struct mds_authority_ops rondb_locked_authority_ops = {
 	.ns_create         = rondb_auth_ns_create,
 	.ns_create_wide    = rondb_auth_ns_create_wide,
+	.ns_create_with_layout = catalogue_rondb_ns_create_with_layout,
 	.ns_remove         = rondb_auth_ns_remove,
 	.ns_remove_known   = rondb_auth_ns_remove_known,
 	.ns_remove_known_gc = rondb_auth_ns_remove_known_gc,
@@ -4488,6 +4552,7 @@ static const struct mds_coordination_ops rondb_coordination_ops = {
 	.journal_scan            = catalogue_rondb_journal_scan,
 	.layout_grant            = catalogue_rondb_layout_grant,
 	.layout_grant_union      = catalogue_rondb_layout_grant_union,
+	.layoutget_fused         = catalogue_rondb_layoutget_fused,
 	.layout_return           = catalogue_rondb_layout_return,
 	.layout_get_by_stateid   = catalogue_rondb_layout_get_by_stateid,
 	.layout_scan_for_file    = catalogue_rondb_layout_scan_for_file,
@@ -4527,15 +4592,21 @@ static const struct mds_coordination_ops rondb_coordination_ops = {
 };
 
 /* -----------------------------------------------------------------------
- * Phase 9A -- Node registry C wrappers
+ * Phase 9A -- Node registry cluster slots (struct mds_cluster_ops)
+ *
+ * Reached only through the mds_cluster_* dispatchers.  The mds_cluster_*
+ * callback typedefs have exactly the shapes of the shim's rondb_*_cb
+ * typedefs, so the callback pointers are forwarded without a cast: any
+ * future drift between the two is an incompatible-pointer-type error
+ * under -Werror rather than a silent ABI mismatch.
  * ----------------------------------------------------------------------- */
 
-enum mds_status catalogue_rondb_mds_register(struct mds_catalogue *cat,
-                                             uint32_t mds_id,
-                                             uint64_t boot_epoch,
-                                             const char *hostname,
-                                             uint16_t nfs_port,
-                                             uint16_t grpc_port)
+static enum mds_status rondb_cluster_node_register(struct mds_catalogue *cat,
+                                                   uint32_t mds_id,
+                                                   uint64_t boot_epoch,
+                                                   const char *hostname,
+                                                   uint16_t nfs_port,
+                                                   uint16_t grpc_port)
 {
     void *h = rondb_handle(cat);
 
@@ -4547,9 +4618,9 @@ enum mds_status catalogue_rondb_mds_register(struct mds_catalogue *cat,
            ? MDS_OK : MDS_ERR_IO;
 }
 
-enum mds_status catalogue_rondb_mds_heartbeat(struct mds_catalogue *cat,
-                                              uint32_t mds_id,
-                                              uint64_t boot_epoch)
+static enum mds_status rondb_cluster_node_heartbeat(struct mds_catalogue *cat,
+                                                    uint32_t mds_id,
+                                                    uint64_t boot_epoch)
 {
     void *h = rondb_handle(cat);
 
@@ -4561,11 +4632,18 @@ enum mds_status catalogue_rondb_mds_heartbeat(struct mds_catalogue *cat,
     return rc == 0 ? MDS_OK : MDS_ERR_IO;
 }
 
-enum mds_status catalogue_rondb_mds_deregister(struct mds_catalogue *cat,
-                                               uint32_t mds_id)
+/* boot_epoch is accepted but not yet honoured: the row is deleted by
+ * mds_id alone (documented deviation in mds_cluster.h).  The
+ * epoch-matching conditional delete of the target contract is a
+ * separately reviewed RonDB change (Phase 1b); the parameter is in the
+ * slot signature now so that change needs no interface change. */
+static enum mds_status rondb_cluster_node_deregister(struct mds_catalogue *cat,
+                                                     uint32_t mds_id,
+                                                     uint64_t boot_epoch)
 {
     void *h = rondb_handle(cat);
 
+    (void)boot_epoch;
     if (h == NULL) {
         return MDS_ERR_INVAL;
     }
@@ -4573,10 +4651,10 @@ enum mds_status catalogue_rondb_mds_deregister(struct mds_catalogue *cat,
            ? MDS_OK : MDS_ERR_IO;
 }
 
-enum mds_status catalogue_rondb_mds_scan_stale(
+static enum mds_status rondb_cluster_node_scan_stale(
     struct mds_catalogue *cat,
     uint64_t threshold_ns,
-    rondb_stale_node_cb cb, void *ctx)
+    mds_cluster_stale_cb cb, void *ctx)
 {
     void *h = rondb_handle(cat);
 
@@ -4633,11 +4711,11 @@ enum mds_status catalogue_rondb_lock_reap_by_owner(
 }
 
 /* -----------------------------------------------------------------------
- * Partition map C wrappers
+ * Partition map cluster slots (struct mds_cluster_ops)
  * ----------------------------------------------------------------------- */
 
-enum mds_status catalogue_rondb_partition_map_list(
-    struct mds_catalogue *cat, rondb_partition_map_cb cb, void *ctx)
+static enum mds_status rondb_cluster_partition_list(
+    struct mds_catalogue *cat, mds_cluster_partition_cb cb, void *ctx)
 {
     void *h = rondb_handle(cat);
 
@@ -4648,12 +4726,20 @@ enum mds_status catalogue_rondb_partition_map_list(
            ? MDS_OK : MDS_ERR_IO;
 }
 
-enum mds_status catalogue_rondb_partition_map_put(
+/* insert_only is accepted but not yet honoured: the shim's
+ * partition_map_put is an unconditional writeTuple upsert (documented
+ * deviation in mds_cluster.h).  The insert-only root claim of the
+ * target contract is a separately reviewed RonDB change (Phase 1b);
+ * the flag is in the slot signature now so that change needs no
+ * interface change. */
+static enum mds_status rondb_cluster_partition_put(
     struct mds_catalogue *cat, uint32_t partition_id,
-    uint32_t owner_mds_id, uint8_t state, const char *subtree_path)
+    uint32_t owner_mds_id, uint8_t state, const char *subtree_path,
+    bool insert_only)
 {
     void *h = rondb_handle(cat);
 
+    (void)insert_only;
     if (h == NULL || subtree_path == NULL) {
         return MDS_ERR_INVAL;
     }
@@ -4683,11 +4769,11 @@ enum mds_status catalogue_rondb_partition_map_cas(
 }
 
 /* -----------------------------------------------------------------------
- * Node registry list C wrapper
+ * Node registry list cluster slot
  * ----------------------------------------------------------------------- */
 
-enum mds_status catalogue_rondb_mds_list(
-    struct mds_catalogue *cat, rondb_mds_list_cb cb, void *ctx)
+static enum mds_status rondb_cluster_node_list(
+    struct mds_catalogue *cat, mds_cluster_node_cb cb, void *ctx)
 {
     void *h = rondb_handle(cat);
 
@@ -4697,6 +4783,19 @@ enum mds_status catalogue_rondb_mds_list(
     return rondb_shim_mds_list(h, cb, ctx) == 0
            ? MDS_OK : MDS_ERR_IO;
 }
+
+/* Cluster services vtable.  Every slot is populated: RonDB is one
+ * cluster reachable from every MDS process (MDS_CAT_CAP_MULTI_PROCESS
+ * in catalogue_rondb_open), so mds_cluster_supported() is true. */
+static const struct mds_cluster_ops rondb_cluster_ops = {
+    .node_register   = rondb_cluster_node_register,
+    .node_heartbeat  = rondb_cluster_node_heartbeat,
+    .node_deregister = rondb_cluster_node_deregister,
+    .node_list       = rondb_cluster_node_list,
+    .node_scan_stale = rondb_cluster_node_scan_stale,
+    .partition_list  = rondb_cluster_partition_list,
+    .partition_put   = rondb_cluster_partition_put,
+};
 
 /* -----------------------------------------------------------------------
  * Metadata search scan C wrappers

@@ -66,9 +66,16 @@ struct rename_2pc_ctx {
  * Coordination journal dispatch helpers
  * ----------------------------------------------------------------------- */
 
-static bool rename_2pc_cat_is_rondb(const struct mds_catalogue *cat)
+/*
+ * Shared-authority catalogues (one store visible from every MDS) keep
+ * the inode in place and move only the dirent; the legacy path copies
+ * the inode to the participant and deletes it locally.  This is a
+ * property of the store, not of a particular backend, so ask the
+ * catalogue rather than testing its type.
+ */
+static bool rename_2pc_cat_shared_authority(const struct mds_catalogue *cat)
 {
-	return mds_catalogue_backend_type(cat) == MDS_BACKEND_RONDB;
+	return mds_catalogue_shared_authority(cat);
 }
 
 static uint64_t rename_2pc_payload_fileid(const struct rename_2pc_ctx *ctx)
@@ -343,9 +350,9 @@ enum mds_status rename_2pc_initiate(
 	if (vote == 1) {
 	    ctx.state = R2PC_COMMITTED;
 
-	    if (rename_2pc_cat_is_rondb(cat)) {
+	    if (rename_2pc_cat_shared_authority(cat)) {
 	        /*
-	         * RonDB shared-authority mode: keep the source visible until the
+	         * Shared-authority mode: keep the source visible until the
 	         * participant durably commits the destination dirent.  The inode
 	         * itself stays global/shared, so coordinator cleanup removes only
 	         * the source dirent after commit delivery succeeds.
@@ -623,7 +630,7 @@ enum mds_status rename_2pc_on_commit(struct mds_catalogue *cat,
 	const struct mds_inode *src_inode =
 	    (const struct mds_inode *)ctx.inode_data;
 
-	if (rename_2pc_cat_is_rondb(cat)) {
+	if (rename_2pc_cat_shared_authority(cat)) {
 	    uint64_t existing = 0;
 	    uint8_t existing_type = 0;
 	    uint64_t fileid = rename_2pc_payload_fileid(&ctx);
