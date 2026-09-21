@@ -548,8 +548,35 @@ static int cleanup_collect_cb(const struct mds_cat_dirent *entry, void *arg)
     return 0;
 }
 
+/* Names of the leftovers the cleanup reports at most; the rest is a
+ * count. */
+#define CLEANUP_REPORT_NAMES 8
+
+/*
+ * Remove one entry of @dir_fid.  ns_remove refuses a raw dirent whose
+ * inode is already gone (tests insert such aliases with
+ * mds_cat_dirent_insert and then unlink the real name) on a backend
+ * that resolves the inode inside the remove: RonDB answers NOTFOUND
+ * from its lookup, a guarded remove STALE.  The dangling row itself is
+ * then dropped with mds_cat_dirent_del, so the scratch directory can
+ * be removed afterwards.  memdb and fdb remove such a dirent through
+ * ns_remove already; the fallback never runs there.
+ */
+static enum mds_status cleanup_remove_entry(struct mds_catalogue *cat,
+                                            uint64_t dir_fid,
+                                            const char *name)
+{
+    enum mds_status st = mds_cat_ns_remove(cat, NULL, dir_fid, name);
+
+    if (st == MDS_ERR_NOTFOUND || st == MDS_ERR_STALE) {
+        st = mds_cat_dirent_del(cat, NULL, dir_fid, name);
+    }
+    return st;
+}
+
 /* Remove every entry of @dir_fid; entries that are directories have
- * their own (one level of) entries removed first. */
+ * their own (one level of) entries removed first.  Teardown is best
+ * effort: an entry that stays is reported, never fatal. */
 static void cleanup_dir_entries(struct mds_catalogue *cat, uint64_t dir_fid,
                                 int depth)
 {
@@ -565,11 +592,45 @@ static void cleanup_dir_entries(struct mds_catalogue *cat, uint64_t dir_fid,
         return;
     }
     for (i = 0; i < page->count; i++) {
+        enum mds_status st;
+
         if (page->type[i] == (uint8_t)MDS_FTYPE_DIR && depth > 0) {
             cleanup_dir_entries(cat, page->fid[i], depth - 1);
         }
-        (void)mds_cat_ns_remove(cat, NULL, dir_fid, page->name[i]);
+        st = cleanup_remove_entry(cat, dir_fid, page->name[i]);
+        if (st != MDS_OK) {
+            (void)fprintf(stderr, "conformance: cleanup left '%s' (fileid %llu) "
+                          "in directory %llu: status %d\n", page->name[i],
+                          (unsigned long long)page->fid[i],
+                          (unsigned long long)dir_fid, (int)st);
+        }
     }
+    free(page);
+}
+
+/* Report what a scratch directory that could not be removed still
+ * holds: the first CLEANUP_REPORT_NAMES names and the total. */
+static void cleanup_report_leftovers(struct mds_catalogue *cat,
+                                     uint64_t dir_fid)
+{
+    struct cleanup_page *page = calloc(1, sizeof(*page));
+    uint32_t i;
+
+    if (page == NULL) {
+        return;
+    }
+    if (mds_cat_ns_readdir(cat, dir_fid, NULL, CLEANUP_PAGE, NULL,
+                           cleanup_collect_cb, page) != MDS_OK) {
+        free(page);
+        return;
+    }
+    (void)fprintf(stderr, "conformance: %u%s entr%s left in scratch directory "
+                  "%llu:", page->count, page->count >= CLEANUP_PAGE ? "+" : "",
+                  page->count == 1 ? "y" : "ies", (unsigned long long)dir_fid);
+    for (i = 0; i < page->count && i < CLEANUP_REPORT_NAMES; i++) {
+        (void)fprintf(stderr, " '%s'", page->name[i]);
+    }
+    (void)fprintf(stderr, "%s\n", page->count > CLEANUP_REPORT_NAMES ? " ..." : "");
     free(page);
 }
 
@@ -579,6 +640,7 @@ void conformance_scratch_cleanup(struct mds_catalogue *cat,
     char name[64];
     uint32_t i;
     bool found = false;
+    enum mds_status st;
 
     if (cat == NULL) {
         return;
@@ -604,7 +666,23 @@ void conformance_scratch_cleanup(struct mds_catalogue *cat,
     }
 
     cleanup_dir_entries(cat, dir_fid, 1);
-    if (found) {
-        (void)mds_cat_ns_remove(cat, NULL, MDS_FILEID_ROOT, name);
+    if (!found) {
+        struct mds_inode dir;
+
+        /* Silent when the directory itself is already gone (a test
+         * that removed it, or a second cleanup of the same fileid). */
+        if (mds_cat_ns_getattr(cat, dir_fid, &dir) == MDS_OK) {
+            (void)fprintf(stderr, "conformance: scratch directory %llu has no "
+                          "name under the root; not removed\n",
+                          (unsigned long long)dir_fid);
+        }
+        return;
+    }
+    st = cleanup_remove_entry(cat, MDS_FILEID_ROOT, name);
+    if (st != MDS_OK) {
+        (void)fprintf(stderr, "conformance: scratch directory '%s' (fileid %llu) "
+                      "not removed: status %d\n", name,
+                      (unsigned long long)dir_fid, (int)st);
+        cleanup_report_leftovers(cat, dir_fid);
     }
 }

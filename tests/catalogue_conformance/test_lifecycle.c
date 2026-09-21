@@ -89,7 +89,18 @@ static void test_open_close_cycles(int cycles)
                                      0644, 0, 0, NULL, &child), MDS_OK);
         CHECK_EQ(mds_cat_ns_lookup(cat, dir, "cycle", &seen), MDS_OK);
         CHECK_EQ(seen.fileid, child.fileid);
+        if (i == 0) {
+            /* A raw alias dirent whose inode is unlinked underneath it
+             * (what the catalogue unit tests leave behind): the cleanup
+             * must still take the scratch directory with it, or every
+             * run on a shared store leaks one directory. */
+            CHECK_EQ(mds_cat_dirent_insert(cat, NULL, dir, "alias",
+                                           child.fileid,
+                                           (uint8_t)MDS_FTYPE_REG), MDS_OK);
+            CHECK_EQ(mds_cat_ns_remove(cat, NULL, dir, "cycle"), MDS_OK);
+        }
         conformance_scratch_cleanup(cat, dir);
+        CHECK_EQ(mds_cat_ns_getattr(cat, dir, &seen), MDS_ERR_NOTFOUND);
         mds_catalogue_close(cat);
     }
     /* NULL is always safe. */

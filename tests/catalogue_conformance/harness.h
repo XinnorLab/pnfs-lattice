@@ -96,8 +96,11 @@ enum mds_status conformance_scratch_dir(struct mds_catalogue *cat,
 
 /**
  * Remove every entry of @p dir_fid (one level, files and empty
- * directories) and then @p dir_fid itself from the root.  Best effort;
- * used by tests that share a persistent store.
+ * directories) and then @p dir_fid itself from the root.  A raw dirent
+ * whose inode is already gone is dropped with mds_cat_dirent_del when
+ * ns_remove refuses it (NOTFOUND / STALE).  Best effort: anything that
+ * could not be removed is reported on stderr, never a failure; used by
+ * tests that share a persistent store.
  *
  * @param cat      Catalogue handle.
  * @param dir_fid  Directory created by conformance_scratch_dir().
