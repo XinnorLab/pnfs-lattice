@@ -53,6 +53,7 @@ static const struct fdb_txn_calls g_real_calls = {
     .transaction_set_option        = fdb_transaction_set_option,
     .transaction_set               = fdb_transaction_set,
     .transaction_get               = fdb_transaction_get,
+    .transaction_get_read_version  = fdb_transaction_get_read_version,
     .transaction_add_conflict_range = fdb_transaction_add_conflict_range,
     .transaction_commit            = fdb_transaction_commit,
     .transaction_on_error          = fdb_transaction_on_error,
@@ -441,20 +442,36 @@ static fdb_error_t witness_probe(const struct run_state *rs, FDBTransaction *tr2
     return err;
 }
 
-/* Fence in @p tr2 (which already holds the probe read): a WRITE
- * conflict range on the witness key, no mutation.  Committing it
- * intersects the in-flight attempt's READ conflict range, so the
- * attempt can no longer commit after this point. */
+/* Conflict range [K_f, K_f + 0x00) of @p type on the fence anchor of
+ * witness key @p wk.  The anchor is never mutated, so the read-your-
+ * writes layer forwards the range unchanged (see fdb_txn.h). */
+static fdb_error_t anchor_conflict_range(const struct run_state *rs, FDBTransaction *tr,
+                                         const struct fdb_key *wk, FDBConflictRangeType type)
+{
+    struct fdb_key fk;
+    struct fdb_key_range r;
+
+    fdb_key_witness_fence(&fk, wk);
+    if (!fdb_key_ok(&fk)) {
+        return FDB_ERR_PLATFORM_ERROR;
+    }
+    fdb_key_range_single(&r, &fk);
+    return rs->c->transaction_add_conflict_range(tr, r.begin.buf, (int)r.begin.len,
+                                                 r.end.buf, (int)r.end.len, type);
+}
+
+/* Fence in @p tr2 (which already holds the probe read of the witness
+ * key): a WRITE conflict range on the fence anchor, no mutation.
+ * Committing it intersects the in-flight attempt's READ conflict range
+ * on the anchor, so the attempt can no longer commit after this point;
+ * the probe's read of the witness key makes the fence itself abort
+ * (1020, re-probed) when the attempt landed in between. */
 static fdb_error_t fence_commit(const struct run_state *rs, FDBTransaction *tr2,
                                 const struct fdb_key *wk)
 {
-    struct fdb_key_range r;
     fdb_error_t err;
 
-    fdb_key_range_single(&r, wk);
-    err = rs->c->transaction_add_conflict_range(tr2, r.begin.buf, (int)r.begin.len,
-                                                r.end.buf, (int)r.end.len,
-                                                FDB_CONFLICT_RANGE_TYPE_WRITE);
+    err = anchor_conflict_range(rs, tr2, wk, FDB_CONFLICT_RANGE_TYPE_WRITE);
     if (err == 0) {
         err = commit_wait(rs, tr2);
     }
@@ -462,20 +479,40 @@ static fdb_error_t fence_commit(const struct run_state *rs, FDBTransaction *tr2,
     return err;
 }
 
+/* Replace *trp with a fresh transaction object.  Used after an error
+ * that leaves a commit possibly in flight on the old object: the old
+ * object stays owned by that commit (see fdb_txn.h), so the next round
+ * must not touch it.  False when the client cannot create one; *trp is
+ * NULL then and the caller stops. */
+static bool recreate_transaction(const struct run_state *rs, FDBTransaction **trp)
+{
+    rs->c->transaction_destroy(*trp);
+    *trp = NULL;
+    if (rs->c->create_transaction(rs->b->db, trp) != 0 || *trp == NULL) {
+        *trp = NULL;
+        return false;
+    }
+    return true;
+}
+
 /* A probe or fence round failed with @p err.  A conflict backs off
- * through on_error; a timeout, a cancel, a version change or an
- * unknown fence outcome just resets the transaction (the next round
- * re-probes, so a fence that did land is seen).  True when the round
- * may be repeated; false on a terminal error. */
-static bool resolve_round_retryable(const struct run_state *rs, FDBTransaction *tr2,
+ * through on_error; an unknown fence outcome (1021: nothing in flight)
+ * resets the transaction; a timeout, a cancel or a version change may
+ * leave the fence commit in flight, so the object is replaced.  The
+ * next round re-probes either way, so a fence that did land is seen.
+ * True when the round may be repeated; false on a terminal error. */
+static bool resolve_round_retryable(const struct run_state *rs, FDBTransaction **tr2p,
                                     fdb_error_t err)
 {
     if (is_retryable_abort(rs, err)) {
-        return back_off(rs, tr2, err) == 0;
+        return back_off(rs, *tr2p, err) == 0;
     }
-    if (is_maybe_in_flight(err) || err == FDB_ERR_COMMIT_UNKNOWN_RESULT) {
-        rs->c->transaction_reset(tr2);
+    if (err == FDB_ERR_COMMIT_UNKNOWN_RESULT) {
+        rs->c->transaction_reset(*tr2p);
         return true;
+    }
+    if (is_maybe_in_flight(err)) {
+        return recreate_transaction(rs, tr2p);
     }
     return false;
 }
@@ -512,11 +549,13 @@ static enum outcome resolve_outcome(const struct run_state *rs, const struct fdb
             out = saw ? OUTCOME_LANDED : OUTCOME_NOT_LANDED;
             break;
         }
-        if (!resolve_round_retryable(rs, tr2, err)) {
+        if (!resolve_round_retryable(rs, &tr2, err)) {
             break;
         }
     }
-    rs->c->transaction_destroy(tr2);
+    if (tr2 != NULL) {
+        rs->c->transaction_destroy(tr2);
+    }
     return out;
 }
 
@@ -550,20 +589,42 @@ static enum mds_status finish_io(const struct run_state *rs, fdb_error_t err)
     return MDS_ERR_IO;
 }
 
+/* Wait for @p tr's read version so the commit request carries a
+ * read_snapshot that precedes any later fence (fdb_txn.h).  Already
+ * ready when the body read; the commit's own GRV otherwise. */
+static fdb_error_t pin_read_version(const struct run_state *rs, FDBTransaction *tr)
+{
+    FDBFuture *f = rs->c->transaction_get_read_version(tr);
+    fdb_error_t err;
+
+    if (f == NULL) {
+        return FDB_ERR_PLATFORM_ERROR;
+    }
+    err = rs->c->future_block_until_ready(f);
+    if (err == 0) {
+        err = rs->c->future_get_error(f);
+    }
+    rs->c->future_destroy(f);
+    return err;
+}
+
 /* Commit @p tr with the witness protocol.  Returns the status to hand
- * back, or MDS_OK with *rerun set when the body must be run again. */
+ * back, or MDS_OK with *rerun set when the body must be run again.
+ * *issued reports whether the commit was handed to the client: a
+ * failure before that point (conflict-range or read-version error) is
+ * a definitive failure of the attempt with nothing in flight. */
 static enum mds_status commit_attempt(const struct run_state *rs, FDBTransaction *tr,
-                                      enum mds_status body_st, bool *rerun,
+                                      enum mds_status body_st, bool *rerun, bool *issued,
                                       fdb_error_t *err_out)
 {
     struct fdb_key wk;
-    struct fdb_key_range r;
     uint64_t seq = 0;
     uint8_t v[8];
     fdb_error_t err;
     enum outcome out;
 
     *rerun = false;
+    *issued = false;
     if (!fdb_txn_witness_key(rs->b, &wk, &seq)) {
         MDS_LOG_ERROR(LOG_COMP_CAT, "fdb %s: witness slot pool exhausted (%u slots)",
                       rs->op, FDB_WITNESS_SLOTS);
@@ -571,15 +632,29 @@ static enum mds_status commit_attempt(const struct run_state *rs, FDBTransaction
         *err_out = 0;
         return MDS_ERR_DELAY;
     }
+    /* The witness value for the probe, and the READ + WRITE conflict
+     * ranges on the unwritten anchor that let a fence stop this attempt
+     * and order it against the slot's other attempts.  A READ range on
+     * the witness key itself would be dropped by the read-your-writes
+     * layer because this transaction mutates that key (fdb_txn.h). */
     fdb_le64_put(v, seq);
     rs->c->transaction_set(tr, wk.buf, (int)wk.len, v, (int)sizeof(v));
-    fdb_key_range_single(&r, &wk);
-    err = rs->c->transaction_add_conflict_range(tr, r.begin.buf, (int)r.begin.len, r.end.buf,
-                                                (int)r.end.len, FDB_CONFLICT_RANGE_TYPE_READ);
+    err = anchor_conflict_range(rs, tr, &wk, FDB_CONFLICT_RANGE_TYPE_READ);
+    if (err == 0) {
+        err = anchor_conflict_range(rs, tr, &wk, FDB_CONFLICT_RANGE_TYPE_WRITE);
+    }
     if (err != 0) {
         *err_out = err;
         return MDS_ERR_IO;
     }
+    /* Nothing is committed yet: a failure here is a definitive failure
+     * of the attempt, which the caller classifies like a body error. */
+    err = pin_read_version(rs, tr);
+    if (err != 0) {
+        *err_out = err;
+        return MDS_ERR_IO;
+    }
+    *issued = true;
     err = commit_wait(rs, tr);
     *err_out = err;
     if (err == 0) {
@@ -600,6 +675,9 @@ static enum mds_status commit_attempt(const struct run_state *rs, FDBTransaction
         return body_st;
     }
     if (out == OUTCOME_NOT_LANDED) {
+        if (err != FDB_ERR_COMMIT_UNKNOWN_RESULT) {
+            stat_inc(&rs->b->stats.fenced_reruns);
+        }
         *rerun = true;
         return MDS_OK;
     }
@@ -608,17 +686,22 @@ static enum mds_status commit_attempt(const struct run_state *rs, FDBTransaction
 
 enum attempt_action {
     ATTEMPT_RETURN, /**< *result is final. */
-    ATTEMPT_RERUN,  /**< Transaction reset; run the body again. */
+    ATTEMPT_RERUN,  /**< Transaction reset or replaced; run the body again. */
     ATTEMPT_FAILED, /**< *err is this attempt's definitive failure. */
 };
 
-/* One attempt: arm the timeout, run the body, commit when asked. */
-static enum attempt_action run_attempt(const struct run_state *rs, FDBTransaction *tr,
+/* One attempt: arm the timeout, run the body, commit when asked.  *trp
+ * is replaced when the attempt's commit may still be in flight after a
+ * not-landed resolution (see fdb_txn.h); NULL afterwards means the
+ * replacement failed and *err is terminal. */
+static enum attempt_action run_attempt(const struct run_state *rs, FDBTransaction **trp,
                                        enum fdb_txn_kind kind, fdb_txn_body body, void *ctx,
                                        enum mds_status *result, fdb_error_t *err)
 {
+    FDBTransaction *tr = *trp;
     enum mds_status st = MDS_ERR_IO;
     bool rerun = false;
+    bool issued = false;
     int rc;
 
     *err = set_timeout_with(rs->c, tr, attempt_timeout_ms(rs));
@@ -635,16 +718,31 @@ static enum attempt_action run_attempt(const struct run_state *rs, FDBTransactio
         *err = (fdb_error_t)rc;
         return ATTEMPT_FAILED;
     }
-    *result = commit_attempt(rs, tr, st, &rerun, err);
+    *result = commit_attempt(rs, tr, st, &rerun, &issued, err);
     if (rerun) {
-        rs->c->transaction_reset(tr);
+        if (is_maybe_in_flight(*err)) {
+            /* Fenced, never landing -- but the client-side commit actor
+             * may still own this object: replace it. */
+            if (!recreate_transaction(rs, trp)) {
+                *err = FDB_ERR_PLATFORM_ERROR;
+                return ATTEMPT_FAILED;
+            }
+        } else {
+            rs->c->transaction_reset(tr); /* 1021: nothing in flight */
+        }
         return ATTEMPT_RERUN;
     }
-    /* Committed, resolved (INDOUBT / DELAY), or an outcome the witness
-     * protocol has already settled: final.  Anything else is a
-     * definitive failure of the commit, classified like a body error. */
-    if (*err == 0 || *result == MDS_ERR_INDOUBT || *result == MDS_ERR_DELAY ||
-        *err == FDB_ERR_COMMIT_UNKNOWN_RESULT || is_maybe_in_flight(*err)) {
+    if (*result == MDS_ERR_DELAY) {
+        return ATTEMPT_RETURN; /* witness slot pool exhausted */
+    }
+    if (!issued) {
+        return ATTEMPT_FAILED; /* nothing in flight: classified like a body error */
+    }
+    /* Committed, resolved (INDOUBT), or an outcome the witness protocol
+     * has already settled: final.  Anything else is a definitive failure
+     * of the commit, classified like a body error. */
+    if (*err == 0 || *result == MDS_ERR_INDOUBT || *err == FDB_ERR_COMMIT_UNKNOWN_RESULT ||
+        is_maybe_in_flight(*err)) {
         return ATTEMPT_RETURN;
     }
     return ATTEMPT_FAILED;
@@ -706,16 +804,19 @@ enum mds_status fdb_run_txn(struct fdb_backend *b, enum fdb_txn_kind kind, const
             result = finish_delay(&rs);
             break;
         }
-        act = run_attempt(&rs, tr, kind, body, ctx, &result, &err);
+        act = run_attempt(&rs, &tr, kind, body, ctx, &result, &err);
         if (act == ATTEMPT_RETURN) {
             break;
         }
-        if (act == ATTEMPT_FAILED && !attempt_failure_retryable(&rs, tr, &err)) {
+        if (act == ATTEMPT_FAILED &&
+            (tr == NULL || !attempt_failure_retryable(&rs, tr, &err))) {
             result = finish_io(&rs, err);
             break;
         }
     }
-    rs.c->transaction_destroy(tr);
+    if (tr != NULL) {
+        rs.c->transaction_destroy(tr);
+    }
     return result;
 }
 

@@ -32,19 +32,59 @@
  *
  * Commit-outcome witness.  Each thread that runs a mutating body owns
  * one WITNESS slot (fdb_keys.h: WITNESS + mds_id + epoch + slot) for
- * its lifetime.  Every mutating attempt blind-sets the slot key to the
- * attempt's fresh attempt_seq AND adds a READ conflict range on it, so
- * the resolver totally orders the attempts of a slot: a commit from an
- * earlier attempt cannot land after a later attempt committed, and a
- * later attempt whose read version predates an earlier landing aborts
- * with 1020 and re-runs.  On 1021 a fresh default transaction (no GRV
- * cache, no causal-read-risky) reads the key: equal to attempt_seq ->
- * committed, else definitively not committed.  On 1025/1031/1039 a
- * fence transaction (read the key, add a WRITE conflict range on it,
- * no mutation) is committed first: committed and saw attempt_seq ->
- * landed; committed and did not -> the attempt can never land (its
- * read conflict range now intersects the fence's write) and the body
- * may be re-run; fence failed -> retried within the deadline.
+ * its lifetime, with two keys: the witness key K_w, blind-set by every
+ * mutating attempt to the attempt's fresh attempt_seq, and the fence
+ * anchor K_f = K_w + 0x01 (fdb_key_witness_fence), which is never
+ * written and on which every mutating attempt adds a READ and a WRITE
+ * conflict range.  The anchor totally orders the attempts of a slot: a
+ * commit from an earlier attempt cannot land after a later attempt
+ * committed, and a later attempt whose read version predates an
+ * earlier landing aborts with 1020 and re-runs.  On 1021 a fresh
+ * default transaction (no GRV cache, no causal-read-risky) reads K_w:
+ * equal to attempt_seq -> committed, else definitively not committed.
+ * On 1025/1031/1039 a fence transaction (read K_w, add a WRITE conflict
+ * range on K_f, no mutation) is committed first: committed and saw
+ * attempt_seq -> landed; committed and did not -> the attempt can
+ * never land (its READ conflict range on K_f now intersects the
+ * fence's write) and the body may be re-run; fence failed -> retried
+ * within the deadline.
+ *
+ * The fence only orders against an attempt whose read version precedes
+ * the fence's commit: the resolver compares the attempt's read_snapshot
+ * with the versions of the writes it conflicts with.  A body that did
+ * not read has no read version yet and the client would take one inside
+ * the commit -- possibly after the fence, in which case the fenced
+ * attempt would still land.  The runner therefore waits for the
+ * transaction's read version before it issues the commit (free when the
+ * body read: the future is already ready; the commit's own GRV
+ * otherwise, so no extra round trip either way).
+ *
+ * Why a separate, unwritten anchor: fdb_transaction_add_conflict_range
+ * goes through the client's read-your-writes layer, which records a
+ * READ conflict range only over the parts of the range the transaction
+ * has NOT mutated itself (RYWImpl::updateConflictMap keeps unmodified
+ * ranges only).  A READ range on the mutated witness key therefore
+ * never reaches the resolver and a fence on that key intersects
+ * nothing -- verified against libfdb_c 7.3 by tests/unit/test_fdb_txn.c
+ * and the fault-injection suite.  Ranges on a key nobody mutates always
+ * reach the resolver, in any call order; this is the construction the
+ * client itself uses for its self-conflict key (\xFF/SC/<uid>).  The
+ * same elision applies to a range the transaction CLEARS, so a body
+ * must never clear a range that covers its handle's WITNESS table
+ * (catalogue_fdb_keyspace_clear excludes it): the anchor would be
+ * inside the cleared range, its READ range would be dropped and the
+ * fence could not stop a late landing of that clear.
+ *
+ * A transaction object whose commit MAY still be in flight (1025/1031/
+ * 1039) is never reused: the runner destroys it and creates a fresh one
+ * for the re-run, and does the same with a resolver transaction whose
+ * round ended that way.  fdb_transaction_reset is only equivalent to
+ * destroy + create when no commit actor is outstanding on the object;
+ * under the client's own fault injection (CLIENT_BUGGIFY) the delayed
+ * in-flight commit still owns the object and a later commit on the
+ * reused object trips the client's ASSERT(!committing.isValid())
+ * (internal_error 4100).  After 1021 the client guarantees nothing is
+ * in flight, so a reset is enough there.
  *
  * The epoch component is the process-wide incarnation stamp taken when
  * the client network starts (CLOCK_REALTIME ns), not the cluster
@@ -108,6 +148,7 @@ struct fdb_txn_calls {
                                    const uint8_t *value, int value_len);
     FDBFuture  *(*transaction_get)(FDBTransaction *tr, const uint8_t *key, int key_len,
                                    fdb_bool_t snapshot);
+    FDBFuture  *(*transaction_get_read_version)(FDBTransaction *tr);
     fdb_error_t (*transaction_add_conflict_range)(FDBTransaction *tr, const uint8_t *begin,
                                                   int begin_len, const uint8_t *end,
                                                   int end_len, FDBConflictRangeType type);
@@ -138,6 +179,7 @@ struct fdb_txn_stats {
     _Atomic uint64_t unknown_landed;   /**< ... of which had landed. */
     _Atomic uint64_t fences;           /**< 1025/1031/1039 fence rounds. */
     _Atomic uint64_t fence_landed;     /**< ... of which proved a landing. */
+    _Atomic uint64_t fenced_reruns;    /**< Attempts a fence proved not landed, re-run. */
     _Atomic uint64_t indoubt;          /**< MDS_ERR_INDOUBT returned. */
     _Atomic uint64_t delay_exhausted;  /**< MDS_ERR_DELAY returned. */
     _Atomic uint64_t io_errors;        /**< MDS_ERR_IO returned. */

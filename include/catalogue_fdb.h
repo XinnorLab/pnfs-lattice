@@ -92,9 +92,12 @@ enum mds_status fdb_backend_set_boot_epoch(const struct mds_catalogue *cat,
                                            uint64_t boot_epoch);
 
 /**
- * Range-clear every key under the handle's prefix (test and admin
- * helper).  Refuses an empty prefix: that would erase the whole
- * database.
+ * Range-clear every key under the handle's prefix except the WITNESS
+ * table (test and admin helper).  The live incarnation's witness and
+ * fence-anchor rows must survive any clear that runs through the
+ * transaction runner (fdb_txn.h, body rule); dead incarnations' rows
+ * are swept by the next open of their mds_id.  Refuses an empty
+ * prefix: that would erase the whole database.
  *
  * @return MDS_OK; MDS_ERR_INVAL for a NULL / non-fdb handle or an empty
  *         prefix; the transaction runner's status otherwise.

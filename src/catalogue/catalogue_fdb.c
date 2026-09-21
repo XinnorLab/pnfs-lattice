@@ -304,17 +304,39 @@ static int witness_clear_body(FDBTransaction *tr, void *arg, enum mds_status *st
     return FDB_BODY_COMMIT;
 }
 
+/* Clear every catalogue row under the prefix EXCEPT the WITNESS table:
+ * [prefix, prefix + WITNESS) and [prefix + WITNESS + 1, strinc(prefix)).
+ * The live incarnation's witness and fence-anchor rows must survive any
+ * clear issued through the runner: the read-your-writes layer drops a
+ * READ conflict range that lies inside a range the same transaction
+ * clears, so a clear covering the anchor could not be fenced and a
+ * late landing of it would wipe whatever was written after it -- and
+ * clearing other threads' live witness rows blinds their in-flight
+ * resolution (fdb_txn.h, body rule).  Dead incarnations' witness rows
+ * are swept by the next open of their mds_id. */
 static int keyspace_clear_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
 {
     struct fdb_backend *b = arg;
+    struct fdb_key_range whole;
     struct fdb_key_range r;
 
-    r.begin.len = b->prefix.len;
-    r.begin.overflow = false;
-    memcpy(r.begin.buf, b->prefix.bytes, b->prefix.len);
-    if (!fdb_key_range_prefix(&r, &r.begin)) {
+    whole.begin.len = b->prefix.len;
+    whole.begin.overflow = false;
+    memcpy(whole.begin.buf, b->prefix.bytes, b->prefix.len);
+    if (!fdb_key_range_prefix(&whole, &whole.begin)) {
         return FDB_ERR_PLATFORM_ERROR;
     }
+    /* Below the WITNESS table. */
+    r.begin = whole.begin;
+    fdb_key_init(&r.end, &b->prefix, FDB_KT_WITNESS);
+    fdb_txn_clear_range(tr, &r);
+    /* Above it: from the first key past the WITNESS table to the end of
+     * the prefix. */
+    fdb_key_init(&r.begin, &b->prefix, FDB_KT_WITNESS);
+    if (!fdb_key_strinc(&r.begin)) {
+        return FDB_ERR_PLATFORM_ERROR;
+    }
+    r.end = whole.end;
     fdb_txn_clear_range(tr, &r);
     *st_out = MDS_OK;
     return FDB_BODY_COMMIT;

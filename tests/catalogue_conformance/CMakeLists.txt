@@ -82,3 +82,15 @@ conformance_add(conformance_contract        test_contract.c        conformance)
 # The contract binary carries its own 600 s watchdog; give ctest room
 # above it so the binary, not ctest, reports the deadlock.
 set_tests_properties(conformance_contract PROPERTIES TIMEOUT 900)
+
+# Phase 6c: FoundationDB fault injection and lifecycle.  fdb only (77
+# on any other backend or without ENABLE_FDB).  The buggify, restart
+# and lifecycle sub-tests re-execute the binary as child processes so
+# the client network options they need never touch the harness process
+# (see the header of test_fault.c).  The binary carries a 1500 s
+# watchdog that also kills a stuck child; ctest sits above it.
+conformance_add(conformance_fault test_fault.c conformance)
+if(ENABLE_FDB)
+    target_include_directories(conformance_fault SYSTEM PRIVATE ${FDB_INCLUDE_DIR})
+endif()
+set_tests_properties(conformance_fault PROPERTIES TIMEOUT 1800)

@@ -257,6 +257,16 @@ static FDBFuture *m_transaction_get(FDBTransaction *tr, const uint8_t *key, int 
     return (FDBFuture *)f;
 }
 
+/* fdb-fault track: the runner pins the read version before a commit. */
+static int g_read_versions;
+
+static FDBFuture *m_transaction_get_read_version(FDBTransaction *tr)
+{
+    (void)tr;
+    g_read_versions++;
+    return (FDBFuture *)future_new(0);
+}
+
 static fdb_error_t m_add_conflict_range(FDBTransaction *tr, const uint8_t *begin, int begin_len,
                                         const uint8_t *end, int end_len,
                                         FDBConflictRangeType type)
@@ -371,6 +381,7 @@ static const struct fdb_txn_calls g_mock_calls = {
     .transaction_set_option         = m_set_option,
     .transaction_set                = m_transaction_set,
     .transaction_get                = m_transaction_get,
+    .transaction_get_read_version   = m_transaction_get_read_version,
     .transaction_add_conflict_range = m_add_conflict_range,
     .transaction_commit             = m_transaction_commit,
     .transaction_on_error           = m_transaction_on_error,
@@ -702,6 +713,299 @@ static void test_witness_key_shape(void)
 }
 
 /* -----------------------------------------------------------------------
+ * Phase 6c additions (fault-injection track): a transaction object
+ * whose commit may still be in flight is replaced, never reused;
+ * 1025 / 1039 are classified like 1031; resolver rounds that keep
+ * failing after a landed commit end in INDOUBT with exactly one effect.
+ *
+ * A thin table over the mock counts the transaction objects the runner
+ * creates and destroys and can script the error every probe read
+ * reports.
+ * ----------------------------------------------------------------------- */
+
+static int         g_w_creates;
+static int         g_w_destroys;
+static fdb_error_t g_w_probe_err;      /* != 0: probe reads fail with it ... */
+static int         g_w_probe_err_left; /* ... this many times (-1: forever) */
+static fdb_error_t g_w_rv_err;         /* != 0: read-version pins fail with it ... */
+static int         g_w_rv_err_left;    /* ... this many times */
+
+static fdb_error_t w_create_transaction(FDBDatabase *db, FDBTransaction **out)
+{
+    g_w_creates++;
+    return m_create_transaction(db, out);
+}
+
+static void w_transaction_destroy(FDBTransaction *tr)
+{
+    g_w_destroys++;
+    m_transaction_destroy(tr);
+}
+
+static FDBFuture *w_transaction_get(FDBTransaction *tr, const uint8_t *key, int key_len,
+                                    fdb_bool_t snapshot)
+{
+    struct mock_future *f = (struct mock_future *)m_transaction_get(tr, key, key_len, snapshot);
+
+    if (f != NULL && g_w_probe_err != 0 && g_w_probe_err_left != 0) {
+        f->err = g_w_probe_err;
+        if (g_w_probe_err_left > 0) {
+            g_w_probe_err_left--;
+        }
+    }
+    return (FDBFuture *)f;
+}
+
+static FDBFuture *w_transaction_get_read_version(FDBTransaction *tr)
+{
+    struct mock_future *f = (struct mock_future *)m_transaction_get_read_version(tr);
+
+    if (f != NULL && g_w_rv_err != 0 && g_w_rv_err_left > 0) {
+        f->err = g_w_rv_err;
+        g_w_rv_err_left--;
+    }
+    return (FDBFuture *)f;
+}
+
+static const struct fdb_txn_calls g_wrap_calls = {
+    .create_transaction             = w_create_transaction,
+    .transaction_destroy            = w_transaction_destroy,
+    .transaction_reset              = m_transaction_reset,
+    .transaction_set_option         = m_set_option,
+    .transaction_set                = m_transaction_set,
+    .transaction_get                = w_transaction_get,
+    .transaction_get_read_version   = w_transaction_get_read_version,
+    .transaction_add_conflict_range = m_add_conflict_range,
+    .transaction_commit             = m_transaction_commit,
+    .transaction_on_error           = m_transaction_on_error,
+    .future_block_until_ready       = m_future_block_until_ready,
+    .future_get_error               = m_future_get_error,
+    .future_get_value               = m_future_get_value,
+    .future_destroy                 = m_future_destroy,
+    .error_predicate                = m_error_predicate,
+    .now_ns                         = m_now_ns,
+};
+
+static void wrap_reset(struct fdb_backend *b)
+{
+    mock_reset();
+    backend_init(b);
+    b->calls = &g_wrap_calls;
+    g_w_creates = 0;
+    g_w_destroys = 0;
+    g_w_probe_err = 0;
+    g_w_probe_err_left = 0;
+    g_w_rv_err = 0;
+    g_w_rv_err_left = 0;
+    g_read_versions = 0;
+}
+
+/* Every mutating attempt pins its read version exactly once, before the
+ * commit; read-only bodies and bodies that decline to commit never do. */
+static void test_read_version_pinned(void)
+{
+    struct fdb_backend b;
+    struct body_ctx c;
+
+    wrap_reset(&b);
+    memset(&c, 0, sizeof(c));
+    ASSERT_EQ(fdb_run_txn(&b, FDB_TXN_MUTATING, "t", body_fn, &c), MDS_OK);
+    ASSERT_EQ(g_read_versions, 1);
+
+    wrap_reset(&b);
+    memset(&c, 0, sizeof(c));
+    script_add(1031, false); /* fenced, re-run: two attempts, two pins */
+    script_add(0, false);
+    script_add(0, true);
+    ASSERT_EQ(fdb_run_txn(&b, FDB_TXN_MUTATING, "t", body_fn, &c), MDS_OK);
+    ASSERT_EQ(c.calls, 2);
+    ASSERT_EQ(g_read_versions, 2);
+
+    wrap_reset(&b);
+    memset(&c, 0, sizeof(c));
+    ASSERT_EQ(fdb_run_txn(&b, FDB_TXN_READONLY, "t", body_fn, &c), MDS_OK);
+    ASSERT_EQ(g_read_versions, 0);
+
+    wrap_reset(&b);
+    memset(&c, 0, sizeof(c));
+    c.done_status = MDS_ERR_EXISTS;
+    ASSERT_EQ(fdb_run_txn(&b, FDB_TXN_MUTATING, "t", body_fn, &c), MDS_ERR_EXISTS);
+    ASSERT_EQ(g_read_versions, 0);
+    ASSERT_EQ(g_futures_live, 0);
+
+    /* A pin that times out happened before anything was issued: a
+     * definitive failure, re-run without a probe or a fence. */
+    wrap_reset(&b);
+    memset(&c, 0, sizeof(c));
+    g_w_rv_err = 1031;
+    g_w_rv_err_left = 1;
+    ASSERT_EQ(fdb_run_txn(&b, FDB_TXN_MUTATING, "t", body_fn, &c), MDS_OK);
+    ASSERT_EQ(c.calls, 2);
+    ASSERT_EQ(g_read_versions, 2);
+    ASSERT_EQ(g_probes, 0);
+    ASSERT_EQ(g_fence_commits, 0);
+    ASSERT_EQ(g_commits, 1);
+    ASSERT_EQ(atomic_load(&b.stats.retries), 1);
+    ASSERT_EQ(atomic_load(&b.stats.indoubt), 0);
+    ASSERT_EQ(g_futures_live, 0);
+}
+
+static int mock_live_transactions(void)
+{
+    int i;
+    int live = 0;
+
+    for (i = 0; i < MOCK_TRS; i++) {
+        if (g_trs[i].used) {
+            live++;
+        }
+    }
+    return live;
+}
+
+/* 1031 not landed: the fenced attempt's object is destroyed and a fresh
+ * one runs the body again (attempt, resolver, replacement = 3 objects);
+ * 1021 not landed keeps the object (nothing can be in flight). */
+static void test_inflight_object_replaced(void)
+{
+    struct fdb_backend b;
+    struct body_ctx c = { 0, 0, MDS_OK };
+
+    wrap_reset(&b);
+    script_add(1031, false); /* maybe in flight, never lands */
+    script_add(0, false);    /* the fence commits */
+    script_add(0, true);     /* the re-run commits */
+    ASSERT_EQ(fdb_run_txn(&b, FDB_TXN_MUTATING, "t", body_fn, &c), MDS_OK);
+    ASSERT_EQ(c.calls, 2);
+    ASSERT_EQ(g_fence_commits, 1);
+    ASSERT_EQ(g_w_creates, 3);
+    ASSERT_EQ(g_w_destroys, 3);
+    ASSERT_EQ(mock_live_transactions(), 0);
+    ASSERT_EQ(fdb_le64_get(g_db_val), g_witness_vals[1]);
+    ASSERT_EQ(g_futures_live, 0);
+
+    wrap_reset(&b);
+    memset(&c, 0, sizeof(c));
+    script_add(1021, false); /* never happened; the client fenced it itself */
+    script_add(0, true);
+    ASSERT_EQ(fdb_run_txn(&b, FDB_TXN_MUTATING, "t", body_fn, &c), MDS_OK);
+    ASSERT_EQ(c.calls, 2);
+    ASSERT_EQ(g_w_creates, 2);   /* attempt + resolver only: reset, not replaced */
+    ASSERT_EQ(g_w_destroys, 2);
+    ASSERT_EQ(mock_live_transactions(), 0);
+    ASSERT_EQ(g_futures_live, 0);
+}
+
+/* 1025 transaction_cancelled and 1039 cluster_version_changed take the
+ * fence path exactly like 1031. */
+static void test_cancelled_and_version_changed(void)
+{
+    struct fdb_backend b;
+    struct body_ctx c;
+
+    /* 1025, landed: the probe alone proves it, no fence, no re-run. */
+    wrap_reset(&b);
+    memset(&c, 0, sizeof(c));
+    script_add(1025, true);
+    ASSERT_EQ(fdb_run_txn(&b, FDB_TXN_MUTATING, "t", body_fn, &c), MDS_OK);
+    ASSERT_EQ(c.calls, 1);
+    ASSERT_EQ(g_commits, 1);
+    ASSERT_EQ(g_probes, 1);
+    ASSERT_EQ(g_fence_commits, 0);
+    ASSERT_EQ(atomic_load(&b.stats.fence_landed), 1);
+    ASSERT_EQ(atomic_load(&b.stats.commits), 1);
+
+    /* 1039, never lands: fence, replacement object, re-run. */
+    wrap_reset(&b);
+    memset(&c, 0, sizeof(c));
+    script_add(1039, false);
+    script_add(0, false);
+    script_add(0, true);
+    ASSERT_EQ(fdb_run_txn(&b, FDB_TXN_MUTATING, "t", body_fn, &c), MDS_OK);
+    ASSERT_EQ(c.calls, 2);
+    ASSERT_EQ(g_commits, 3);
+    ASSERT_EQ(g_fence_commits, 1);
+    ASSERT_EQ(atomic_load(&b.stats.fences), 1);
+    ASSERT_EQ(atomic_load(&b.stats.fence_landed), 0);
+    ASSERT_EQ(g_w_creates, 3);
+    ASSERT_EQ(g_w_destroys, 3);
+    ASSERT_EQ(mock_live_transactions(), 0);
+    ASSERT_EQ(g_futures_live, 0);
+}
+
+/* Commit landed with 1021, then every probe read times out until the
+ * deadline: INDOUBT, the body never re-run, exactly one effect (the
+ * landed one), every resolver object replaced and released. */
+static void test_landed_then_probes_fail(void)
+{
+    struct fdb_backend b;
+    struct body_ctx c = { 0, 0, MDS_OK };
+    uint64_t seq;
+
+    wrap_reset(&b);
+    b.op_deadline_ms = 500;
+    g_clock_step_ns = 60ULL * 1000000ULL;
+    script_add(1021, true);
+    g_w_probe_err = 1031;
+    g_w_probe_err_left = -1;
+    ASSERT_EQ(fdb_run_txn(&b, FDB_TXN_MUTATING, "t", body_fn, &c), MDS_ERR_INDOUBT);
+    ASSERT_EQ(c.calls, 1);
+    ASSERT_EQ(g_commits, 1);
+    ASSERT_EQ(g_fence_commits, 0);
+    ASSERT_TRUE(g_probes >= 2);
+    ASSERT_TRUE(g_db_present);
+    seq = g_witness_vals[0];
+    ASSERT_EQ(fdb_le64_get(g_db_val), seq); /* the one landed attempt */
+    ASSERT_EQ(atomic_load(&b.stats.indoubt), 1);
+    ASSERT_EQ(atomic_load(&b.stats.commits), 0);
+    ASSERT_TRUE(g_w_creates >= 3);          /* attempt + a resolver per timed-out round */
+    ASSERT_EQ(g_w_destroys, g_w_creates);
+    ASSERT_EQ(mock_live_transactions(), 0);
+    ASSERT_EQ(g_futures_live, 0);
+
+    /* Probe conflicts back off and re-probe; the third read sees it. */
+    wrap_reset(&b);
+    memset(&c, 0, sizeof(c));
+    script_add(1021, true);
+    g_w_probe_err = 1020;
+    g_w_probe_err_left = 2;
+    ASSERT_EQ(fdb_run_txn(&b, FDB_TXN_MUTATING, "t", body_fn, &c), MDS_OK);
+    ASSERT_EQ(c.calls, 1);
+    ASSERT_EQ(g_probes, 3);
+    ASSERT_EQ(g_on_error_calls, 2);
+    ASSERT_EQ(atomic_load(&b.stats.unknown_landed), 1);
+    ASSERT_EQ(g_w_creates, 2);
+    ASSERT_EQ(g_w_destroys, 2);
+    ASSERT_EQ(g_futures_live, 0);
+}
+
+/* A fence round whose commit reports 1021 is repeated (reset, re-probe,
+ * fence again) and the attempt is only re-run once a fence committed. */
+static void test_fence_round_unknown_result(void)
+{
+    struct fdb_backend b;
+    struct body_ctx c = { 0, 0, MDS_OK };
+
+    wrap_reset(&b);
+    script_add(1031, false); /* attempt: maybe in flight */
+    script_add(1021, false); /* first fence: unknown result */
+    script_add(0, false);    /* second fence commits */
+    script_add(0, true);     /* re-run commits */
+    ASSERT_EQ(fdb_run_txn(&b, FDB_TXN_MUTATING, "t", body_fn, &c), MDS_OK);
+    ASSERT_EQ(c.calls, 2);
+    ASSERT_EQ(g_commits, 4);
+    ASSERT_EQ(g_fence_commits, 2);
+    ASSERT_EQ(g_probes, 2);
+    ASSERT_EQ(atomic_load(&b.stats.fences), 2);
+    ASSERT_EQ(atomic_load(&b.stats.commits), 1);
+    ASSERT_EQ(g_w_creates, 3);   /* the 1021 fence round reset its object */
+    ASSERT_EQ(g_w_destroys, 3);
+    ASSERT_EQ(mock_live_transactions(), 0);
+    ASSERT_EQ(fdb_le64_get(g_db_val), g_witness_vals[1]);
+    ASSERT_EQ(g_futures_live, 0);
+}
+
+/* -----------------------------------------------------------------------
  * Real path (local cluster)
  * ----------------------------------------------------------------------- */
 
@@ -811,6 +1115,219 @@ static void test_real_cluster(void)
     ASSERT_TRUE(atomic_load(&b->stats.commits) >= 2);
 }
 
+/* -----------------------------------------------------------------------
+ * Fence premise against the installed client (fdb-fault track).
+ *
+ * Bare fdb_c, no runner.  An "attempt" transaction fixes its read
+ * version with a read of another key, sets the witness key K and adds
+ * its conflict ranges; a "fence" transaction reads K and adds a WRITE
+ * conflict range; the fence commits first, then the held-back attempt
+ * is committed.  What the resolver then does is the premise:
+ *   set K, then READ range on K  -> the attempt COMMITS.  The read-your-
+ *                                   writes layer records a READ range
+ *                                   only over keys the transaction did
+ *                                   not mutate, so the range never
+ *                                   reaches the resolver: the reason the
+ *                                   runner fences on an unwritten anchor.
+ *   READ range on K, then set K  -> reported, not asserted: it fences on
+ *                                   7.3 because ranges added before the
+ *                                   write are kept, which is undocumented.
+ *   anchor K + 0x01, either order -> 1020 not_committed: the fence works.
+ *   two attempts on the anchor   -> the one committing second gets 1020.
+ *   blind attempt (no read), anchor ranges, read version NOT pinned
+ *                                -> the attempt COMMITS: its read version
+ *                                   is taken inside the commit, after the
+ *                                   fence, so nothing precedes the fence.
+ *   blind attempt, read version pinned before the commit (the runner's
+ *   pin_read_version)            -> 1020: the fence works.
+ * ----------------------------------------------------------------------- */
+
+enum fence_shape {
+    SHAPE_SET_THEN_READ = 0,
+    SHAPE_READ_THEN_SET,
+    SHAPE_ANCHOR,
+    SHAPE_ANCHOR_REVERSED,
+    SHAPE_BLIND_UNPINNED,
+    SHAPE_BLIND_PINNED,
+};
+
+static fdb_error_t real_wait_destroy(FDBFuture *f)
+{
+    fdb_error_t err = fdb_txn_wait(f);
+
+    if (f != NULL) {
+        fdb_future_destroy(f);
+    }
+    return err;
+}
+
+static fdb_error_t real_add_range(FDBTransaction *tr, const struct fdb_key *k,
+                                  FDBConflictRangeType type)
+{
+    struct fdb_key_range r;
+
+    fdb_key_range_single(&r, k);
+    return fdb_transaction_add_conflict_range(tr, r.begin.buf, (int)r.begin.len, r.end.buf,
+                                              (int)r.end.len, type);
+}
+
+/* Scratch keys inside the test keyspace (cleared with it). */
+static void premise_keys(const struct fdb_backend *b, struct fdb_key *other,
+                         struct fdb_key *witness, struct fdb_key *anchor)
+{
+    fdb_key_init(other, &b->prefix, FDB_KT_META);
+    fdb_key_u8(other, 0x70);
+    fdb_key_init(witness, &b->prefix, FDB_KT_META);
+    fdb_key_u8(witness, 0x71);
+    fdb_key_witness_fence(anchor, witness);
+}
+
+/* An attempt of @p shape: read version fixed by a read of @p other,
+ * witness set, conflict ranges per shape.  Nothing is committed. */
+static fdb_error_t premise_attempt(FDBDatabase *db, enum fence_shape shape,
+                                   const struct fdb_key *other, const struct fdb_key *witness,
+                                   const struct fdb_key *anchor, FDBTransaction **out)
+{
+    uint8_t v[8] = { 1, 0, 0, 0, 0, 0, 0, 0 };
+    fdb_error_t err = fdb_database_create_transaction(db, out);
+
+    if (err != 0) {
+        return err;
+    }
+    err = fdb_txn_set_timeout(*out, 4000);
+    if (err == 0 && shape != SHAPE_BLIND_UNPINNED && shape != SHAPE_BLIND_PINNED) {
+        err = real_wait_destroy(fdb_txn_get_start(*out, other, false));
+    }
+    if (err != 0) {
+        return err;
+    }
+    switch (shape) {
+    case SHAPE_SET_THEN_READ:
+        fdb_txn_set(*out, witness, v, sizeof(v));
+        err = real_add_range(*out, witness, FDB_CONFLICT_RANGE_TYPE_READ);
+        break;
+    case SHAPE_READ_THEN_SET:
+        err = real_add_range(*out, witness, FDB_CONFLICT_RANGE_TYPE_READ);
+        fdb_txn_set(*out, witness, v, sizeof(v));
+        break;
+    case SHAPE_ANCHOR_REVERSED:
+        fdb_txn_set(*out, witness, v, sizeof(v));
+        err = real_add_range(*out, anchor, FDB_CONFLICT_RANGE_TYPE_WRITE);
+        if (err == 0) {
+            err = real_add_range(*out, anchor, FDB_CONFLICT_RANGE_TYPE_READ);
+        }
+        break;
+    default: /* SHAPE_ANCHOR and the blind shapes */
+        fdb_txn_set(*out, witness, v, sizeof(v));
+        err = real_add_range(*out, anchor, FDB_CONFLICT_RANGE_TYPE_READ);
+        if (err == 0) {
+            err = real_add_range(*out, anchor, FDB_CONFLICT_RANGE_TYPE_WRITE);
+        }
+        break;
+    }
+    if (err == 0 && shape == SHAPE_BLIND_PINNED) {
+        err = real_wait_destroy(fdb_transaction_get_read_version(*out));
+    }
+    return err;
+}
+
+/* The fence: probe read of the witness, WRITE range on @p fence_key. */
+static fdb_error_t premise_fence(FDBDatabase *db, const struct fdb_key *witness,
+                                 const struct fdb_key *fence_key)
+{
+    FDBTransaction *fen = NULL;
+    fdb_error_t err = fdb_database_create_transaction(db, &fen);
+
+    if (err != 0) {
+        return err;
+    }
+    err = fdb_txn_set_timeout(fen, 4000);
+    if (err == 0) {
+        err = real_wait_destroy(fdb_txn_get_start(fen, witness, false));
+    }
+    if (err == 0) {
+        err = real_add_range(fen, fence_key, FDB_CONFLICT_RANGE_TYPE_WRITE);
+    }
+    if (err == 0) {
+        err = real_wait_destroy(fdb_transaction_commit(fen));
+    }
+    fdb_transaction_destroy(fen);
+    return err;
+}
+
+/* Held-back attempt, fence commits, attempt committed afterwards:
+ * returns the attempt's commit error; *fence_err the fence's. */
+static fdb_error_t premise_scenario(struct fdb_backend *b, enum fence_shape shape,
+                                    fdb_error_t *fence_err)
+{
+    struct fdb_key other;
+    struct fdb_key witness;
+    struct fdb_key anchor;
+    FDBTransaction *att = NULL;
+    fdb_error_t err;
+
+    premise_keys(b, &other, &witness, &anchor);
+    err = premise_attempt(b->db, shape, &other, &witness, &anchor, &att);
+    if (err == 0) {
+        *fence_err = premise_fence(b->db, &witness,
+                                   shape >= SHAPE_ANCHOR ? &anchor : &witness);
+        err = real_wait_destroy(fdb_transaction_commit(att));
+    }
+    if (att != NULL) {
+        fdb_transaction_destroy(att);
+    }
+    return err;
+}
+
+static void test_real_fence_premise(void)
+{
+    struct fdb_backend *b = g_real_cat->backend_private;
+    struct fdb_key other;
+    struct fdb_key witness;
+    struct fdb_key anchor;
+    FDBTransaction *a1 = NULL;
+    FDBTransaction *a2 = NULL;
+    fdb_error_t fence_err = -1;
+    fdb_error_t err;
+
+    ASSERT_TRUE(b != NULL);
+    /* The elision that motivated the anchor: a READ range on the key the
+     * transaction set never reaches the resolver. */
+    err = premise_scenario(b, SHAPE_SET_THEN_READ, &fence_err);
+    ASSERT_EQ(fence_err, 0);
+    ASSERT_EQ(err, 0);
+    /* Reported only (see the section comment). */
+    err = premise_scenario(b, SHAPE_READ_THEN_SET, &fence_err);
+    ASSERT_EQ(fence_err, 0);
+    fprintf(stdout, "[read range before the write: late commit -> %d %s] ", (int)err,
+            fdb_get_error(err));
+    /* The anchor fences in either order. */
+    err = premise_scenario(b, SHAPE_ANCHOR, &fence_err);
+    ASSERT_EQ(fence_err, 0);
+    ASSERT_EQ(err, FDB_ERR_NOT_COMMITTED);
+    err = premise_scenario(b, SHAPE_ANCHOR_REVERSED, &fence_err);
+    ASSERT_EQ(fence_err, 0);
+    ASSERT_EQ(err, FDB_ERR_NOT_COMMITTED);
+    /* A blind attempt is fenced only when its read version was taken
+     * before the fence -- which is what the runner's pin guarantees. */
+    err = premise_scenario(b, SHAPE_BLIND_UNPINNED, &fence_err);
+    ASSERT_EQ(fence_err, 0);
+    ASSERT_EQ(err, 0);
+    err = premise_scenario(b, SHAPE_BLIND_PINNED, &fence_err);
+    ASSERT_EQ(fence_err, 0);
+    ASSERT_EQ(err, FDB_ERR_NOT_COMMITTED);
+
+    /* Total order: two attempts on the anchor, the later one commits
+     * first, the earlier one can no longer land. */
+    premise_keys(b, &other, &witness, &anchor);
+    ASSERT_EQ(premise_attempt(b->db, SHAPE_ANCHOR, &other, &witness, &anchor, &a1), 0);
+    ASSERT_EQ(premise_attempt(b->db, SHAPE_ANCHOR, &other, &witness, &anchor, &a2), 0);
+    ASSERT_EQ(real_wait_destroy(fdb_transaction_commit(a2)), 0);
+    ASSERT_EQ(real_wait_destroy(fdb_transaction_commit(a1)), FDB_ERR_NOT_COMMITTED);
+    fdb_transaction_destroy(a1);
+    fdb_transaction_destroy(a2);
+}
+
 /* ----------------------------------------------------------------------- */
 
 static int real_open(void)
@@ -866,7 +1383,13 @@ int main(void)
     RUN_TEST(test_retry_classification);
     RUN_TEST(test_readonly_and_done);
     RUN_TEST(test_witness_key_shape);
+    RUN_TEST(test_inflight_object_replaced);
+    RUN_TEST(test_cancelled_and_version_changed);
+    RUN_TEST(test_landed_then_probes_fail);
+    RUN_TEST(test_fence_round_unknown_result);
+    RUN_TEST(test_read_version_pinned);
     RUN_TEST(test_real_cluster);
+    RUN_TEST(test_real_fence_premise);
 
     (void)catalogue_fdb_keyspace_clear(g_real_cat);
     mds_catalogue_close(g_real_cat);

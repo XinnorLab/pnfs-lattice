@@ -89,6 +89,12 @@
  *   WITNESS         + be32 mds_id + be64 epoch + be32 slot   -> LE u64 seq
  *     commit-outcome witness (fdb_txn.h); epoch is the process-wide
  *     incarnation stamp, slot the worker's witness slot.
+ *   WITNESS         + be32 mds_id + be64 epoch + be32 slot + u8 0x01
+ *     the slot's fence anchor: NEVER written.  Every mutating attempt
+ *     adds READ + WRITE conflict ranges on it and a fence adds a WRITE
+ *     conflict range; the read-your-writes layer keeps explicit
+ *     conflict ranges only over keys the transaction did not mutate,
+ *     which is why the anchor is a separate, unwritten key (fdb_txn.h).
  *
  * Bounds: the longest key is prefix (FDB_KEY_PREFIX_MAX) + type + be64 +
  * be32 + owner bytes (128) + be64 + be64, or a NUL-terminated
@@ -538,5 +544,26 @@ static inline void fdb_key_link_anchor(struct fdb_key *k, const struct fdb_key_p
 }
 
 /* End of ext track section. */
+
+/* -----------------------------------------------------------------------
+ * fdb-fault track: the fence anchor of a witness slot.
+ * ----------------------------------------------------------------------- */
+
+/** Byte appended to a witness key to name its fence anchor. */
+#define FDB_WITNESS_FENCE_TAG 0x01U
+
+/**
+ * The fence anchor of the witness slot @p witness (fdb_key_witness):
+ * the witness key plus FDB_WITNESS_FENCE_TAG.  It is never written;
+ * transactions only place conflict ranges on it (fdb_txn.h).  Sorts
+ * inside the slot's mds_id / epoch range, so the open-time clear of
+ * dead incarnations covers it, and outside [witness, witness + 0x00),
+ * so the probe's read of the witness value never touches it.
+ */
+static inline void fdb_key_witness_fence(struct fdb_key *k, const struct fdb_key *witness)
+{
+    *k = *witness;
+    fdb_key_u8(k, FDB_WITNESS_FENCE_TAG);
+}
 
 #endif /* FDB_KEYS_H */
