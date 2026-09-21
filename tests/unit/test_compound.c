@@ -5633,6 +5633,42 @@ static void test_layoutcommit_stamps_mtime_without_client_time(void)
 	close_test_db(db, path);
 }
 
+/** The process-wide layout-seqid tracker must release every entry on
+ * layout_seqid_table_destroy() and stay usable afterwards; without the
+ * teardown the entries granted by the LAYOUTGET tests above outlive
+ * main() and the valgrind gate counts them as still-reachable errors. */
+static void test_layout_seqid_table_destroy(void)
+{
+	static const uint8_t other_a[NFS4_OTHER_SIZE] = {
+		0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xA1 };
+	static const uint8_t other_b[NFS4_OTHER_SIZE] = {
+		0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xB2 };
+	uint64_t before;
+	uint32_t seq = 0;
+
+	before = layout_seqid_entry_count();
+	layout_seqid_record_at(other_a, 5);
+	layout_seqid_record_at(other_b, 7);
+	ASSERT_EQ(layout_seqid_entry_count(), before + 2);
+	ASSERT_TRUE(layout_seqid_peek(other_a, &seq));
+	ASSERT_EQ(seq, (uint32_t)5);
+
+	layout_seqid_table_destroy();
+	ASSERT_EQ(layout_seqid_entry_count(), (uint64_t)0);
+	ASSERT_TRUE(!layout_seqid_peek(other_a, &seq));
+	ASSERT_TRUE(!layout_seqid_peek(other_b, &seq));
+
+	/* A second call is a no-op and the table is still usable. */
+	layout_seqid_table_destroy();
+	layout_seqid_record_at(other_a, 9);
+	ASSERT_TRUE(layout_seqid_peek(other_a, &seq));
+	ASSERT_EQ(seq, (uint32_t)9);
+	ASSERT_EQ(layout_seqid_entry_count(), (uint64_t)1);
+
+	layout_seqid_table_destroy();
+	ASSERT_EQ(layout_seqid_entry_count(), (uint64_t)0);
+}
+
 int main(void)
 {
 	fprintf(stdout, "Running compound dispatch tests:\n");
@@ -5678,6 +5714,7 @@ int main(void)
 	RUN_TEST(test_layoutget_ds_pending_patched_ready_clears_pending);
 	RUN_TEST(test_layoutreturn);
 	RUN_TEST(test_layoutcommit_stamps_mtime_without_client_time);
+	RUN_TEST(test_layout_seqid_table_destroy);
 	RUN_TEST(test_openattr_create_remove);
 	RUN_TEST(test_openattr_read_write);
 	RUN_TEST(test_gc_on_remove);
@@ -5739,5 +5776,8 @@ int main(void)
 	RUN_TEST(test_nametoolong_flag_paths);
 
 	fprintf(stdout, "\n%d/%d tests passed.\n", tests_passed, tests_run);
+	/* Release the layout stateids the LAYOUTGET tests granted; the
+	 * tracker is process-global and has no other owner here. */
+	layout_seqid_table_destroy();
 	return (tests_passed == tests_run) ? 0 : 1;
 }

@@ -2519,6 +2519,11 @@ cleanup:
 	 * prober thread; no-op when probing was never started. */
 	ds_io_limits_stop();
 	layout_recall_destroy(lr);
+	/* The process-wide layout-seqid tracker is written by the COMPOUND
+	 * path (Phase 1), the transport admin handlers (Phase 3), the DS
+	 * health monitor and the recall coordinator (both just above); with
+	 * all of them down its entries can be released. */
+	layout_seqid_table_destroy();
 	/* Stop the capacity probe before destroying the DS cache it
 	 * writes into.  ds_capacity_stop joins the worker thread. */
 	ds_capacity_stop(ds_cap);

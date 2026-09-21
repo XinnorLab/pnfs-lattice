@@ -181,9 +181,10 @@ static pthread_once_t g_layout_sid_seed_once = PTHREAD_ONCE_INIT;
  *
  * This module-local table records every layout `other` we issue and
  * the latest seqid we returned for it.  Lookup is keyed on the 12-byte
- * `other`; chained hash with a striped mutex.  Entries persist for
- * the lifetime of the daemon -- same lifecycle as the layout itself
- * for transient mode.  Memory is bounded by the number of distinct
+ * `other`; chained hash with a striped mutex.  Entries persist until
+ * LAYOUTRETURN or until layout_seqid_table_destroy() sweeps the table
+ * at daemon shutdown -- same lifecycle as the layout itself for
+ * transient mode.  Memory is bounded by the number of distinct
  * granted stateids (one per (clientid, fileid) pair on most paths);
  * the hash overhead is sizeof(struct layout_seqid_entry) per entry.
  *
@@ -483,6 +484,44 @@ uint64_t layout_seqid_entry_count(void)
 bool layout_seqid_at_capacity(void)
 {
 	return layout_seqid_entry_count() >= LAYOUT_SEQID_MAX_ENTRIES;
+}
+
+/*
+ * Free every tracked entry and leave the table empty but usable.
+ *
+ * The stripe locks are taken in ascending order and all held while the
+ * bucket array is swept; every other entry point holds exactly one
+ * stripe lock at a time, so this cannot deadlock against a straggler
+ * -- but the contract (layout_recall.h) is that no other thread is
+ * inside the tracker any more, and the locks are only insurance.  The
+ * locks themselves are static storage and are deliberately left
+ * initialised so a later grant (or a second destroy call) is still
+ * well-defined.
+ */
+void layout_seqid_table_destroy(void)
+{
+	uint32_t i;
+
+	(void)pthread_once(&g_layout_seqid_init_once, layout_seqid_init);
+
+	for (i = 0; i < LAYOUT_SEQID_STRIPES; i++) {
+		pthread_mutex_lock(&g_layout_seqid_locks[i]);
+	}
+	for (i = 0; i < LAYOUT_SEQID_BUCKETS; i++) {
+		struct layout_seqid_entry *e = g_layout_seqid_buckets[i];
+
+		while (e != NULL) {
+			struct layout_seqid_entry *next = e->hash_next;
+
+			free(e);
+			e = next;
+		}
+		g_layout_seqid_buckets[i] = NULL;
+	}
+	atomic_store_explicit(&g_layout_seqid_count, 0, memory_order_relaxed);
+	for (i = LAYOUT_SEQID_STRIPES; i > 0; i--) {
+		pthread_mutex_unlock(&g_layout_seqid_locks[i - 1]);
+	}
 }
 
 static void seed_layout_sid_counter(void)
