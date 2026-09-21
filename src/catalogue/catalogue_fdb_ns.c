@@ -1793,7 +1793,7 @@ static int rdp_collect(FDBTransaction *tr, struct rdp_page_ctx *c, const FDBKeyV
         struct rdp_entry *e = &c->page[c->n];
 
         fdb_kv_at(kvs, i, &kv);
-        if (kv.key_length != (int)key_base_len + 8 ||
+        if (kv.key_length != (int)(key_base_len + FDB_KEY_BE64_LEN) ||
             !fdb_dirent_seq_decode(kv.value, (size_t)kv.value_length, &sv)) {
             return FDB_ERR_PLATFORM_ERROR;
         }

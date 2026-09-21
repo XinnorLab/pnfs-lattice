@@ -197,6 +197,10 @@ static void key_u64_prefix(struct fdb_key *k, const struct fdb_key_prefix *p,
     fdb_key_be64(k, id);
 }
 
+/* Tail of a DS_LAYOUT_IDX key after the be32 ds_id: be64 clientid + be64
+ * fileid + stateid_other. */
+#define FDB_DS_LAYOUT_IDX_TAIL (2U * FDB_KEY_BE64_LEN + NFS4_OTHER_SIZE)
+
 static void key_ds_layout_idx(struct fdb_key *k, const struct fdb_key_prefix *p, uint32_t ds_id,
                               uint64_t clientid, uint64_t fileid,
                               const uint8_t other[NFS4_OTHER_SIZE])
@@ -207,6 +211,10 @@ static void key_ds_layout_idx(struct fdb_key *k, const struct fdb_key_prefix *p,
     fdb_key_be64(k, fileid);
     fdb_key_bytes(k, other, NFS4_OTHER_SIZE);
 }
+
+/* A LOCK row key after the type byte, and the tail of a LOCK_BY_OWNER
+ * key after its owner: be64 fileid + be64 lock_id. */
+#define FDB_LOCK_KEY_TAIL (2U * FDB_KEY_BE64_LEN)
 
 static void key_lock(struct fdb_key *k, const struct fdb_key_prefix *p, uint64_t fileid,
                      uint64_t lock_id)
@@ -268,6 +276,9 @@ static void key_recovery_by_owner(struct fdb_key *k, const struct fdb_key_prefix
     fdb_key_be32(k, owner);
     fdb_key_be64(k, clientid);
 }
+
+/* A JOURNAL key after the type byte: be64 txn_id + u8 role. */
+#define FDB_JOURNAL_KEY_TAIL (FDB_KEY_BE64_LEN + FDB_KEY_U8_LEN)
 
 static void key_journal(struct fdb_key *k, const struct fdb_key_prefix *p, uint64_t txn_id,
                         uint8_t role)
@@ -997,15 +1008,15 @@ static int ds_idx_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
         const uint8_t *s;
 
         fdb_kv_at(page.kvs, (int)i, &kv);
-        s = key_suffix(&base, &kv, 8U + 8U + NFS4_OTHER_SIZE);
+        s = key_suffix(&base, &kv, FDB_DS_LAYOUT_IDX_TAIL);
         if (s == NULL) {
             kvs_release(&page);
             futures_drop(c->fs, 0, n);
             return FDB_ERR_PLATFORM_ERROR;
         }
         c->cand[n].clientid = fdb_get_u64(s);
-        c->cand[n].fileid = fdb_get_u64(s + 8);
-        key_sid(&k, p, FDB_KT_LAYOUT_STATE, s + 16);
+        c->cand[n].fileid = fdb_get_u64(s + FDB_KEY_BE64_LEN);
+        key_sid(&k, p, FDB_KT_LAYOUT_STATE, s + 2U * FDB_KEY_BE64_LEN);
         c->fs[n] = fdb_txn_get_start(tr, &k, false);
         n++;
     }
@@ -1250,7 +1261,7 @@ static int fused_collect_entries(struct fused_ctx *c, const struct fdb_key *ent_
         const uint8_t *s;
 
         fdb_kv_at(page->kvs, (int)i, &kv);
-        s = key_suffix(ent_base, &kv, 4);
+        s = key_suffix(ent_base, &kv, FDB_KEY_BE32_LEN); /* the ordinal */
         if (s == NULL || fdb_get_u32(s) != i ||
             !fdb_stripe_ent_decode(kv.value, (size_t)kv.value_length, &c->entries[i])) {
             return FDB_ERR_PLATFORM_ERROR; /* corrupt or incomplete stripe map */
@@ -1611,7 +1622,7 @@ static int recovery_table_body(FDBTransaction *tr, void *arg, enum mds_status *s
         struct fdb_recovery_val v;
 
         fdb_kv_at(page.kvs, (int)i, &kv);
-        s = key_suffix(&base, &kv, 8);
+        s = key_suffix(&base, &kv, FDB_KEY_BE64_LEN); /* the clientid */
         if (s == NULL || !fdb_recovery_decode(kv.value, (size_t)kv.value_length, &v)) {
             kvs_release(&page);
             c->n = 0;
@@ -1660,7 +1671,7 @@ static int recovery_index_body(FDBTransaction *tr, void *arg, enum mds_status *s
         const uint8_t *s;
 
         fdb_kv_at(page.kvs, (int)i, &kv);
-        s = key_suffix(&base, &kv, 8);
+        s = key_suffix(&base, &kv, FDB_KEY_BE64_LEN); /* the clientid */
         if (s == NULL) {
             kvs_release(&page);
             futures_drop(c->fs, 0, n);
@@ -1981,7 +1992,7 @@ static int journal_keys_body(FDBTransaction *tr, void *arg, enum mds_status *st_
         struct journal_key *jk;
 
         fdb_kv_at(page.kvs, (int)i, &kv);
-        s = key_suffix(&base, &kv, 9);
+        s = key_suffix(&base, &kv, FDB_JOURNAL_KEY_TAIL);
         if (s == NULL) {
             kvs_release(&page);
             return FDB_ERR_PLATFORM_ERROR;
@@ -1992,7 +2003,7 @@ static int journal_keys_body(FDBTransaction *tr, void *arg, enum mds_status *st_
         }
         jk = &c->keys[c->n_keys];
         jk->txn_id = fdb_get_u64(s);
-        jk->role = s[8];
+        jk->role = s[FDB_KEY_BE64_LEN];
         if (!fdb_journal_decode(kv.value, (size_t)kv.value_length, jk->txn_id, jk->role,
                                 &c->scratch)) {
             kvs_release(&page);
@@ -2640,7 +2651,7 @@ static fdb_error_t lock_test_page(FDBTransaction *tr, struct lock_test_ctx *c,
         struct mds_coord_lock_row row;
 
         fdb_kv_at(page.kvs, (int)i, &kv);
-        s = key_suffix(base, &kv, 8);
+        s = key_suffix(base, &kv, FDB_KEY_BE64_LEN); /* the lock_id */
         if (s == NULL || !fdb_lock_decode(kv.value, (size_t)kv.value_length, c->fileid,
                                           fdb_get_u64(s), &row)) {
             kvs_release(&page);
@@ -2762,7 +2773,7 @@ static int lock_scan_body(FDBTransaction *tr, void *arg, enum mds_status *st_out
         const uint8_t *s;
 
         fdb_kv_at(page.kvs, (int)i, &kv);
-        s = key_suffix(&base, &kv, 8);
+        s = key_suffix(&base, &kv, FDB_KEY_BE64_LEN); /* the lock_id */
         if (s == NULL || !fdb_lock_decode(kv.value, (size_t)kv.value_length, c->fileid,
                                           fdb_get_u64(s), &c->page[c->n])) {
             kvs_release(&page);
@@ -2843,12 +2854,12 @@ static int lock_owner_body(FDBTransaction *tr, void *arg, enum mds_status *st_ou
         return (int)err;
     }
     for (i = 0; i < c->idx.n; i++) {
-        const uint8_t *s = c->idx.suffixes + (size_t)i * 16U;
+        const uint8_t *s = c->idx.suffixes + (size_t)i * FDB_LOCK_KEY_TAIL;
         struct mds_coord_lock_row *row = &c->page[c->n];
 
         if (c->idx.vals[i] != NULL &&
             fdb_lock_decode(c->idx.vals[i], c->idx.lens[i], fdb_get_u64(s),
-                            fdb_get_u64(s + 8), row) &&
+                            fdb_get_u64(s + FDB_KEY_BE64_LEN), row) &&
             lock_owner_eq(row, c->clientid, c->owner, c->owner_len)) {
             c->n++;
         }
@@ -2874,7 +2885,7 @@ static enum mds_status fdb_lock_scan_owner(struct mds_catalogue *cat, uint64_t c
     if (c == NULL) {
         return MDS_ERR_NOMEM;
     }
-    idx_scan_init(&c->idx, be_of(cat), 16U, FDB_KT_LOCK);
+    idx_scan_init(&c->idx, be_of(cat), FDB_LOCK_KEY_TAIL, FDB_KT_LOCK);
     c->clientid = clientid;
     c->owner = owner;
     c->owner_len = owner_len;
@@ -2921,17 +2932,19 @@ static bool lock_owner_key_parse(const struct fdb_key *base, const FDBKeyValue *
     size_t rest;
     uint32_t owner_len;
 
-    if (kv->key_length <= 0 || (size_t)kv->key_length < base->len + 4U + 16U) {
+    if (kv->key_length <= 0 ||
+        (size_t)kv->key_length < base->len + FDB_KEY_BE32_LEN + FDB_LOCK_KEY_TAIL) {
         return false;
     }
     s = kv->key + base->len;
     rest = (size_t)kv->key_length - base->len;
     owner_len = fdb_get_u32(s);
-    if (owner_len > 128U || rest != 4U + (size_t)owner_len + 16U) {
+    if (owner_len > 128U || rest != FDB_KEY_BE32_LEN + (size_t)owner_len + FDB_LOCK_KEY_TAIL) {
         return false;
     }
-    *fileid = fdb_get_u64(s + 4 + owner_len);
-    *lock_id = fdb_get_u64(s + 12 + owner_len);
+    s += FDB_KEY_BE32_LEN + owner_len;
+    *fileid = fdb_get_u64(s);
+    *lock_id = fdb_get_u64(s + FDB_KEY_BE64_LEN);
     return true;
 }
 

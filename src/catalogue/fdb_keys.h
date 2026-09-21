@@ -224,6 +224,13 @@ struct fdb_key_range {
  * Generic builder
  * ----------------------------------------------------------------------- */
 
+/** Encoded widths of the fixed-width components -- what fdb_key_u8,
+ *  fdb_key_be32 and fdb_key_be64 append -- for code that parses a key
+ *  back (a range page's keys are validated against base + these). */
+#define FDB_KEY_U8_LEN   sizeof(uint8_t)
+#define FDB_KEY_BE32_LEN sizeof(uint32_t)
+#define FDB_KEY_BE64_LEN sizeof(uint64_t)
+
 /** Start @p k with the prefix and @p type. */
 static inline void fdb_key_init(struct fdb_key *k, const struct fdb_key_prefix *p,
                                 enum fdb_key_type type)
@@ -258,7 +265,7 @@ static inline void fdb_key_u8(struct fdb_key *k, uint8_t v)
 
 static inline void fdb_key_be32(struct fdb_key *k, uint32_t v)
 {
-    uint8_t b[4];
+    uint8_t b[FDB_KEY_BE32_LEN];
 
     fdb_put_u32(b, v);
     fdb_key_bytes(k, b, sizeof(b));
@@ -266,7 +273,7 @@ static inline void fdb_key_be32(struct fdb_key *k, uint32_t v)
 
 static inline void fdb_key_be64(struct fdb_key *k, uint64_t v)
 {
-    uint8_t b[8];
+    uint8_t b[FDB_KEY_BE64_LEN];
 
     fdb_put_u64(b, v);
     fdb_key_bytes(k, b, sizeof(b));

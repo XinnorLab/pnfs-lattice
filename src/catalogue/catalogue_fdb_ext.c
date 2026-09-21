@@ -873,7 +873,7 @@ static int stripe_entries_finish(FDBFuture *f, const struct fdb_stripe_hdr_val *
         FDBKeyValue kv;
 
         fdb_kv_at(kvs, i, &kv);
-        if (kv.key_length != (int)key_base_len + 4 ||
+        if (kv.key_length != (int)(key_base_len + FDB_KEY_BE32_LEN) ||
             fdb_get_u32(kv.key + key_base_len) != (uint32_t)i ||
             !fdb_stripe_ent_decode(kv.value, (size_t)kv.value_length, &entries[i])) {
             fdb_future_destroy(f);
@@ -1167,7 +1167,7 @@ static int scan_collect_headers(FDBTransaction *tr, struct stripe_scan_ctx *c)
         uint32_t n_ent;
 
         fdb_kv_at(kvs, i, &kv);
-        if (kv.key_length != (int)base.len + 8 ||
+        if (kv.key_length != (int)(base.len + FDB_KEY_BE64_LEN) ||
             !fdb_stripe_hdr_decode(kv.value, (size_t)kv.value_length, &sf->hdr)) {
             fdb_future_destroy(f);
             return FDB_ERR_PLATFORM_ERROR; /* corrupt header row */
@@ -1640,7 +1640,7 @@ static int queue_page_body(FDBTransaction *tr, void *arg, enum mds_status *st_ou
         int rc;
 
         fdb_kv_at(kvs, i, &kv);
-        if (kv.key_length != (int)c->base.len + 8 || kv.value_length < 0) {
+        if (kv.key_length != (int)(c->base.len + FDB_KEY_BE64_LEN) || kv.value_length < 0) {
             fdb_future_destroy(f);
             return FDB_ERR_PLATFORM_ERROR; /* corrupt key */
         }
@@ -1849,7 +1849,7 @@ static bool gc_idx_head(const struct gc_idx_page *pg, uint32_t base_len, uint64_
     FDBKeyValue kv;
 
     fdb_kv_at(pg->kvs, pg->pos, &kv);
-    if (kv.key_length != (int)base_len + 8) {
+    if (kv.key_length != (int)(base_len + FDB_KEY_BE64_LEN)) {
         return false;
     }
     *seq = fdb_get_u64(kv.key + base_len);
@@ -2613,7 +2613,7 @@ static enum mds_status fdb_shard_fileid_get(struct mds_catalogue *cat, uint64_t 
                                             uint32_t *shard_id)
 {
     struct fdb_backend *b = be_of(cat);
-    uint8_t buf[4];
+    uint8_t buf[sizeof(uint32_t)]; /* SHARD_FILEID value: one LE u32 */
     size_t len = 0;
     struct fdb_key k;
     enum mds_status st;
@@ -2633,7 +2633,7 @@ static enum mds_status fdb_shard_fileid_put(struct mds_catalogue *cat, struct md
                                             uint64_t fileid, uint32_t shard_id)
 {
     struct fdb_backend *b = be_of(cat);
-    uint8_t enc[4];
+    uint8_t enc[sizeof(uint32_t)]; /* SHARD_FILEID value: one LE u32 */
     struct fdb_key k;
 
     (void)txn;
