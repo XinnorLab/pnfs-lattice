@@ -31,8 +31,9 @@
  *   ns_remove*           R dirent || R parent blob -> RR child [|| RR child
  *                        dirents limit 1 for a directory]; W clear dirent +
  *                        dirent_seq, final: clear INODE/XATTR/INLINE/STRIPE
- *                        ranges [+ W GC rows] / non-final: W blob; parent
- *                        touch [A nlink -1 for a directory child]
+ *                        ranges [+ W GC rows with their GC_BY_OWNER keys] /
+ *                        non-final: W blob; parent touch [A nlink -1 for a
+ *                        directory child]
  *   ns_rename*           R src dirent || R dst dirent || R src parent blob
  *                        || R dst parent blob -> RR src child [|| RR victim
  *                        || RR victim dirents limit 1]; W clear src dirent +
@@ -66,6 +67,7 @@
 #include <time.h>
 
 #include "catalogue_fdb.h"
+#include "catalogue_fdb_internal.h"
 #include "catalogue_internal.h"
 #include "ds_prealloc.h"
 #include "fdb_codec.h"
@@ -1206,16 +1208,16 @@ static int remove_resolve(FDBTransaction *tr, const struct remove_ctx *c,
     return FDB_BODY_COMMIT;
 }
 
+/* The caller's GC rows, each with its GC_BY_OWNER key, stamped with
+ * this MDS's id (the same shape gc_enqueue writes). */
 static int remove_write_gc_rows(FDBTransaction *tr, const struct remove_ctx *c,
                                 uint64_t child_fileid)
 {
-    uint8_t enc[FDB_GC_ENC_MAX];
-    struct fdb_key k;
     uint32_t i;
 
     for (i = 0; i < c->gc_count; i++) {
         struct mds_gc_entry e;
-        size_t len = 0;
+        int rc;
 
         memset(&e, 0, sizeof(e));
         e.gc_seq = c->gc_seqs[i];
@@ -1228,11 +1230,10 @@ static int remove_write_gc_rows(FDBTransaction *tr, const struct remove_ctx *c,
             e.nfs_fh_len = MDS_NFS_FH_MAX;
         }
         memcpy(e.nfs_fh, c->gc_entries[i].nfs_fh, e.nfs_fh_len);
-        if (!fdb_gc_encode(&e, enc, sizeof(enc), &len)) {
-            return FDB_ERR_PLATFORM_ERROR;
+        rc = fdb_gc_row_set(tr, &c->b->prefix, &e);
+        if (rc != 0) {
+            return rc;
         }
-        fdb_key_gc(&k, &c->b->prefix, e.gc_seq);
-        fdb_txn_set(tr, &k, enc, len);
     }
     return 0;
 }

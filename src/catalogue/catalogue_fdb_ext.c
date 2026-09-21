@@ -40,10 +40,17 @@
  *   ds_provision_get/put/del      R / W / R presence -> W clear
  *   quota_rule_get / _put         R / W
  *   quota_usage_get / _put        R / W (absolute upsert)
- *   gc_enqueue                    seq from the GC_SEQ batch allocator; W
- *   gc_peek / gc_peek_batch       page: RR rows, owner filter
- *   gc_dequeue                    R presence -> W clear
- *   gc_count                      page: RR rows, owner filter, count
+ *   gc_enqueue                    seq from the GC_SEQ batch allocator; W row,
+ *                                 W GC_BY_OWNER key (blind)
+ *   gc_peek / gc_peek_batch       mds_id != 0: RR GC_BY_OWNER + mds_id || RR
+ *                                 GC_BY_OWNER + 0 (cap keys each) -> merge
+ *                                 by seq -> R || ... || R rows (waves of
+ *                                 FDB_EXT_QUEUE_PAGE); mds_id == 0: page: RR
+ *                                 GC rows
+ *   gc_dequeue                    R row -> W clear row + GC_BY_OWNER key
+ *   gc_count                      mds_id != 0: page: RR GC_BY_OWNER + mds_id,
+ *                                 then + 0, count keys; mds_id == 0: page:
+ *                                 RR GC rows, count
  *   remove_pending_enqueue        seq from the REMOVE_SEQ allocator; W
  *   remove_pending_enqueue_unlink R dirent || R child blob; W child blob
  *                                 (DELETE_PENDING), W clear dirent +
@@ -61,23 +68,30 @@
  *
  * GC visibility.  gc_peek, gc_peek_batch and gc_count see the rows
  * whose owner_mds_id is 0 (legacy) or this MDS's id, exactly like the
- * RonDB backend (filter off when this MDS's id is 0); gc_enqueue stamps
- * the owner like ns_remove_known_gc does.  ds_gc.c drops a peeked row
- * whose ds_id is not mounted on the draining MDS, so on a store shared
- * by several daemons an unfiltered peek would let a peer drain -- and
- * drop -- rows it cannot service.  The inherited consequence is that a
- * dead MDS's rows wait for its restart under the same id: reaping
+ * RonDB backend (every row when this MDS's id is 0); gc_enqueue and
+ * the fused remove (catalogue_fdb_ns.c) stamp the owner.  ds_gc.c
+ * drops a peeked row whose ds_id is not mounted on the draining MDS,
+ * so on a store shared by several daemons an unfiltered peek would let
+ * a peer drain -- and drop -- rows it cannot service.  A dead MDS's
+ * rows therefore wait for its restart under the same id; reaping
  * foreign rows is a recovery-time job (an epoch-aware sweep), not a
- * peek-time one.  A filtered peek pages over the queue skipping foreign
- * rows and stops after FDB_EXT_EXAMINE_CAP(cap) examined rows, RonDB's
- * bound, so a sparse owner still returns promptly (possibly with fewer
- * rows than it owns, as on RonDB).
+ * peek-time one.  The filter is structural, not a scan: every row has
+ * a GC_BY_OWNER key (fdb_keys.h) written and cleared with it, and a
+ * filtered peek pages the two owner prefixes it may drain (its own id
+ * and 0), merges them by seq and point-reads the rows -- O(rows it may
+ * drain) whatever a dead peer's backlog is.  A walk of the GC table
+ * with a row filter cannot give that: the peer's rows are older, hence
+ * sorted first, and any examine cap that keeps a peek prompt would
+ * stop before this MDS's rows for ever.  FDB_EXT_EXAMINE_CAP(cap)
+ * still bounds the walks in which every row is a candidate (the id-0
+ * peek and the manifest peek).
  *
  * Counts.  gc_count and remove_pending_count are exact paged counts
- * (RonDB semantics) that saturate at FDB_EXT_COUNT_MAX examined rows so
- * the metrics gauge they feed stays bounded in time.  A maintained
- * META counter is not an option: catalogue_fdb_ns.c's fused remove
- * writes GC rows directly and would drift it.
+ * (RonDB semantics) that saturate at FDB_EXT_COUNT_MAX examined keys so
+ * the metrics gauge they feed stays bounded in time; a filtered
+ * gc_count pages the two index prefixes, the others page the tables.
+ * A maintained META counter is not an option: catalogue_fdb_ns.c's
+ * fused remove writes GC rows directly and would drift it.
  *
  * Sequences.  GC and manifest sequences come from the META batch
  * allocators (fdb_backend_alloc_id), so their order is the order the
@@ -98,6 +112,7 @@
 #include <time.h>
 
 #include "catalogue_fdb.h"
+#include "catalogue_fdb_internal.h"
 #include "catalogue_internal.h"
 #include "fdb_codec.h"
 #include "fdb_keys.h"
@@ -1637,11 +1652,13 @@ static enum mds_status fdb_quota_usage_put(struct mds_catalogue *cat, struct mds
 }
 
 /* -----------------------------------------------------------------------
- * Sequence-keyed queues (GC, delete manifest): a paged, read-only walk
- * in ascending sequence order.  Every row is handed to a visitor; the
- * visitor filters, copies out and says when the caller's capacity is
- * reached.  A page is one transaction; a retried page re-runs from the
- * position saved at its start, so nothing is counted or copied twice.
+ * Sequence-keyed ranges (the GC and manifest tables, one owner's prefix
+ * of the GC index): a paged, read-only walk in ascending sequence order
+ * over the keys `base + be64 seq`.  Every key is handed to a visitor
+ * with its value; the visitor filters, copies out and says when the
+ * caller's capacity is reached.  A page is one transaction; a retried
+ * page re-runs from the position saved at its start, so nothing is
+ * counted or copied twice.
  * ----------------------------------------------------------------------- */
 
 struct queue_pos {
@@ -1659,7 +1676,7 @@ typedef int (*queue_visit_fn)(struct queue_ctx *c, uint64_t seq, const uint8_t *
 
 struct queue_ctx {
     struct fdb_backend *b;
-    enum fdb_key_type   type;
+    struct fdb_key      base;      /**< The range walked: base + be64 seq. */
     uint32_t            page;      /**< Rows per range read. */
     struct queue_pos    start;     /**< Position at the start of the page. */
     struct queue_pos    cur;       /**< Position reached by the page. */
@@ -1672,7 +1689,6 @@ struct queue_ctx {
 static int queue_page_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
 {
     struct queue_ctx *c = arg;
-    struct fdb_key base;
     struct fdb_key_range r;
     const FDBKeyValue *kvs = NULL;
     FDBFuture *f;
@@ -1684,12 +1700,11 @@ static int queue_page_body(FDBTransaction *tr, void *arg, enum mds_status *st_ou
     c->cur = c->start;
     c->more = false;
     c->stop = false;
-    fdb_key_init(&base, &c->b->prefix, c->type);
-    if (!fdb_key_range_prefix(&r, &base)) {
+    if (!fdb_key_range_prefix(&r, &c->base)) {
         return FDB_ERR_PLATFORM_ERROR;
     }
     if (c->cur.have_cursor) {
-        r.begin = base;
+        r.begin = c->base;
         fdb_key_be64(&r.begin, c->cur.cursor);
         fdb_key_u8(&r.begin, 0); /* strictly after the last examined row */
     }
@@ -1707,11 +1722,11 @@ static int queue_page_body(FDBTransaction *tr, void *arg, enum mds_status *st_ou
         int rc;
 
         fdb_kv_at(kvs, i, &kv);
-        if (kv.key_length != (int)base.len + 8 || kv.value_length < 0) {
+        if (kv.key_length != (int)c->base.len + 8 || kv.value_length < 0) {
             fdb_future_destroy(f);
             return FDB_ERR_PLATFORM_ERROR; /* corrupt key */
         }
-        seq = fdb_get_u64(kv.key + base.len);
+        seq = fdb_get_u64(kv.key + c->base.len);
         rc = c->visit(c, seq, kv.value, (size_t)kv.value_length);
         if (rc < 0) {
             fdb_future_destroy(f);
@@ -1748,26 +1763,61 @@ static enum mds_status queue_walk(struct queue_ctx *c, const char *op, uint64_t 
     }
 }
 
-static void queue_init(struct queue_ctx *c, struct fdb_backend *b, enum fdb_key_type type,
-                       uint32_t page, queue_visit_fn visit, void *arg)
+/* Walk the keys under @p base (a table, or one owner's index prefix). */
+static void queue_init_base(struct queue_ctx *c, struct fdb_backend *b,
+                            const struct fdb_key *base, uint32_t page, queue_visit_fn visit,
+                            void *arg)
 {
     memset(c, 0, sizeof(*c));
     c->b = b;
-    c->type = type;
+    c->base = *base;
     c->page = page;
     c->visit = visit;
     c->arg = arg;
 }
 
+/* Walk the whole table @p type. */
+static void queue_init(struct queue_ctx *c, struct fdb_backend *b, enum fdb_key_type type,
+                       uint32_t page, queue_visit_fn visit, void *arg)
+{
+    struct fdb_key base;
+
+    fdb_key_init(&base, &b->prefix, type);
+    queue_init_base(c, b, &base, page, visit, arg);
+}
+
 /* -----------------------------------------------------------------------
  * GC queue
+ *
+ * Two views (header comment, "GC visibility").  An MDS with an id
+ * drains its own rows and the legacy rows (owner 0) and reaches them
+ * through GC_BY_OWNER; an MDS with id 0 sees every row and walks the
+ * GC table with the sequence walk above.  Both deliver ascending seq.
  * ----------------------------------------------------------------------- */
 
-/* The rows this MDS drains: legacy rows (owner 0) and its own; every
- * row when the MDS id is 0.  See the header comment. */
-static bool gc_visible(const struct fdb_backend *b, uint32_t owner)
+/* Largest batch one index peek materialises (ds_gc asks for at most
+ * 4096, DS_GC_MAX_BATCH_SIZE).  A larger cap is served up to this
+ * bound: fewer rows than asked for is always a legal answer, and the
+ * bound keeps the per-call scratch (one seq per candidate) fixed. */
+#define FDB_EXT_GC_PEEK_MAX       65536U
+
+_Static_assert(FDB_EXT_GC_PEEK_MAX <= 0x7FFFFFFFU, "range limits are fdb_c ints");
+
+struct gc_enqueue_ctx {
+    struct fdb_backend  *b;
+    struct mds_gc_entry  e;
+};
+
+static int gc_enqueue_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
 {
-    return b->mds_id == 0 || owner == 0 || owner == b->mds_id;
+    struct gc_enqueue_ctx *c = arg;
+    int rc = fdb_gc_row_set(tr, &c->b->prefix, &c->e);
+
+    if (rc != 0) {
+        return rc;
+    }
+    *st_out = MDS_OK;
+    return FDB_BODY_COMMIT;
 }
 
 static enum mds_status fdb_gc_enqueue(struct mds_catalogue *cat, struct mds_cat_txn *txn,
@@ -1775,10 +1825,7 @@ static enum mds_status fdb_gc_enqueue(struct mds_catalogue *cat, struct mds_cat_
                                       uint32_t fh_len, uint32_t sweep_hint)
 {
     struct fdb_backend *b = be_of(cat);
-    struct mds_gc_entry e;
-    uint8_t enc[FDB_GC_ENC_MAX];
-    size_t len = 0;
-    struct fdb_key k;
+    struct gc_enqueue_ctx c;
     uint64_t seq = 0;
     enum mds_status st;
 
@@ -1787,27 +1834,26 @@ static enum mds_status fdb_gc_enqueue(struct mds_catalogue *cat, struct mds_cat_
         return MDS_ERR_INVAL;
     }
     /* The sequence is minted once per call: a retried attempt rewrites
-     * the same row. */
+     * the same row and the same index key. */
     st = fdb_backend_alloc_id(b, FDB_META_GC_SEQ, &seq);
     if (st != MDS_OK) {
         return st;
     }
-    memset(&e, 0, sizeof(e));
-    e.gc_seq = seq;
-    e.fileid = fileid;
-    e.ds_id = ds_id;
-    e.owner_mds_id = b->mds_id;
-    e.sweep_hint = sweep_hint;
-    e.nfs_fh_len = fh_len;
+    memset(&c, 0, sizeof(c));
+    c.b = b;
+    c.e.gc_seq = seq;
+    c.e.fileid = fileid;
+    c.e.ds_id = ds_id;
+    c.e.owner_mds_id = b->mds_id;
+    c.e.sweep_hint = sweep_hint;
+    c.e.nfs_fh_len = fh_len;
     if (fh_len > 0) {
-        memcpy(e.nfs_fh, nfs_fh, fh_len);
+        memcpy(c.e.nfs_fh, nfs_fh, fh_len);
     }
-    if (!fdb_gc_encode(&e, enc, sizeof(enc), &len)) {
-        return MDS_ERR_INVAL;
-    }
-    fdb_key_gc(&k, &b->prefix, seq);
-    return run_set(b, "gc_enqueue", &k, enc, len);
+    return fdb_run_txn(b, FDB_TXN_MUTATING, "gc_enqueue", gc_enqueue_body, &c);
 }
+
+/* --- peek: the id-0 view, a walk of the GC table ------------------------ */
 
 struct gc_peek_arg {
     struct mds_gc_entry *entries;
@@ -1822,29 +1868,19 @@ static int gc_peek_visit(struct queue_ctx *c, uint64_t seq, const uint8_t *val, 
     if (!fdb_gc_decode(val, vlen, &e)) {
         return -1;
     }
-    if (!gc_visible(c->b, e.owner_mds_id)) {
-        return 0;
-    }
     e.gc_seq = seq;
     a->entries[c->cur.n] = e;
     c->cur.n++;
     return (c->cur.n >= a->cap) ? 1 : 0;
 }
 
-static enum mds_status fdb_gc_peek_batch(struct mds_catalogue *cat, struct mds_gc_entry *entries,
-                                         uint32_t cap, uint32_t *n_out)
+static enum mds_status gc_walk_peek(struct fdb_backend *b, struct mds_gc_entry *entries,
+                                    uint32_t cap, uint32_t *n_out)
 {
-    struct fdb_backend *b = be_of(cat);
     struct queue_ctx q;
     struct gc_peek_arg a;
     enum mds_status st;
 
-    if (n_out != NULL) {
-        *n_out = 0;
-    }
-    if (b == NULL || entries == NULL || cap == 0 || n_out == NULL) {
-        return MDS_ERR_INVAL;
-    }
     a.entries = entries;
     a.cap = cap;
     queue_init(&q, b, FDB_KT_GC, FDB_EXT_QUEUE_PAGE, gc_peek_visit, &a);
@@ -1853,6 +1889,251 @@ static enum mds_status fdb_gc_peek_batch(struct mds_catalogue *cat, struct mds_g
         *n_out = q.cur.n;
     }
     return st;
+}
+
+/* --- peek: the owner view, through GC_BY_OWNER ------------------------- */
+
+/* Heap allocated once per call (the wave of futures). */
+struct gc_idx_ctx {
+    struct fdb_backend  *b;
+    struct mds_gc_entry *entries;   /**< Caller's array; want slots are used. */
+    uint32_t             want;      /**< Rows asked for (<= FDB_EXT_GC_PEEK_MAX). */
+    uint32_t             n;         /**< Rows delivered. */
+    uint32_t             base_len;  /**< Bytes of an index key before its seq. */
+    uint64_t            *seqs;      /**< want slots: the merged candidates (heap). */
+    FDBFuture           *fs[FDB_EXT_QUEUE_PAGE]; /**< One wave of row reads. */
+};
+
+/* One owner's index page while it is merged. */
+struct gc_idx_page {
+    const FDBKeyValue *kvs;
+    int                count;
+    int                pos;
+};
+
+/* Start the range read of the first @p limit index keys of @p owner. */
+static FDBFuture *gc_idx_start(FDBTransaction *tr, const struct fdb_key_prefix *p,
+                               uint32_t owner, uint32_t limit)
+{
+    struct fdb_key_range r;
+
+    fdb_key_gc_by_owner_prefix(&r.begin, p, owner);
+    if (!fdb_key_range_prefix(&r, &r.begin)) {
+        return NULL;
+    }
+    return fdb_txn_get_range_start(tr, &r, (int)limit, false, false);
+}
+
+/* The seq of the page's next key; false when the key is not
+ * prefix + be64 (a corrupt index). */
+static bool gc_idx_head(const struct gc_idx_page *pg, uint32_t base_len, uint64_t *seq)
+{
+    FDBKeyValue kv;
+
+    fdb_kv_at(pg->kvs, pg->pos, &kv);
+    if (kv.key_length != (int)base_len + 8) {
+        return false;
+    }
+    *seq = fdb_get_u64(kv.key + base_len);
+    return true;
+}
+
+/* Merge the two owner pages by ascending seq into c->seqs, at most
+ * c->want of them.  Each page holds the smallest seqs of its owner, so
+ * the merged prefix is the smallest seqs of both together. */
+static int gc_idx_merge(struct gc_idx_ctx *c, struct gc_idx_page *own,
+                        struct gc_idx_page *legacy, uint32_t *n_out)
+{
+    uint32_t n = 0;
+
+    while (n < c->want && (own->pos < own->count || legacy->pos < legacy->count)) {
+        bool have_own = own->pos < own->count;
+        bool have_legacy = legacy->pos < legacy->count;
+        uint64_t so = 0;
+        uint64_t sl = 0;
+
+        if ((have_own && !gc_idx_head(own, c->base_len, &so)) ||
+            (have_legacy && !gc_idx_head(legacy, c->base_len, &sl))) {
+            return FDB_ERR_PLATFORM_ERROR; /* corrupt index key */
+        }
+        if (have_own && (!have_legacy || so <= sl)) {
+            c->seqs[n] = so;
+            own->pos++;
+        } else {
+            c->seqs[n] = sl;
+            legacy->pos++;
+        }
+        n++;
+    }
+    *n_out = n;
+    return 0;
+}
+
+/* Wave 1: the first c->want keys of this MDS's prefix and of the
+ * legacy prefix, read in parallel and merged. */
+static int gc_idx_collect(FDBTransaction *tr, struct gc_idx_ctx *c, uint32_t *n_out)
+{
+    const struct fdb_key_prefix *p = &c->b->prefix;
+    struct gc_idx_page own;
+    struct gc_idx_page legacy;
+    FDBFuture *f_own;
+    FDBFuture *f_legacy;
+    bool more = false;
+    fdb_error_t err;
+    fdb_error_t err2;
+    int rc;
+
+    memset(&own, 0, sizeof(own));
+    memset(&legacy, 0, sizeof(legacy));
+    f_own = gc_idx_start(tr, p, c->b->mds_id, c->want);
+    f_legacy = gc_idx_start(tr, p, 0, c->want);
+    err = fdb_txn_get_range_wait(f_own, &own.kvs, &own.count, &more);
+    err2 = fdb_txn_get_range_wait(f_legacy, &legacy.kvs, &legacy.count, &more);
+    if (err == 0) {
+        err = err2;
+    }
+    rc = (err == 0) ? gc_idx_merge(c, &own, &legacy, n_out) : (int)err;
+    if (f_own != NULL) {
+        fdb_future_destroy(f_own);
+    }
+    if (f_legacy != NULL) {
+        fdb_future_destroy(f_legacy);
+    }
+    return rc;
+}
+
+/* Finish the row read @p f of @p seq into *e (gc_seq set from the key);
+ * *found is false when the row is absent. */
+static fdb_error_t gc_row_finish(FDBFuture *f, uint64_t seq, struct mds_gc_entry *e,
+                                 bool *found)
+{
+    uint8_t buf[FDB_GC_ENC_MAX];
+    size_t len = 0;
+    fdb_error_t err;
+
+    err = fdb_txn_get_finish(f, buf, sizeof(buf), &len, found);
+    if (err != 0 || !*found) {
+        return err;
+    }
+    if (!fdb_gc_decode(buf, len, e)) {
+        return FDB_ERR_PLATFORM_ERROR; /* corrupt row */
+    }
+    e->gc_seq = seq;
+    return 0;
+}
+
+/* Wave 2: the rows of c->seqs[0 .. n), FDB_EXT_QUEUE_PAGE parallel
+ * point reads at a time, appended to c->entries in seq order.  A key
+ * whose row is absent is skipped: row and key are written and cleared
+ * in one transaction and this is one snapshot, so only a foreign
+ * writer could produce one. */
+static int gc_idx_rows(FDBTransaction *tr, struct gc_idx_ctx *c, uint32_t n)
+{
+    const struct fdb_key_prefix *p = &c->b->prefix;
+    uint32_t done = 0;
+
+    while (done < n) {
+        uint32_t wave = n - done;
+        fdb_error_t err = 0;
+        uint32_t i;
+
+        if (wave > FDB_EXT_QUEUE_PAGE) {
+            wave = FDB_EXT_QUEUE_PAGE;
+        }
+        for (i = 0; i < wave; i++) {
+            struct fdb_key k;
+
+            fdb_key_gc(&k, p, c->seqs[done + i]);
+            c->fs[i] = fdb_txn_get_start(tr, &k, false);
+        }
+        /* Every future is finished, even after an error, so none leaks. */
+        for (i = 0; i < wave; i++) {
+            bool found = false;
+            fdb_error_t e2 = gc_row_finish(c->fs[i], c->seqs[done + i], &c->entries[c->n],
+                                           &found);
+
+            c->fs[i] = NULL;
+            if (e2 != 0) {
+                if (err == 0) {
+                    err = e2;
+                }
+            } else if (err == 0 && found) {
+                c->n++;
+            }
+        }
+        if (err != 0) {
+            return (int)err;
+        }
+        done += wave;
+    }
+    return 0;
+}
+
+static int gc_idx_peek_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
+{
+    struct gc_idx_ctx *c = arg;
+    uint32_t n = 0;
+    int rc;
+
+    c->n = 0;
+    rc = gc_idx_collect(tr, c, &n);
+    if (rc == 0) {
+        rc = gc_idx_rows(tr, c, n);
+    }
+    if (rc != 0) {
+        return rc;
+    }
+    *st_out = MDS_OK;
+    return FDB_BODY_COMMIT;
+}
+
+/* One read-only transaction, two dependent waves (three or more only
+ * above FDB_EXT_QUEUE_PAGE rows). */
+static enum mds_status gc_idx_peek(struct fdb_backend *b, struct mds_gc_entry *entries,
+                                   uint32_t cap, uint32_t *n_out)
+{
+    struct gc_idx_ctx *c;
+    struct fdb_key base;
+    enum mds_status st;
+
+    c = calloc(1, sizeof(*c));
+    if (c == NULL) {
+        return MDS_ERR_NOMEM;
+    }
+    c->b = b;
+    c->entries = entries;
+    c->want = (cap < FDB_EXT_GC_PEEK_MAX) ? cap : FDB_EXT_GC_PEEK_MAX;
+    fdb_key_gc_by_owner_prefix(&base, &b->prefix, 0);
+    c->base_len = base.len;
+    c->seqs = calloc(c->want, sizeof(*c->seqs));
+    if (c->seqs == NULL) {
+        free(c);
+        return MDS_ERR_NOMEM;
+    }
+    st = fdb_run_txn(b, FDB_TXN_READONLY, "gc_peek_batch", gc_idx_peek_body, c);
+    if (st == MDS_OK) {
+        *n_out = c->n;
+    }
+    free(c->seqs);
+    free(c);
+    return st;
+}
+
+static enum mds_status fdb_gc_peek_batch(struct mds_catalogue *cat, struct mds_gc_entry *entries,
+                                         uint32_t cap, uint32_t *n_out)
+{
+    struct fdb_backend *b = be_of(cat);
+
+    if (n_out != NULL) {
+        *n_out = 0;
+    }
+    if (b == NULL || entries == NULL || cap == 0 || n_out == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (b->mds_id == 0) {
+        return gc_walk_peek(b, entries, cap, n_out);
+    }
+    return gc_idx_peek(b, entries, cap, n_out);
 }
 
 static enum mds_status fdb_gc_peek(struct mds_catalogue *cat, struct mds_gc_entry *entry)
@@ -1870,24 +2151,78 @@ static enum mds_status fdb_gc_peek(struct mds_catalogue *cat, struct mds_gc_entr
     return (n == 1) ? MDS_OK : MDS_ERR_NOTFOUND;
 }
 
+/* --- dequeue ------------------------------------------------------------ */
+
+struct gc_dequeue_ctx {
+    struct fdb_backend *b;
+    uint64_t            gc_seq;
+};
+
+/* The row is read for its owner, then row and index key are cleared
+ * together.  An absent row is MDS_ERR_NOTFOUND with nothing written
+ * (a repeated dequeue), as before the index existed; a row that does
+ * not decode is corrupt (MDS_ERR_IO), as a peek over it reports. */
+static int gc_dequeue_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
+{
+    struct gc_dequeue_ctx *c = arg;
+    struct mds_gc_entry e;
+    struct fdb_key k;
+    uint8_t buf[FDB_GC_ENC_MAX];
+    size_t len = 0;
+    bool found = false;
+    fdb_error_t err;
+
+    fdb_key_gc(&k, &c->b->prefix, c->gc_seq);
+    err = fdb_txn_get(tr, &k, false, buf, sizeof(buf), &len, &found);
+    if (err != 0) {
+        return (int)err;
+    }
+    if (!found) {
+        *st_out = MDS_ERR_NOTFOUND;
+        return FDB_BODY_DONE;
+    }
+    if (!fdb_gc_decode(buf, len, &e)) {
+        return FDB_ERR_PLATFORM_ERROR;
+    }
+    fdb_gc_row_clear(tr, &c->b->prefix, c->gc_seq, e.owner_mds_id);
+    *st_out = MDS_OK;
+    return FDB_BODY_COMMIT;
+}
+
 static enum mds_status fdb_gc_dequeue(struct mds_catalogue *cat, struct mds_cat_txn *txn,
                                       uint64_t gc_seq)
 {
     struct fdb_backend *b = be_of(cat);
-    struct fdb_key k;
+    struct gc_dequeue_ctx c;
 
     (void)txn;
     if (b == NULL) {
         return MDS_ERR_INVAL;
     }
-    fdb_key_gc(&k, &b->prefix, gc_seq);
-    return run_clear(b, "gc_dequeue", &k, true);
+    c.b = b;
+    c.gc_seq = gc_seq;
+    return fdb_run_txn(b, FDB_TXN_MUTATING, "gc_dequeue", gc_dequeue_body, &c);
 }
+
+/* --- count -------------------------------------------------------------- */
 
 struct count_arg {
     uint64_t count;
 };
 
+/* Every key counts (an index prefix, the manifest table). */
+static int count_visit(struct queue_ctx *c, uint64_t seq, const uint8_t *val, size_t vlen)
+{
+    struct count_arg *a = c->arg;
+
+    (void)seq;
+    (void)val;
+    (void)vlen;
+    a->count++;
+    return 0;
+}
+
+/* GC rows of the id-0 walk: decoded, so a corrupt row is reported. */
 static int gc_count_visit(struct queue_ctx *c, uint64_t seq, const uint8_t *val, size_t vlen)
 {
     struct count_arg *a = c->arg;
@@ -1897,15 +2232,32 @@ static int gc_count_visit(struct queue_ctx *c, uint64_t seq, const uint8_t *val,
     if (!fdb_gc_decode(val, vlen, &e)) {
         return -1;
     }
-    if (gc_visible(c->b, e.owner_mds_id)) {
-        a->count++;
-    }
+    a->count++;
     return 0;
 }
 
 static uint32_t count_clamp(uint64_t n)
 {
     return (n > UINT32_MAX) ? UINT32_MAX : (uint32_t)n;
+}
+
+/* Add the number of index keys of @p owner to *count, examining at
+ * most @p budget of them. */
+static enum mds_status gc_idx_count(struct fdb_backend *b, uint32_t owner, uint64_t budget,
+                                    uint64_t *count)
+{
+    struct queue_ctx q;
+    struct count_arg a = { 0 };
+    struct fdb_key base;
+    enum mds_status st;
+
+    fdb_key_gc_by_owner_prefix(&base, &b->prefix, owner);
+    queue_init_base(&q, b, &base, FDB_EXT_COUNT_PAGE, count_visit, &a);
+    st = queue_walk(&q, "gc_count", budget);
+    if (st == MDS_OK) {
+        *count += a.count;
+    }
+    return st;
 }
 
 static enum mds_status fdb_gc_count(struct mds_catalogue *cat, uint32_t *count)
@@ -1917,6 +2269,20 @@ static enum mds_status fdb_gc_count(struct mds_catalogue *cat, uint32_t *count)
 
     if (b == NULL || count == NULL) {
         return MDS_ERR_INVAL;
+    }
+    if (b->mds_id != 0) {
+        uint64_t total = 0;
+
+        /* Own keys first; the legacy keys get what is left of the
+         * examine budget, so the two together saturate like one walk. */
+        st = gc_idx_count(b, b->mds_id, FDB_EXT_COUNT_MAX, &total);
+        if (st == MDS_OK && total < FDB_EXT_COUNT_MAX) {
+            st = gc_idx_count(b, 0, FDB_EXT_COUNT_MAX - total, &total);
+        }
+        if (st == MDS_OK) {
+            *count = count_clamp(total);
+        }
+        return st;
     }
     queue_init(&q, b, FDB_KT_GC, FDB_EXT_COUNT_PAGE, gc_count_visit, &a);
     st = queue_walk(&q, "gc_count", FDB_EXT_COUNT_MAX);
@@ -2246,17 +2612,6 @@ static enum mds_status fdb_remove_pending_bump_retry(struct mds_catalogue *cat,
     return fdb_run_txn(b, FDB_TXN_MUTATING, "remove_pending_bump_retry", rp_bump_body, &c);
 }
 
-static int rp_count_visit(struct queue_ctx *c, uint64_t seq, const uint8_t *val, size_t vlen)
-{
-    struct count_arg *a = c->arg;
-
-    (void)seq;
-    (void)val;
-    (void)vlen;
-    a->count++;
-    return 0;
-}
-
 static enum mds_status fdb_remove_pending_count(struct mds_catalogue *cat, uint32_t *count)
 {
     struct fdb_backend *b = be_of(cat);
@@ -2267,7 +2622,7 @@ static enum mds_status fdb_remove_pending_count(struct mds_catalogue *cat, uint3
     if (b == NULL || count == NULL) {
         return MDS_ERR_INVAL;
     }
-    queue_init(&q, b, FDB_KT_REMOVE_PENDING, FDB_EXT_COUNT_PAGE, rp_count_visit, &a);
+    queue_init(&q, b, FDB_KT_REMOVE_PENDING, FDB_EXT_COUNT_PAGE, count_visit, &a);
     st = queue_walk(&q, "remove_pending_count", FDB_EXT_COUNT_MAX);
     if (st == MDS_OK) {
         *count = count_clamp(a.count);

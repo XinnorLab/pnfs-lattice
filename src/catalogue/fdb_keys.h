@@ -53,6 +53,15 @@
  *   XATTR           + be64 fileid + name             -> raw value bytes
  *   INLINE          + be64 fileid                    -> raw data bytes
  *   GC              + be64 gc_seq                    -> fdb_gc codec
+ *   GC_BY_OWNER     + be32 owner_mds_id + be64 gc_seq -> empty
+ *     owner_mds_id is the row's owner (0 = legacy).  Written and
+ *     cleared with the GC row in the same transaction, never alone.
+ *     An MDS with an id drains the rows of its own id and of owner 0
+ *     and finds them by paging these two prefixes instead of walking
+ *     the GC table, so a dead peer's backlog -- older, hence sorted
+ *     first -- cannot starve it (catalogue_fdb_ext.c).  Schema version
+ *     2 (catalogue_fdb.h): a version-1 keyspace holds GC rows without
+ *     index keys and must be re-initialised.
  *   REMOVE_PENDING  + be64 remove_seq                -> fdb_remove_pending codec
  *   LAYOUT_STATE    + stateid_other[12]              -> fdb_layout codec
  *   LAYOUT_BY_FILE  + be64 fileid + stateid_other[12]        -> empty
@@ -168,6 +177,7 @@ enum fdb_key_type {
     FDB_KT_NODE_REGISTRY     = 0x26,
     FDB_KT_PARTITION_MAP     = 0x27,
     FDB_KT_WITNESS           = 0x28,
+    FDB_KT_GC_BY_OWNER       = 0x29,
 };
 
 /** META sub-keys (the u8 after the META type byte). */
@@ -443,6 +453,23 @@ static inline void fdb_key_gc(struct fdb_key *k, const struct fdb_key_prefix *p,
                               uint64_t gc_seq)
 {
     fdb_key_init(k, p, FDB_KT_GC);
+    fdb_key_be64(k, gc_seq);
+}
+
+/** GC_BY_OWNER + be32 owner_mds_id: the range base of one owner's GC
+ *  rows, in gc_seq order. */
+static inline void fdb_key_gc_by_owner_prefix(struct fdb_key *k, const struct fdb_key_prefix *p,
+                                              uint32_t owner_mds_id)
+{
+    fdb_key_init(k, p, FDB_KT_GC_BY_OWNER);
+    fdb_key_be32(k, owner_mds_id);
+}
+
+/** The index key of the GC row @p gc_seq owned by @p owner_mds_id. */
+static inline void fdb_key_gc_by_owner(struct fdb_key *k, const struct fdb_key_prefix *p,
+                                       uint32_t owner_mds_id, uint64_t gc_seq)
+{
+    fdb_key_gc_by_owner_prefix(k, p, owner_mds_id);
     fdb_key_be64(k, gc_seq);
 }
 

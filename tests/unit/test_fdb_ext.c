@@ -20,6 +20,11 @@
  *   GC rows come back in ascending sequence, gc_count matches the
  *   number enqueued (below the saturation cap) and the owner filter
  *   hides another MDS's rows while legacy (owner 0) rows stay visible;
+ *   the owner filter is the GC_BY_OWNER index, not a scan: a dead
+ *   peer's backlog larger than the examine cap ahead of this MDS's
+ *   rows leaves peek, peek_batch and count exact, legacy rows
+ *   interleave by seq, dequeue clears row and index key together and
+ *   the fused remove writes the index too;
  *   remove_pending claims are exclusive until they expire,
  *   enqueue_unlink is guarded by (child, generation), scan_all pages;
  *   the DS registry holds exactly MDS_MAX_DS_NODES ids and refuses more.
@@ -38,6 +43,7 @@
 #ifdef HAVE_FDB
 
 #include "catalogue_fdb.h"
+#include "catalogue_fdb_internal.h"
 #include "catalogue_internal.h"
 #include "fdb_codec.h"
 #include "fdb_keys.h"
@@ -834,6 +840,383 @@ static void test_gc_queue(void)
 }
 
 /* -----------------------------------------------------------------------
+ * GC owner index (GC_BY_OWNER)
+ * ----------------------------------------------------------------------- */
+
+/* A dead peer's backlog ahead of this MDS's rows, larger than what a
+ * peek walking the GC table with a row filter would examine before
+ * giving up: FDB_EXT_EXAMINE_CAP(1) = 1 * 256 + 4096 rows, checked only
+ * between pages of FDB_EXT_QUEUE_PAGE = 1024 rows (catalogue_fdb_ext.c),
+ * so such a walk reads 5 pages = 5120 rows and stops.  Any backlog
+ * beyond that would hide our rows from it for ever. */
+#define GC_FOREIGN_N       (5U * 1024U + 200U)
+/* Foreign rows written per raw transaction. */
+#define GC_FOREIGN_TXN     512U
+/* The dead peer and its fileids. */
+#define GC_FOREIGN_MDS_ID  2U
+#define GC_FOREIGN_FILEID  910000ULL
+/* This handle's rows behind the backlog, and the interleave test's. */
+#define GC_OWN_N           3U
+#define GC_OWN_FILEID      920000ULL
+#define GC_MIX_FILEID      930000ULL
+/* Raw index scans read at most this many keys (above every count). */
+#define GC_RAW_SCAN_LIMIT  (GC_FOREIGN_N + 64U)
+
+/* One raw batch of GC rows of a foreign owner, written the way a
+ * peer's gc_enqueue writes them (row + GC_BY_OWNER key). */
+struct gc_raw_write {
+    struct fdb_backend *b;
+    uint32_t            owner;
+    uint32_t            n;
+    uint64_t            seqs[GC_FOREIGN_TXN];
+    uint64_t            fileid_base;
+};
+
+static int gc_raw_write_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
+{
+    struct gc_raw_write *c = arg;
+    uint32_t i;
+
+    for (i = 0; i < c->n; i++) {
+        struct mds_gc_entry e;
+        int rc;
+
+        memset(&e, 0, sizeof(e));
+        e.gc_seq = c->seqs[i];
+        e.fileid = c->fileid_base + i;
+        e.ds_id = 1;
+        e.owner_mds_id = c->owner;
+        e.nfs_fh_len = 1;
+        e.nfs_fh[0] = 0xF0;
+        rc = fdb_gc_row_set(tr, &c->b->prefix, &e);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    *st_out = MDS_OK;
+    return FDB_BODY_COMMIT;
+}
+
+/* Write GC_FOREIGN_N rows of GC_FOREIGN_MDS_ID; seqs are minted from
+ * this handle's allocator, so they precede everything enqueued after. */
+static enum mds_status gc_write_foreign_backlog(struct fdb_backend *b)
+{
+    struct gc_raw_write *c = calloc(1, sizeof(*c));
+    uint32_t done;
+    enum mds_status st = MDS_OK;
+
+    if (c == NULL) {
+        return MDS_ERR_NOMEM;
+    }
+    c->b = b;
+    c->owner = GC_FOREIGN_MDS_ID;
+    for (done = 0; done < GC_FOREIGN_N && st == MDS_OK; done += c->n) {
+        uint32_t i;
+
+        c->n = GC_FOREIGN_N - done;
+        if (c->n > GC_FOREIGN_TXN) {
+            c->n = GC_FOREIGN_TXN;
+        }
+        c->fileid_base = GC_FOREIGN_FILEID + done;
+        for (i = 0; i < c->n && st == MDS_OK; i++) {
+            st = fdb_backend_alloc_id(b, FDB_META_GC_SEQ, &c->seqs[i]);
+        }
+        if (st == MDS_OK) {
+            st = fdb_run_txn(b, FDB_TXN_MUTATING, "test_gc_raw_write", gc_raw_write_body, c);
+        }
+    }
+    free(c);
+    return st;
+}
+
+/* Raw read of one owner's GC_BY_OWNER prefix: key count and first seq. */
+struct gc_raw_scan {
+    struct fdb_backend *b;
+    uint32_t            owner;
+    int                 count;
+    uint64_t            first_seq;
+};
+
+static int gc_raw_scan_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
+{
+    struct gc_raw_scan *c = arg;
+    struct fdb_key_range r;
+    const FDBKeyValue *kvs = NULL;
+    FDBFuture *f;
+    bool more = false;
+    fdb_error_t err;
+
+    c->count = 0;
+    c->first_seq = 0;
+    fdb_key_gc_by_owner_prefix(&r.begin, &c->b->prefix, c->owner);
+    if (!fdb_key_range_prefix(&r, &r.begin)) {
+        return FDB_ERR_PLATFORM_ERROR;
+    }
+    f = fdb_txn_get_range_start(tr, &r, (int)GC_RAW_SCAN_LIMIT, false, false);
+    err = fdb_txn_get_range_wait(f, &kvs, &c->count, &more);
+    if (err == 0 && c->count > 0) {
+        FDBKeyValue kv;
+
+        fdb_kv_at(kvs, 0, &kv);
+        c->first_seq = fdb_get_u64(kv.key + r.begin.len);
+    }
+    if (f != NULL) {
+        fdb_future_destroy(f);
+    }
+    if (err != 0) {
+        return (int)err;
+    }
+    *st_out = MDS_OK;
+    return FDB_BODY_COMMIT;
+}
+
+/* Number of index keys under @p owner, -1 on a failed read. */
+static int gc_index_count(struct fdb_backend *b, uint32_t owner, uint64_t *first_seq)
+{
+    struct gc_raw_scan c;
+
+    memset(&c, 0, sizeof(c));
+    c.b = b;
+    c.owner = owner;
+    if (fdb_run_txn(b, FDB_TXN_READONLY, "test_gc_raw_scan", gc_raw_scan_body, &c) != MDS_OK) {
+        return -1;
+    }
+    if (first_seq != NULL) {
+        *first_seq = c.first_seq;
+    }
+    return c.count;
+}
+
+/* Clear the GC table and the whole GC_BY_OWNER index (the foreign
+ * backlog is not drainable through any handle of this test). */
+static int gc_raw_wipe_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
+{
+    struct fdb_backend *b = arg;
+    struct fdb_key_range r;
+
+    fdb_key_gc_prefix(&r.begin, &b->prefix);
+    if (!fdb_key_range_prefix(&r, &r.begin)) {
+        return FDB_ERR_PLATFORM_ERROR;
+    }
+    fdb_txn_clear_range(tr, &r);
+    fdb_key_init(&r.begin, &b->prefix, FDB_KT_GC_BY_OWNER);
+    if (!fdb_key_range_prefix(&r, &r.begin)) {
+        return FDB_ERR_PLATFORM_ERROR;
+    }
+    fdb_txn_clear_range(tr, &r);
+    *st_out = MDS_OK;
+    return FDB_BODY_COMMIT;
+}
+
+/* (a) A backlog of a dead peer, older than everything of ours and
+ * larger than the examine cap, sits ahead of our rows: peek, peek_batch
+ * and count (e) answer exactly our rows; an id-0 handle sees every row
+ * (d); dequeue clears the row with its index key and repeats as
+ * NOTFOUND without touching anything (c). */
+static void test_gc_owner_index_starvation(void)
+{
+    struct fdb_backend *b = g_cat->backend_private;
+    struct mds_gc_entry entry;
+    struct mds_gc_entry batch[8];
+    struct mds_catalogue *legacy = NULL;
+    struct mds_catalogue *foreign = NULL;
+    uint8_t fh[3] = { 7, 8, 9 };
+    uint64_t first = 0;
+    uint32_t n = 0;
+    uint32_t i;
+
+    ASSERT_TRUE(b != NULL);
+    ASSERT_EQ(mds_cat_gc_count(g_cat, &n), MDS_OK);
+    ASSERT_EQ(n, 0);
+    ASSERT_EQ(gc_write_foreign_backlog(b), MDS_OK);
+    for (i = 0; i < GC_OWN_N; i++) {
+        ASSERT_EQ(mds_cat_gc_enqueue_hint(g_cat, NULL, GC_OWN_FILEID + i, 1 + i, fh, 3,
+                                          MDS_GC_SWEEP_GEOM(1, 1)), MDS_OK);
+    }
+
+    /* Ours, in seq order, whatever sits in front of them. */
+    ASSERT_EQ(mds_cat_gc_peek(g_cat, &entry), MDS_OK);
+    ASSERT_EQ(entry.fileid, GC_OWN_FILEID);
+    ASSERT_EQ(entry.owner_mds_id, TEST_MDS_ID);
+    ASSERT_EQ(mds_cat_gc_peek_batch(g_cat, batch, 8, &n), MDS_OK);
+    ASSERT_EQ(n, GC_OWN_N);
+    for (i = 0; i < n; i++) {
+        ASSERT_EQ(batch[i].fileid, GC_OWN_FILEID + i);
+        ASSERT_EQ(batch[i].ds_id, 1 + i);
+        ASSERT_EQ(batch[i].owner_mds_id, TEST_MDS_ID);
+        ASSERT_EQ(batch[i].sweep_hint, MDS_GC_SWEEP_GEOM(1, 1));
+        ASSERT_TRUE(i == 0 || batch[i - 1].gc_seq < batch[i].gc_seq);
+    }
+    ASSERT_EQ(mds_cat_gc_count(g_cat, &n), MDS_OK);
+    ASSERT_EQ(n, GC_OWN_N);
+    ASSERT_EQ(gc_index_count(b, TEST_MDS_ID, &first), (int)GC_OWN_N);
+    ASSERT_EQ(first, batch[0].gc_seq);
+    ASSERT_EQ(gc_index_count(b, GC_FOREIGN_MDS_ID, NULL), (int)GC_FOREIGN_N);
+    ASSERT_EQ(gc_index_count(b, 0, NULL), 0);
+
+    /* The peer itself and an id-0 handle see the backlog. */
+    legacy = open_as(0);
+    foreign = open_as(GC_FOREIGN_MDS_ID);
+    ASSERT_TRUE(legacy != NULL && foreign != NULL);
+    ASSERT_EQ(mds_cat_gc_count(foreign, &n), MDS_OK);
+    ASSERT_EQ(n, GC_FOREIGN_N);
+    ASSERT_EQ(mds_cat_gc_peek(foreign, &entry), MDS_OK);
+    ASSERT_EQ(entry.fileid, GC_FOREIGN_FILEID);
+    ASSERT_EQ(entry.owner_mds_id, GC_FOREIGN_MDS_ID);
+    ASSERT_EQ(mds_cat_gc_count(legacy, &n), MDS_OK);
+    ASSERT_EQ(n, GC_FOREIGN_N + GC_OWN_N);
+    ASSERT_EQ(mds_cat_gc_peek_batch(legacy, batch, 8, &n), MDS_OK);
+    ASSERT_EQ(n, 8);
+    for (i = 0; i < n; i++) {
+        ASSERT_EQ(batch[i].fileid, GC_FOREIGN_FILEID + i);
+    }
+
+    /* Dequeue: row and index key go together; a repeat changes nothing. */
+    ASSERT_EQ(mds_cat_gc_peek_batch(g_cat, batch, 8, &n), MDS_OK);
+    ASSERT_EQ(n, GC_OWN_N);
+    ASSERT_EQ(mds_cat_gc_dequeue(g_cat, NULL, batch[0].gc_seq), MDS_OK);
+    ASSERT_EQ(gc_index_count(b, TEST_MDS_ID, &first), (int)GC_OWN_N - 1);
+    ASSERT_EQ(first, batch[1].gc_seq);
+    ASSERT_EQ(mds_cat_gc_peek(g_cat, &entry), MDS_OK);
+    ASSERT_EQ(entry.fileid, GC_OWN_FILEID + 1U);
+    ASSERT_EQ(mds_cat_gc_dequeue(g_cat, NULL, batch[0].gc_seq), MDS_ERR_NOTFOUND);
+    ASSERT_EQ(gc_index_count(b, TEST_MDS_ID, &first), (int)GC_OWN_N - 1);
+    ASSERT_EQ(first, batch[1].gc_seq);
+    ASSERT_EQ(mds_cat_gc_count(g_cat, &n), MDS_OK);
+    ASSERT_EQ(n, GC_OWN_N - 1);
+    for (i = 1; i < GC_OWN_N; i++) {
+        ASSERT_EQ(mds_cat_gc_dequeue(g_cat, NULL, batch[i].gc_seq), MDS_OK);
+    }
+    ASSERT_EQ(gc_index_count(b, TEST_MDS_ID, NULL), 0);
+    ASSERT_EQ(mds_cat_gc_peek(g_cat, &entry), MDS_ERR_NOTFOUND);
+    ASSERT_EQ(mds_cat_gc_count(g_cat, &n), MDS_OK);
+    ASSERT_EQ(n, 0);
+    ASSERT_EQ(mds_cat_gc_count(foreign, &n), MDS_OK);
+    ASSERT_EQ(n, GC_FOREIGN_N);
+
+    /* The backlog belongs to nobody here: wipe it raw. */
+    ASSERT_EQ(fdb_run_txn(b, FDB_TXN_MUTATING, "test_gc_raw_wipe", gc_raw_wipe_body, b),
+              MDS_OK);
+    ASSERT_EQ(mds_cat_gc_count(legacy, &n), MDS_OK);
+    ASSERT_EQ(n, 0);
+    ASSERT_EQ(gc_index_count(b, GC_FOREIGN_MDS_ID, NULL), 0);
+    mds_catalogue_close(legacy);
+    mds_catalogue_close(foreign);
+}
+
+/* (b) Legacy rows (owner 0) are visible to every owner and take their
+ * place by seq among the owner's rows. */
+static void test_gc_owner_index_legacy_interleave(void)
+{
+    struct fdb_backend *b = g_cat->backend_private;
+    struct mds_gc_entry batch[8];
+    struct mds_catalogue *legacy = open_as(0);
+    struct mds_catalogue *other = open_as(GC_FOREIGN_MDS_ID);
+    uint8_t fh[2] = { 1, 2 };
+    uint64_t first = 0;
+    uint32_t n = 0;
+    uint32_t i;
+
+    ASSERT_TRUE(b != NULL && legacy != NULL && other != NULL);
+    ASSERT_EQ(mds_cat_gc_enqueue(g_cat, NULL, GC_MIX_FILEID, 1, fh, 2), MDS_OK);
+    ASSERT_EQ(mds_cat_gc_enqueue(legacy, NULL, GC_MIX_FILEID + 1U, 1, fh, 2), MDS_OK);
+    ASSERT_EQ(mds_cat_gc_enqueue(g_cat, NULL, GC_MIX_FILEID + 2U, 1, fh, 2), MDS_OK);
+
+    ASSERT_EQ(mds_cat_gc_peek_batch(g_cat, batch, 8, &n), MDS_OK);
+    ASSERT_EQ(n, 3);
+    for (i = 0; i < n; i++) {
+        ASSERT_EQ(batch[i].fileid, GC_MIX_FILEID + i);
+        ASSERT_TRUE(i == 0 || batch[i - 1].gc_seq < batch[i].gc_seq);
+    }
+    ASSERT_EQ(batch[0].owner_mds_id, TEST_MDS_ID);
+    ASSERT_EQ(batch[1].owner_mds_id, 0);
+    ASSERT_EQ(batch[2].owner_mds_id, TEST_MDS_ID);
+    ASSERT_EQ(mds_cat_gc_count(g_cat, &n), MDS_OK);
+    ASSERT_EQ(n, 3);
+    /* Another owner sees the legacy row alone. */
+    ASSERT_EQ(mds_cat_gc_peek_batch(other, batch, 8, &n), MDS_OK);
+    ASSERT_EQ(n, 1);
+    ASSERT_EQ(batch[0].fileid, GC_MIX_FILEID + 1U);
+    ASSERT_EQ(mds_cat_gc_count(other, &n), MDS_OK);
+    ASSERT_EQ(n, 1);
+    ASSERT_EQ(gc_index_count(b, 0, &first), 1);
+    ASSERT_EQ(first, batch[0].gc_seq);
+
+    /* Draining through one owner's handle clears the legacy row's own
+     * index key: the owner comes from the row, not from the handle. */
+    ASSERT_EQ(mds_cat_gc_peek_batch(g_cat, batch, 8, &n), MDS_OK);
+    ASSERT_EQ(n, 3);
+    for (i = 0; i < n; i++) {
+        ASSERT_EQ(mds_cat_gc_dequeue(g_cat, NULL, batch[i].gc_seq), MDS_OK);
+    }
+    ASSERT_EQ(gc_index_count(b, 0, NULL), 0);
+    ASSERT_EQ(gc_index_count(b, TEST_MDS_ID, NULL), 0);
+    ASSERT_EQ(mds_cat_gc_count(legacy, &n), MDS_OK);
+    ASSERT_EQ(n, 0);
+    mds_catalogue_close(legacy);
+    mds_catalogue_close(other);
+}
+
+/* (f) The fused final unlink (catalogue_fdb_ns.c) writes the index
+ * with its GC rows: an owner-scoped peek finds them. */
+static void test_gc_fused_remove_indexed(void)
+{
+    struct fdb_backend *b = g_cat->backend_private;
+    struct mds_ds_map_entry entries[2];
+    struct mds_gc_entry batch[8];
+    struct mds_inode child;
+    struct mds_inode seen;
+    uint32_t sc = 0;
+    uint32_t n = 0;
+    uint32_t i;
+    bool safe = true;
+    bool folded = false;
+
+    ASSERT_TRUE(b != NULL);
+    memset(&child, 0, sizeof(child));
+    ASSERT_EQ(mds_cat_alloc_fileid(g_cat, NULL, &child.fileid), MDS_OK);
+    child.type = MDS_FTYPE_REG;
+    child.mode = 0644;
+    child.nlink = 1;
+    child.change = 1;
+    child.generation = 1;
+    child.parent_fileid = MDS_FILEID_ROOT;
+    child.stripe_count = 2;
+    child.stripe_unit = 65536;
+    child.mirror_count = 1;
+    fill_entries(entries, 2, 4);
+    ASSERT_EQ(mds_cat_ns_create_wide(g_cat, MDS_FILEID_ROOT, "gc-wide", &child, 2, 65536, 1,
+                                     entries, &safe), MDS_OK);
+    ASSERT_TRUE(!safe);
+    ASSERT_EQ(mds_cat_ns_getattr(g_cat, child.fileid, &seen), MDS_OK);
+    ASSERT_EQ(mds_cat_ns_remove_known_gc(g_cat, NULL, MDS_FILEID_ROOT, "gc-wide", &seen, 2,
+                                         entries, 2, MDS_GC_SWEEP_GEOM(2, 1), &folded), MDS_OK);
+    ASSERT_TRUE(folded);
+    /* REMOVE purged the map with the inode (op_remove snapshots it first). */
+    ASSERT_EQ(mds_cat_ns_getattr(g_cat, child.fileid, &seen), MDS_ERR_NOTFOUND);
+    ASSERT_EQ(mds_cat_stripe_map_get(g_cat, child.fileid, &sc, NULL, NULL, NULL),
+              MDS_ERR_NOTFOUND);
+
+    ASSERT_EQ(mds_cat_gc_peek_batch(g_cat, batch, 8, &n), MDS_OK);
+    ASSERT_EQ(n, 2);
+    for (i = 0; i < n; i++) {
+        ASSERT_EQ(batch[i].fileid, child.fileid);
+        ASSERT_EQ(batch[i].ds_id, entries[i].ds_id);
+        ASSERT_EQ(batch[i].owner_mds_id, TEST_MDS_ID);
+        ASSERT_EQ(batch[i].sweep_hint, MDS_GC_SWEEP_GEOM(2, 1));
+        ASSERT_EQ(batch[i].nfs_fh_len, entries[i].nfs_fh_len);
+        ASSERT_EQ(memcmp(batch[i].nfs_fh, entries[i].nfs_fh, entries[i].nfs_fh_len), 0);
+    }
+    ASSERT_EQ(gc_index_count(b, TEST_MDS_ID, NULL), 2);
+    for (i = 0; i < n; i++) {
+        ASSERT_EQ(mds_cat_gc_dequeue(g_cat, NULL, batch[i].gc_seq), MDS_OK);
+    }
+    ASSERT_EQ(gc_index_count(b, TEST_MDS_ID, NULL), 0);
+    ASSERT_EQ(mds_cat_gc_count(g_cat, &n), MDS_OK);
+    ASSERT_EQ(n, 0);
+}
+
+/* -----------------------------------------------------------------------
  * Async-REMOVE delete manifest
  * ----------------------------------------------------------------------- */
 
@@ -1163,6 +1546,9 @@ int main(void)
     RUN_TEST(test_ds_provision);
     RUN_TEST(test_quota);
     RUN_TEST(test_gc_queue);
+    RUN_TEST(test_gc_owner_index_starvation);
+    RUN_TEST(test_gc_owner_index_legacy_interleave);
+    RUN_TEST(test_gc_fused_remove_indexed);
     RUN_TEST(test_remove_pending_claims);
     RUN_TEST(test_remove_pending_enqueue_unlink);
     RUN_TEST(test_remove_pending_scan_paging);

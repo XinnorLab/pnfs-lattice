@@ -49,7 +49,7 @@ struct fdb_key_prefix;
 
 /** Schema stamp stored under META/FDB_META_SCHEMA_VERSION; open() and
  *  probe() refuse a keyspace stamped with any other value. */
-#define FDB_CAT_SCHEMA_VERSION 1U
+#define FDB_CAT_SCHEMA_VERSION 2U
 
 /**
  * Factory-shaped constructor for `catalogue_backend = fdb`.
