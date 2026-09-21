@@ -343,40 +343,81 @@ static void test_catalogue_coordination_cq_accepts_wide_ds_count(void)
  * merge (fc6bc2b) dropped the RonDB vtable entries and every HPC
  * hpc_shared create failed with EINVAL; this test fails the same way
  * if memdb (or any backend under test) loses the op again.
+ *
+ * Split in two so the fixture is always restored: the ASSERT_* macros
+ * return from the function they run in, and the checks below leave a
+ * raw alias dirent "b" -> inode("a") behind that the harness cannot
+ * remove (see dirent_insert_only_restore).
  */
-static void test_catalogue_dirent_insert_only(void)
+static void dirent_insert_only_checks(struct mds_catalogue *cat,
+				      uint64_t child_fid)
 {
-	struct mds_catalogue *cat;
-	struct mds_inode child;
-	char *path;
 	uint64_t fid = 0;
 	uint8_t typ = 0;
 
-	cat = open_test_cat(&path);
-
-	memset(&child, 0, sizeof(child));
-	ASSERT_EQ(mds_cat_ns_create(cat, NULL, g_dir, "a",
-				    MDS_FTYPE_REG, 0644, 0, 0, NULL,
-				    &child),
-		  MDS_OK);
-
 	/* Insert-only succeeds for a new name. */
 	ASSERT_EQ(mds_cat_dirent_insert(cat, NULL, g_dir, "b",
-					child.fileid, (uint8_t)MDS_FTYPE_REG),
+					child_fid, (uint8_t)MDS_FTYPE_REG),
 		  MDS_OK);
 	ASSERT_EQ(mds_cat_dirent_get(cat, g_dir, "b", &fid, &typ),
 		  MDS_OK);
-	ASSERT_EQ(fid, child.fileid);
+	ASSERT_EQ(fid, child_fid);
 
 	/* Second insert of the same name must NOT upsert. */
 	ASSERT_EQ(mds_cat_dirent_insert(cat, NULL, g_dir, "b",
-					child.fileid + 1,
+					child_fid + 1,
 					(uint8_t)MDS_FTYPE_REG),
 		  MDS_ERR_EXISTS);
 	fid = 0;
 	ASSERT_EQ(mds_cat_dirent_get(cat, g_dir, "b", &fid, &typ),
 		  MDS_OK);
-	ASSERT_EQ(fid, child.fileid);
+	ASSERT_EQ(fid, child_fid);
+}
+
+/*
+ * "b" is a raw dirent aliasing "a"'s inode with no nlink behind it.
+ * The harness cleanup removes entries in readdir order: removing "a"
+ * first deletes the inode, after which ns_remove("b") fails on the
+ * missing inode and the alias -- and with it the scratch directory --
+ * stays behind forever on a shared persistent store.  Drop the alias
+ * with dirent_del (no inode bookkeeping) BEFORE the ordinary remove of
+ * "a", then prove the directory is empty so the harness's removal of
+ * it cannot fail.
+ */
+static void dirent_insert_only_restore(struct mds_catalogue *cat)
+{
+	uint64_t fid = 0;
+	uint8_t typ = 0;
+	bool empty = false;
+
+	if (mds_cat_dirent_get(cat, g_dir, "b", &fid, &typ) == MDS_OK) {
+		ASSERT_EQ(mds_cat_dirent_del(cat, NULL, g_dir, "b"), MDS_OK);
+	}
+	ASSERT_EQ(mds_cat_dirent_get(cat, g_dir, "b", &fid, &typ),
+		  MDS_ERR_NOTFOUND);
+	ASSERT_EQ(mds_cat_ns_remove(cat, NULL, g_dir, "a"), MDS_OK);
+	ASSERT_EQ(mds_cat_dir_is_empty(cat, g_dir, &empty), MDS_OK);
+	ASSERT_TRUE(empty);
+}
+
+static void test_catalogue_dirent_insert_only(void)
+{
+	struct mds_catalogue *cat;
+	struct mds_inode child;
+	char *path;
+
+	cat = open_test_cat(&path);
+
+	memset(&child, 0, sizeof(child));
+	if (mds_cat_ns_create(cat, NULL, g_dir, "a", MDS_FTYPE_REG, 0644,
+			      0, 0, NULL, &child) != MDS_OK) {
+		fprintf(stderr, "  FAIL %s:%d: create \"a\"\n",
+			__FILE__, __LINE__);
+		current_test_failed = 1;
+	} else {
+		dirent_insert_only_checks(cat, child.fileid);
+		dirent_insert_only_restore(cat);
+	}
 
 	close_test_cat(cat, path);
 }
