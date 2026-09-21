@@ -159,26 +159,9 @@ int catalogue_fdb_inode_write(FDBTransaction *tr, const struct fdb_key_prefix *p
     return 0;
 }
 
-/* Write only the blob of @p ino (a directory's side keys untouched). */
-static int inode_write_blob(FDBTransaction *tr, const struct fdb_key_prefix *p,
-                            const struct mds_inode *ino)
-{
-    struct mds_inode blob_copy;
-    struct fdb_dir_counters ctr;
-    uint8_t enc[FDB_INODE_ENC_MAX];
-    size_t len = 0;
-    struct fdb_key k;
-
-    fdb_inode_split(ino, &blob_copy, &ctr);
-    if (!fdb_inode_encode(&blob_copy, enc, sizeof(enc), &len)) {
-        return FDB_ERR_PLATFORM_ERROR;
-    }
-    fdb_key_inode(&k, p, ino->fileid, FDB_INODE_PART_BLOB);
-    fdb_txn_set(tr, &k, enc, len);
-    return 0;
-}
-
-/* Start the range read of one logical inode (blob + side keys). */
+/* Start the range read of one logical inode (blob + side keys); the
+ * blob-only read and write are fdb_blob_read_start / fdb_blob_write
+ * (catalogue_fdb_internal.h). */
 static FDBFuture *inode_read_start(FDBTransaction *tr, const struct fdb_key_prefix *p,
                                    uint64_t fileid)
 {
@@ -252,61 +235,10 @@ static fdb_error_t inode_read_finish(FDBFuture *f, struct mds_inode *out, bool *
     return 0;
 }
 
-/* Point read of the blob alone: type/mode checks that must not conflict
- * with the directory counters.  *found false when absent. */
-static FDBFuture *blob_read_start(FDBTransaction *tr, const struct fdb_key_prefix *p,
-                                  uint64_t fileid)
-{
-    struct fdb_key k;
-
-    fdb_key_inode(&k, p, fileid, FDB_INODE_PART_BLOB);
-    return fdb_txn_get_start(tr, &k, false);
-}
-
-static fdb_error_t blob_read_finish(FDBFuture *f, struct mds_inode *out, bool *found)
-{
-    uint8_t buf[FDB_INODE_ENC_MAX];
-    size_t len = 0;
-    fdb_error_t err;
-
-    err = fdb_txn_get_finish(f, buf, sizeof(buf), &len, found);
-    if (err != 0) {
-        return err;
-    }
-    if (*found && !fdb_inode_decode(buf, len, out)) {
-        return FDB_ERR_PLATFORM_ERROR;
-    }
-    return 0;
-}
-
 /* -----------------------------------------------------------------------
- * Dirent primitives
+ * Dirent primitives (the reads and the clear are shared with the ext
+ * unit: catalogue_fdb_internal.h)
  * ----------------------------------------------------------------------- */
-
-static FDBFuture *dirent_read_start(FDBTransaction *tr, const struct fdb_key_prefix *p,
-                                    uint64_t parent, const char *name)
-{
-    struct fdb_key k;
-
-    fdb_key_dirent(&k, p, parent, name);
-    return fdb_txn_get_start(tr, &k, false);
-}
-
-static fdb_error_t dirent_read_finish(FDBFuture *f, struct fdb_dirent_val *out, bool *found)
-{
-    uint8_t buf[FDB_DIRENT_ENC_SIZE];
-    size_t len = 0;
-    fdb_error_t err;
-
-    err = fdb_txn_get_finish(f, buf, sizeof(buf), &len, found);
-    if (err != 0) {
-        return err;
-    }
-    if (*found && !fdb_dirent_decode(buf, len, out)) {
-        return FDB_ERR_PLATFORM_ERROR;
-    }
-    return 0;
-}
 
 /* Write the DIRENT row and its DIRENT_SEQ index row together. */
 static int dirent_write(FDBTransaction *tr, const struct fdb_key_prefix *p, uint64_t parent,
@@ -337,18 +269,6 @@ static int dirent_write(FDBTransaction *tr, const struct fdb_key_prefix *p, uint
     fdb_key_dirent_seq(&k, p, parent, seq);
     fdb_txn_set(tr, &k, enc, len);
     return 0;
-}
-
-/* Clear the DIRENT row and its DIRENT_SEQ index row together. */
-static void dirent_clear(FDBTransaction *tr, const struct fdb_key_prefix *p, uint64_t parent,
-                         const char *name, uint64_t seq)
-{
-    struct fdb_key k;
-
-    fdb_key_dirent(&k, p, parent, name);
-    fdb_txn_clear(tr, &k);
-    fdb_key_dirent_seq(&k, p, parent, seq);
-    fdb_txn_clear(tr, &k);
 }
 
 /* Directory bookkeeping: change += 1, mtime/ctime = now, nlink += delta
@@ -494,7 +414,7 @@ static int lookup_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
     bool found = false;
     fdb_error_t err;
 
-    err = dirent_read_finish(dirent_read_start(tr, &c->b->prefix, c->parent, c->name),
+    err = fdb_dirent_read_finish(fdb_dirent_read_start(tr, &c->b->prefix, c->parent, c->name),
                              &dv, &found);
     if (err != 0) {
         return (int)err;
@@ -606,20 +526,20 @@ static int create_check(FDBTransaction *tr, const struct create_ctx *c,
     fdb_error_t err2;
 
     *ok = false;
-    f_parent = blob_read_start(tr, &c->b->prefix, c->parent);
-    f_dirent = dirent_read_start(tr, &c->b->prefix, c->parent, c->name);
+    f_parent = fdb_blob_read_start(tr, &c->b->prefix, c->parent);
+    f_dirent = fdb_dirent_read_start(tr, &c->b->prefix, c->parent, c->name);
     if (c->check_child_absent) {
-        f_child = blob_read_start(tr, &c->b->prefix, c->child.fileid);
+        f_child = fdb_blob_read_start(tr, &c->b->prefix, c->child.fileid);
     }
-    err = blob_read_finish(f_parent, &parent, &parent_found);
-    err2 = dirent_read_finish(f_dirent, &dv, &dirent_found);
+    err = fdb_blob_read_finish(f_parent, &parent, &parent_found);
+    err2 = fdb_dirent_read_finish(f_dirent, &dv, &dirent_found);
     if (err == 0) {
         err = err2;
     }
     if (f_child != NULL) {
         struct mds_inode existing;
 
-        err2 = blob_read_finish(f_child, &existing, &child_found);
+        err2 = fdb_blob_read_finish(f_child, &existing, &child_found);
         if (err == 0) {
             err = err2;
         }
@@ -852,15 +772,15 @@ static int link_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
     fdb_error_t err2;
     int rc;
 
-    f_parent = blob_read_start(tr, &c->b->prefix, c->parent);
-    f_target = blob_read_start(tr, &c->b->prefix, c->target);
-    f_dirent = dirent_read_start(tr, &c->b->prefix, c->parent, c->name);
-    err = blob_read_finish(f_parent, &parent, &parent_found);
-    err2 = blob_read_finish(f_target, &target, &target_found);
+    f_parent = fdb_blob_read_start(tr, &c->b->prefix, c->parent);
+    f_target = fdb_blob_read_start(tr, &c->b->prefix, c->target);
+    f_dirent = fdb_dirent_read_start(tr, &c->b->prefix, c->parent, c->name);
+    err = fdb_blob_read_finish(f_parent, &parent, &parent_found);
+    err2 = fdb_blob_read_finish(f_target, &target, &target_found);
     if (err == 0) {
         err = err2;
     }
-    err2 = dirent_read_finish(f_dirent, &dv, &dirent_found);
+    err2 = fdb_dirent_read_finish(f_dirent, &dv, &dirent_found);
     if (err == 0) {
         err = err2;
     }
@@ -892,7 +812,7 @@ static int link_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
     target.nlink++;
     target.ctime = now;
     target.change++;
-    rc = inode_write_blob(tr, &c->b->prefix, &target);
+    rc = fdb_blob_write(tr, &c->b->prefix, &target);
     if (rc != 0) {
         return rc;
     }
@@ -986,7 +906,7 @@ static int setattr_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
     fdb_error_t err;
     int rc;
 
-    err = blob_read_finish(blob_read_start(tr, &c->b->prefix, c->fileid), &ino, &found);
+    err = fdb_blob_read_finish(fdb_blob_read_start(tr, &c->b->prefix, c->fileid), &ino, &found);
     if (err != 0) {
         return (int)err;
     }
@@ -1002,7 +922,7 @@ static int setattr_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
         /* Side keys are authoritative for the directory's mtime, ctime
          * and change: blind writes, no read of the hot counters. */
         if (blob_changed) {
-            rc = inode_write_blob(tr, &c->b->prefix, &ino);
+            rc = fdb_blob_write(tr, &c->b->prefix, &ino);
             if (rc != 0) {
                 return rc;
             }
@@ -1028,7 +948,7 @@ static int setattr_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
     }
     ino.ctime = now;
     ino.change++;
-    rc = inode_write_blob(tr, &c->b->prefix, &ino);
+    rc = fdb_blob_write(tr, &c->b->prefix, &ino);
     if (rc != 0) {
         return rc;
     }
@@ -1066,7 +986,7 @@ static int nlink_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
     bool found = false;
     fdb_error_t err;
 
-    err = blob_read_finish(blob_read_start(tr, &c->b->prefix, c->fileid), &ino, &found);
+    err = fdb_blob_read_finish(fdb_blob_read_start(tr, &c->b->prefix, c->fileid), &ino, &found);
     if (err != 0) {
         return (int)err;
     }
@@ -1083,7 +1003,7 @@ static int nlink_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
         int64_t n = (int64_t)ino.nlink + c->delta;
 
         ino.nlink = (n < 0) ? 0U : (uint32_t)n;
-        if (inode_write_blob(tr, &c->b->prefix, &ino) != 0) {
+        if (fdb_blob_write(tr, &c->b->prefix, &ino) != 0) {
             return FDB_ERR_PLATFORM_ERROR;
         }
     }
@@ -1147,10 +1067,10 @@ static int remove_resolve(FDBTransaction *tr, const struct remove_ctx *c,
     fdb_error_t err2;
 
     memset(pl, 0, sizeof(*pl));
-    f_dirent = dirent_read_start(tr, &c->b->prefix, c->parent, c->name);
-    f_parent = blob_read_start(tr, &c->b->prefix, c->parent);
-    err = dirent_read_finish(f_dirent, &pl->dv, &dirent_found);
-    err2 = blob_read_finish(f_parent, &parent, &pl->parent_found);
+    f_dirent = fdb_dirent_read_start(tr, &c->b->prefix, c->parent, c->name);
+    f_parent = fdb_blob_read_start(tr, &c->b->prefix, c->parent);
+    err = fdb_dirent_read_finish(f_dirent, &pl->dv, &dirent_found);
+    err2 = fdb_blob_read_finish(f_parent, &parent, &pl->parent_found);
     if (err == 0) {
         err = err2;
     }
@@ -1251,7 +1171,7 @@ static int remove_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
         return rc;
     }
     now = now_ts();
-    dirent_clear(tr, &c->b->prefix, c->parent, c->name, pl.dv.seq);
+    fdb_dirent_clear(tr, &c->b->prefix, c->parent, c->name, pl.dv.seq);
     if (pl.child_found && pl.final) {
         inode_purge(tr, &c->b->prefix, pl.dv.child_fileid);
         rc = remove_write_gc_rows(tr, c, pl.dv.child_fileid);
@@ -1262,7 +1182,7 @@ static int remove_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
         pl.child.nlink--;
         pl.child.ctime = now;
         pl.child.change++;
-        rc = inode_write_blob(tr, &c->b->prefix, &pl.child);
+        rc = fdb_blob_write(tr, &c->b->prefix, &pl.child);
         if (rc != 0) {
             return rc;
         }
@@ -1408,23 +1328,23 @@ static int rename_wave1(FDBTransaction *tr, const struct rename_ctx *c, struct r
     fdb_error_t err;
     fdb_error_t err2;
 
-    f_sd = dirent_read_start(tr, &c->b->prefix, c->sp, c->sn);
-    f_dd = dirent_read_start(tr, &c->b->prefix, c->dp, c->dn);
-    f_sp = blob_read_start(tr, &c->b->prefix, c->sp);
+    f_sd = fdb_dirent_read_start(tr, &c->b->prefix, c->sp, c->sn);
+    f_dd = fdb_dirent_read_start(tr, &c->b->prefix, c->dp, c->dn);
+    f_sp = fdb_blob_read_start(tr, &c->b->prefix, c->sp);
     if (c->dp != c->sp) {
-        f_dp = blob_read_start(tr, &c->b->prefix, c->dp);
+        f_dp = fdb_blob_read_start(tr, &c->b->prefix, c->dp);
     }
-    err = dirent_read_finish(f_sd, &pl->src, &src_found);
-    err2 = dirent_read_finish(f_dd, &pl->dst, &pl->dst_found);
+    err = fdb_dirent_read_finish(f_sd, &pl->src, &src_found);
+    err2 = fdb_dirent_read_finish(f_dd, &pl->dst, &pl->dst_found);
     if (err == 0) {
         err = err2;
     }
-    err2 = blob_read_finish(f_sp, &sp_ino, &pl->sp_found);
+    err2 = fdb_blob_read_finish(f_sp, &sp_ino, &pl->sp_found);
     if (err == 0) {
         err = err2;
     }
     if (f_dp != NULL) {
-        err2 = blob_read_finish(f_dp, &dp_ino, &dp_found);
+        err2 = fdb_blob_read_finish(f_dp, &dp_ino, &dp_found);
         if (err == 0) {
             err = err2;
         }
@@ -1550,7 +1470,7 @@ static int rename_drop_victim(FDBTransaction *tr, const struct rename_ctx *c,
         }
         v->ctime = now;
         v->change++;
-        return inode_write_blob(tr, &c->b->prefix, v);
+        return fdb_blob_write(tr, &c->b->prefix, v);
     }
     inode_purge_keep_stripes(tr, &c->b->prefix, v->fileid);
     return 0;
@@ -1579,7 +1499,7 @@ static int rename_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
 
     /* Every check passed: mutate. */
     now = now_ts();
-    dirent_clear(tr, &c->b->prefix, c->sp, c->sn, pl.src.seq);
+    fdb_dirent_clear(tr, &c->b->prefix, c->sp, c->sn, pl.src.seq);
     if (pl.dst_found) {
         struct fdb_key k;
 
@@ -1608,7 +1528,7 @@ static int rename_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
         }
         if (pl.sc_found) {
             pl.src_child.parent_fileid = c->dp;
-            rc = inode_write_blob(tr, &c->b->prefix, &pl.src_child);
+            rc = fdb_blob_write(tr, &c->b->prefix, &pl.src_child);
             if (rc != 0) {
                 return rc;
             }
@@ -2015,7 +1935,7 @@ static int dirent_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
     bool found = false;
     fdb_error_t err;
 
-    err = dirent_read_finish(dirent_read_start(tr, &c->b->prefix, c->parent, c->name), &old,
+    err = fdb_dirent_read_finish(fdb_dirent_read_start(tr, &c->b->prefix, c->parent, c->name), &old,
                              &found);
     if (err != 0) {
         return (int)err;
@@ -2025,7 +1945,7 @@ static int dirent_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
             *st_out = MDS_ERR_NOTFOUND;
             return FDB_BODY_DONE;
         }
-        dirent_clear(tr, &c->b->prefix, c->parent, c->name, old.seq);
+        fdb_dirent_clear(tr, &c->b->prefix, c->parent, c->name, old.seq);
         *st_out = MDS_OK;
         return FDB_BODY_COMMIT;
     }
@@ -2149,7 +2069,7 @@ static int inode_del_body(FDBTransaction *tr, void *arg, enum mds_status *st_out
     bool found = false;
     fdb_error_t err;
 
-    err = blob_read_finish(blob_read_start(tr, &c->b->prefix, c->fileid), &ino, &found);
+    err = fdb_blob_read_finish(fdb_blob_read_start(tr, &c->b->prefix, c->fileid), &ino, &found);
     if (err != 0) {
         return (int)err;
     }
@@ -2213,7 +2133,7 @@ static int touch_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
 
     /* The blob read keeps a blind ADD from materialising counters for a
      * directory that no longer exists; a missing row is MDS_OK. */
-    err = blob_read_finish(blob_read_start(tr, &c->b->prefix, c->fileid), &ino, &found);
+    err = fdb_blob_read_finish(fdb_blob_read_start(tr, &c->b->prefix, c->fileid), &ino, &found);
     if (err != 0) {
         return (int)err;
     }
