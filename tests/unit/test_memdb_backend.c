@@ -11,11 +11,13 @@
  * mutators see exactly-once semantics, callbacks may re-enter the same
  * handle, two instances share nothing, a full table changes nothing,
  * READDIR cookies are per dirent (hard-link safe), a layout renewal
- * never shrinks the persisted range, LOCKT sees foreign rows only, and
- * the cluster slots implement the Phase 1b registry contract.
+ * never shrinks the persisted range, LOCKT sees foreign rows only, the
+ * cluster slots implement the Phase 1b registry contract, and the link
+ * count saturates at both ends of uint32_t for any int32_t delta.
  */
 
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1792,6 +1794,55 @@ static void test_gc_queue_and_fused_remove(void)
     mds_catalogue_close(cat);
 }
 
+/* -----------------------------------------------------------------------
+ * 13. nlink_adjust saturates at both ends of the link count
+ * ----------------------------------------------------------------------- */
+
+/* Every int32_t delta is a legal argument, including INT32_MIN, whose
+ * negation exists in no int32_t: a delta below -nlink lands on 0 and
+ * never wraps, a delta past UINT32_MAX lands on UINT32_MAX, and a delta
+ * inside the range is applied exactly. */
+static void test_nlink_adjust_saturates(void)
+{
+    struct mds_catalogue *cat = catalogue_memdb_open();
+    struct mds_inode f;
+    struct mds_inode got;
+
+    ASSERT_TRUE(cat != NULL);
+    ASSERT_EQ(mds_cat_ns_create(cat, NULL, MDS_FILEID_ROOT, "n", MDS_FTYPE_REG,
+                                0644, 0, 0, NULL, &f), MDS_OK);
+
+    /* INT32_MIN on a small count clamps to 0. */
+    ASSERT_EQ(mds_cat_ns_nlink_adjust(cat, f.fileid, INT32_MIN), MDS_OK);
+    ASSERT_EQ(mds_cat_ns_getattr(cat, f.fileid, &got), MDS_OK);
+    ASSERT_EQ(got.nlink, 0U);
+
+    /* -1 on 0 stays 0. */
+    ASSERT_EQ(mds_cat_ns_nlink_adjust(cat, f.fileid, -1), MDS_OK);
+    ASSERT_EQ(mds_cat_ns_getattr(cat, f.fileid, &got), MDS_OK);
+    ASSERT_EQ(got.nlink, 0U);
+
+    /* INT32_MAX on a small count is the exact sum. */
+    ASSERT_EQ(mds_cat_ns_nlink_adjust(cat, f.fileid, 2), MDS_OK);
+    ASSERT_EQ(mds_cat_ns_nlink_adjust(cat, f.fileid, INT32_MAX), MDS_OK);
+    ASSERT_EQ(mds_cat_ns_getattr(cat, f.fileid, &got), MDS_OK);
+    ASSERT_EQ(got.nlink, (uint32_t)INT32_MAX + 2U);
+
+    /* Past UINT32_MAX saturates instead of wrapping. */
+    ASSERT_EQ(mds_cat_ns_nlink_adjust(cat, f.fileid, INT32_MAX), MDS_OK);
+    ASSERT_EQ(mds_cat_ns_getattr(cat, f.fileid, &got), MDS_OK);
+    ASSERT_EQ(got.nlink, UINT32_MAX);
+
+    /* INT32_MIN from the top is applied exactly, not clamped:
+     * UINT32_MAX + INT32_MIN == INT32_MAX. */
+    ASSERT_EQ(mds_cat_ns_nlink_adjust(cat, f.fileid, INT32_MIN), MDS_OK);
+    ASSERT_EQ(mds_cat_ns_getattr(cat, f.fileid, &got), MDS_OK);
+    ASSERT_EQ(got.nlink, (uint32_t)INT32_MAX);
+
+    ASSERT_EQ(mds_cat_ns_nlink_adjust(cat, 424242, 1), MDS_ERR_NOTFOUND);
+    mds_catalogue_close(cat);
+}
+
 /* ----------------------------------------------------------------------- */
 
 int main(void)
@@ -1813,6 +1864,7 @@ int main(void)
     RUN_TEST(test_coordination_tables_round_trip);
     RUN_TEST(test_namespace_semantics);
     RUN_TEST(test_gc_queue_and_fused_remove);
+    RUN_TEST(test_nlink_adjust_saturates);
 
     fprintf(stdout, "\n  %d/%d tests passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

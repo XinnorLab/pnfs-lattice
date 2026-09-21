@@ -49,6 +49,8 @@
 #include <assert.h>
 #include <pthread.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -1494,11 +1496,16 @@ static enum mds_status mem_ns_parent_touch(struct mds_catalogue *cat,
     return MDS_OK; /* a missing parent row is MDS_OK by contract */
 }
 
+/* The link count saturates at both ends of uint32_t: it is never
+ * negative and never wraps.  The sum is formed in int64_t, which holds
+ * every (uint32_t + int32_t) exactly -- negating @delta would not (no
+ * int32_t holds -INT32_MIN). */
 static enum mds_status mem_ns_nlink_adjust(struct mds_catalogue *cat,
     uint64_t fileid, int32_t delta)
 {
     struct memdb *m = memdb_of(cat);
     struct mds_inode *i;
+    int64_t sum;
     int idx;
 
     memdb_lock(m);
@@ -1508,10 +1515,13 @@ static enum mds_status mem_ns_nlink_adjust(struct mds_catalogue *cat,
         return MDS_ERR_NOTFOUND;
     }
     i = &m->inodes[idx].ino;
-    if (delta < 0 && (uint32_t)(-delta) > i->nlink) {
+    sum = (int64_t)i->nlink + (int64_t)delta;
+    if (sum < 0) {
         i->nlink = 0;
+    } else if (sum > (int64_t)UINT32_MAX) {
+        i->nlink = UINT32_MAX;
     } else {
-        i->nlink = (uint32_t)((int64_t)i->nlink + delta);
+        i->nlink = (uint32_t)sum;
     }
     memdb_unlock(m);
     return MDS_OK;
