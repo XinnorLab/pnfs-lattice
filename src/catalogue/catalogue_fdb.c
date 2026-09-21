@@ -41,6 +41,13 @@
 
 #define FDB_DEFAULT_CLUSTER_FILE "/etc/foundationdb/fdb.cluster"
 
+/* Bootstrap value of the READDIR cookie allocator.  fdb_backend_alloc_id
+ * hands out counter + 1 onwards, so the first cookie ever minted is 16,
+ * clear of the cookie values NFSv4 reserves and a server must never
+ * return (0 restarts a listing; 1 and 2 historically stood for "." and
+ * ".."). */
+#define FDB_COOKIE_SEQ_SEED 15U
+
 /* -----------------------------------------------------------------------
  * Process-wide client network
  * ----------------------------------------------------------------------- */
@@ -272,12 +279,12 @@ static int bootstrap_body(FDBTransaction *tr, void *arg, enum mds_status *st_out
         return rc;
     }
     /* Allocators hand out counter + 1 .. : fileids start after the
-     * root, READDIR cookies well above the reserved 0/1/2, GC and
-     * remove sequences at 1. */
+     * root, READDIR cookies at FDB_COOKIE_SEQ_SEED + 1, GC and remove
+     * sequences at 1. */
     fdb_key_meta(&k, &sc->b->prefix, FDB_META_FILEID);
     fdb_txn_set_le64(tr, &k, MDS_FILEID_ROOT);
     fdb_key_meta(&k, &sc->b->prefix, FDB_META_COOKIE_SEQ);
-    fdb_txn_set_le64(tr, &k, 15);
+    fdb_txn_set_le64(tr, &k, FDB_COOKIE_SEQ_SEED);
     fdb_key_meta(&k, &sc->b->prefix, FDB_META_GC_SEQ);
     fdb_txn_set_le64(tr, &k, 0);
     fdb_key_meta(&k, &sc->b->prefix, FDB_META_REMOVE_SEQ);

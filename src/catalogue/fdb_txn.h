@@ -285,9 +285,25 @@ fdb_error_t fdb_txn_get_finish(FDBFuture *f, uint8_t *buf, size_t cap, size_t *l
 fdb_error_t fdb_txn_get(FDBTransaction *tr, const struct fdb_key *k, bool snapshot,
                         uint8_t *buf, size_t cap, size_t *len, bool *found);
 
-/** Blind set / clear / range clear. */
+/**
+ * Blind set of @p k to the @p len bytes at @p v (copied by the client;
+ * the caller keeps ownership of both).  @p k must have been built
+ * without overflow (fdb_key_ok).  Applied at commit, never fails here.
+ */
 void fdb_txn_set(FDBTransaction *tr, const struct fdb_key *k, const uint8_t *v, size_t len);
+
+/**
+ * Blind clear of the single key @p k (built without overflow).  Applied
+ * at commit; clearing an absent key is a no-op.
+ */
 void fdb_txn_clear(FDBTransaction *tr, const struct fdb_key *k);
+
+/**
+ * Blind clear of the half-open range [r->begin, r->end) (both built
+ * without overflow).  A body must never clear a range that covers its
+ * own handle's WITNESS table (see the anchor rule above): the fence
+ * could not stop a late landing of that clear.
+ */
 void fdb_txn_clear_range(FDBTransaction *tr, const struct fdb_key_range *r);
 
 /** Set @p k to LE u64 @p v. */

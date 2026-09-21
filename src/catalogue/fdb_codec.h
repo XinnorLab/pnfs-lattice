@@ -85,12 +85,32 @@ _Static_assert(FDB_INODE_ENC_MAX < 100000U && FDB_GC_ENC_MAX < 100000U,
                "FoundationDB values must stay under 100 KB");
 
 /* -----------------------------------------------------------------------
+ * Contract shared by every encoder and decoder below.
+ *
+ * Encoders (fdb_*_encode): write the value's bytes into the caller's
+ * @p buf of @p cap bytes and set *len to the encoded length; false when
+ * an argument is NULL, a field is outside its documented bound or the
+ * buffer is too small (then *len is untouched; bytes already written
+ * to @p buf are meaningless).  Decoders (fdb_*_decode): read exactly
+ * @p len bytes of @p buf into *out; false on a NULL argument, a wrong
+ * version, a length that is not exactly the layout's, or a field
+ * outside its bound (then *out is untouched).  No function allocates,
+ * keeps a pointer to its arguments (fdb_slot_decode's *reply, which
+ * points into @p buf, is the one documented exception) or touches
+ * shared state; all are thread-safe.
+ * ----------------------------------------------------------------------- */
+
+/* -----------------------------------------------------------------------
  * Little-endian integers
  * ----------------------------------------------------------------------- */
 
+/** Store @p v as 8 little-endian bytes at @p dst (caller-owned, >= 8 bytes). */
 void     fdb_le64_put(uint8_t *dst, uint64_t v);
+/** Load the 8 little-endian bytes at @p src as a u64. */
 uint64_t fdb_le64_get(const uint8_t *src);
+/** Store @p v as 4 little-endian bytes at @p dst (caller-owned, >= 4 bytes). */
 void     fdb_le32_put(uint8_t *dst, uint32_t v);
+/** Load the 4 little-endian bytes at @p src as a u32. */
 uint32_t fdb_le32_get(const uint8_t *src);
 
 /**
@@ -205,11 +225,15 @@ struct fdb_stripe_hdr_val {
  *  1..MDS_MAX_MIRRORS, stripe_unit non-zero. */
 bool fdb_stripe_hdr_encode(const struct fdb_stripe_hdr_val *v, uint8_t *buf, size_t cap,
                            size_t *len);
+/** Decode exactly FDB_STRIPE_HDR_ENC_SIZE bytes; the encoder's bounds
+ *  are re-checked on the stored fields. */
 bool fdb_stripe_hdr_decode(const uint8_t *buf, size_t len, struct fdb_stripe_hdr_val *out);
 
 /** Encode one struct mds_ds_map_entry (nfs_fh_len <= MDS_NFS_FH_MAX). */
 bool fdb_stripe_ent_encode(const struct mds_ds_map_entry *e, uint8_t *buf, size_t cap,
                            size_t *len);
+/** Decode one stripe entry; the length must be exactly fixed part +
+ *  nfs_fh_len, nfs_fh_len at most MDS_NFS_FH_MAX. */
 bool fdb_stripe_ent_decode(const uint8_t *buf, size_t len, struct mds_ds_map_entry *out);
 
 /* -----------------------------------------------------------------------
@@ -302,6 +326,8 @@ bool fdb_remove_pending_decode(const uint8_t *buf, size_t len,
 
 /** Encode a DS registry row (every field of struct mds_ds_info). */
 bool fdb_ds_info_encode(const struct mds_ds_info *info, uint8_t *buf, size_t cap, size_t *len);
+/** Decode a DS registry row; the three strings come back NUL-terminated
+ *  within their arrays. */
 bool fdb_ds_info_decode(const uint8_t *buf, size_t len, struct mds_ds_info *out);
 
 struct fdb_ds_provision_val {
@@ -310,16 +336,23 @@ struct fdb_ds_provision_val {
     uint8_t  secret[FDB_DS_SECRET_MAX];
 };
 
+/** Encode a provisioning row; secret_len above FDB_DS_SECRET_MAX is rejected. */
 bool fdb_ds_provision_encode(const struct fdb_ds_provision_val *v, uint8_t *buf, size_t cap,
                              size_t *len);
+/** Decode; the length must be exactly fixed part + secret_len. */
 bool fdb_ds_provision_decode(const uint8_t *buf, size_t len, struct fdb_ds_provision_val *out);
 
+/** Encode a quota rule (fixed FDB_QUOTA_RULE_ENC_SIZE bytes). */
 bool fdb_quota_rule_encode(const struct mds_quota_rule *r, uint8_t *buf, size_t cap,
                            size_t *len);
+/** Decode exactly FDB_QUOTA_RULE_ENC_SIZE bytes; the struct's padding
+ *  word is left zero. */
 bool fdb_quota_rule_decode(const uint8_t *buf, size_t len, struct mds_quota_rule *out);
 
+/** Encode a quota usage row (fixed FDB_QUOTA_USAGE_ENC_SIZE bytes). */
 bool fdb_quota_usage_encode(const struct mds_quota_usage *u, uint8_t *buf, size_t cap,
                             size_t *len);
+/** Decode exactly FDB_QUOTA_USAGE_ENC_SIZE bytes. */
 bool fdb_quota_usage_decode(const uint8_t *buf, size_t len, struct mds_quota_usage *out);
 
 struct fdb_ext_dirent_val {
@@ -329,8 +362,10 @@ struct fdb_ext_dirent_val {
     uint8_t  target_type;
 };
 
+/** Encode a cross-shard dirent (fixed FDB_EXT_DIRENT_ENC_SIZE bytes). */
 bool fdb_ext_dirent_encode(const struct fdb_ext_dirent_val *v, uint8_t *buf, size_t cap,
                            size_t *len);
+/** Decode exactly FDB_EXT_DIRENT_ENC_SIZE bytes. */
 bool fdb_ext_dirent_decode(const uint8_t *buf, size_t len, struct fdb_ext_dirent_val *out);
 
 struct fdb_link_anchor_val {
@@ -339,8 +374,11 @@ struct fdb_link_anchor_val {
     char     name[MDS_MAX_NAME + 1];      /**< NUL-terminated; may be empty. */
 };
 
+/** Encode a link anchor; the name may be empty, at most MDS_MAX_NAME bytes. */
 bool fdb_link_anchor_encode(const struct fdb_link_anchor_val *v, uint8_t *buf, size_t cap,
                             size_t *len);
+/** Decode; the name (fixed part to the end of the value) comes back
+ *  NUL-terminated. */
 bool fdb_link_anchor_decode(const uint8_t *buf, size_t len, struct fdb_link_anchor_val *out);
 
 /* End of ext track section. */
@@ -501,19 +539,25 @@ bool fdb_lock_encode(const struct mds_coord_lock_row *r, uint8_t *buf, size_t ca
 bool fdb_lock_decode(const uint8_t *buf, size_t len, uint64_t fileid, uint64_t lock_id,
                      struct mds_coord_lock_row *out);
 
+/** Encode the non-key fields of a delegation row (fixed FDB_DELEG_ENC_SIZE). */
 bool fdb_deleg_encode(const struct mds_coord_deleg_row *r, uint8_t *buf, size_t cap,
                       size_t *len);
+/** Decode; @p stateid_other (the key) completes the row. */
 bool fdb_deleg_decode(const uint8_t *buf, size_t len, const uint8_t stateid_other[12],
                       struct mds_coord_deleg_row *out);
 
 /** Encode a client row (co_ownerid_len <= 1024). */
 bool fdb_client_encode(const struct mds_coord_client_row *r, uint8_t *buf, size_t cap,
                        size_t *len);
+/** Decode; @p clientid (the key) completes the row.  A confirmed byte
+ *  other than 0 or 1 is rejected. */
 bool fdb_client_decode(const uint8_t *buf, size_t len, uint64_t clientid,
                        struct mds_coord_client_row *out);
 
+/** Encode the non-key fields of a session row (fixed FDB_SESSION_ENC_SIZE). */
 bool fdb_session_encode(const struct mds_coord_session_row *r, uint8_t *buf, size_t cap,
                         size_t *len);
+/** Decode; @p session_id (the key) completes the row. */
 bool fdb_session_decode(const uint8_t *buf, size_t len, const uint8_t session_id[16],
                         struct mds_coord_session_row *out);
 
@@ -542,8 +586,11 @@ struct fdb_recovery_val {
     uint8_t  verifier[8];
 };
 
+/** Encode a recovery row; co_ownerid_len above FDB_RECOVERY_CO_MAX is
+ *  rejected.  clientid is the key, not part of the value. */
 bool fdb_recovery_encode(const struct fdb_recovery_val *v, uint8_t *buf, size_t cap,
                          size_t *len);
+/** Decode; the length must be exactly fixed part + co_ownerid_len. */
 bool fdb_recovery_decode(const uint8_t *buf, size_t len, struct fdb_recovery_val *out);
 
 /* --- 2PC journal ------------------------------------------------------- */
@@ -571,6 +618,8 @@ struct fdb_node_val {
 
 /** Encode; hostname 1..FDB_NODE_HOST_MAX bytes, sw_version 0..FDB_NODE_SW_MAX. */
 bool fdb_node_encode(const struct fdb_node_val *v, uint8_t *buf, size_t cap, size_t *len);
+/** Decode a registry row; both strings come back NUL-terminated.  A row
+ *  of the previous layout (version 1) is rejected. */
 bool fdb_node_decode(const uint8_t *buf, size_t len, struct fdb_node_val *out);
 
 struct fdb_partition_val {
@@ -582,6 +631,7 @@ struct fdb_partition_val {
 /** Encode; subtree_path 1..FDB_PARTITION_PATH_MAX bytes. */
 bool fdb_partition_encode(const struct fdb_partition_val *v, uint8_t *buf, size_t cap,
                           size_t *len);
+/** Decode; the path comes back NUL-terminated, never empty. */
 bool fdb_partition_decode(const uint8_t *buf, size_t len, struct fdb_partition_val *out);
 
 /* ===================== end of fdb-coord track section ==================== */
