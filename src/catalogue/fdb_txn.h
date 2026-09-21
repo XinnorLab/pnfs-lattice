@@ -109,7 +109,9 @@
  * Injection.  The fdb_c calls the runner itself makes go through
  * struct fdb_txn_calls (b->calls); tests script commit outcomes and
  * clock values through a mock table without a buggify build.  Bodies
- * call fdb_c directly through the helpers below.
+ * call fdb_c directly through the helpers below, except the id
+ * allocator's refill body, which is part of this unit and goes through
+ * the table too so its commit outcome can be scripted.
  */
 
 #ifndef FDB_TXN_H
@@ -337,9 +339,18 @@ fdb_error_t fdb_txn_set_timeout(FDBTransaction *tr, uint32_t ms);
  * bound to the backend instance that filled it (b->instance_seq); a
  * different instance on the same thread discards the remainder.
  *
+ * A refill whose commit outcome the runner could not resolve is
+ * reported as MDS_ERR_DELAY, never MDS_ERR_INDOUBT: the batch it may
+ * have reserved is never handed out, so ids stay unique (a batch is
+ * never reused) and a lost batch is only a gap in the counter, while
+ * the caller has committed nothing user-visible yet and may retry.
+ *
  * @return MDS_OK; MDS_ERR_IO when the counter is absent (keyspace not
- *         bootstrapped); MDS_ERR_DELAY / MDS_ERR_INDOUBT / MDS_ERR_IO
- *         from the refill transaction.
+ *         bootstrapped); MDS_ERR_NOSPC when the counter would wrap;
+ *         MDS_ERR_DELAY when the refill's deadline expired (definitive
+ *         aborts or an unresolved commit); MDS_ERR_IO from the refill
+ *         transaction; MDS_ERR_INVAL for a NULL argument or a counter
+ *         that is not an allocator.
  */
 enum mds_status fdb_backend_alloc_id(struct fdb_backend *b, enum fdb_meta_key counter,
                                      uint64_t *id);

@@ -352,14 +352,54 @@ static void stat_inc(_Atomic uint64_t *ctr)
     atomic_fetch_add_explicit(ctr, 1U, memory_order_relaxed);
 }
 
-/* The runner's own blocking points: counted like a body wait when the
+/* Block on @p f through table @p c: counted like a body wait when the
  * real table is in use; a mock table has no futures on the wire. */
-static fdb_error_t rs_block(const struct run_state *rs, FDBFuture *f)
+static fdb_error_t calls_block(const struct fdb_txn_calls *c, FDBFuture *f)
 {
-    if (rs->c == &g_real_calls) {
+    if (c == &g_real_calls) {
         return real_block(f);
     }
-    return rs->c->future_block_until_ready(f);
+    return c->future_block_until_ready(f);
+}
+
+static fdb_error_t rs_block(const struct run_state *rs, FDBFuture *f)
+{
+    return calls_block(rs->c, f);
+}
+
+/* Conflicting point read of the LE u64 at @p k through table @p c.
+ * *found is false when the key is absent or its value is not exactly
+ * 8 bytes; *v is only meaningful when *found. */
+static fdb_error_t calls_get_le64(const struct fdb_txn_calls *c, FDBTransaction *tr,
+                                  const struct fdb_key *k, uint64_t *v, bool *found)
+{
+    FDBFuture *f;
+    fdb_error_t err;
+    fdb_bool_t present = 0;
+    const uint8_t *val = NULL;
+    int vlen = 0;
+
+    *found = false;
+    if (!fdb_key_ok(k)) {
+        return FDB_ERR_PLATFORM_ERROR;
+    }
+    f = c->transaction_get(tr, k->buf, (int)k->len, 0);
+    if (f == NULL) {
+        return FDB_ERR_PLATFORM_ERROR;
+    }
+    err = calls_block(c, f);
+    if (err == 0) {
+        err = c->future_get_error(f);
+    }
+    if (err == 0) {
+        err = c->future_get_value(f, &present, &val, &vlen);
+    }
+    if (err == 0 && present != 0 && vlen == 8) {
+        *v = fdb_le64_get(val);
+        *found = true;
+    }
+    c->future_destroy(f);
+    return err;
 }
 
 static uint64_t remaining_ms(const struct run_state *rs)
@@ -443,33 +483,16 @@ enum outcome {
     OUTCOME_UNKNOWN,
 };
 
-/* Read the witness key in @p tr2 and compare with @p seq.  *saw is only
- * meaningful when 0 is returned. */
+/* Read the witness key in @p tr2 (conflicting read) and compare with
+ * @p seq.  *saw is only meaningful when 0 is returned. */
 static fdb_error_t witness_probe(const struct run_state *rs, FDBTransaction *tr2,
                                  const struct fdb_key *wk, uint64_t seq, bool *saw)
 {
-    FDBFuture *f;
-    fdb_error_t err;
-    fdb_bool_t present = 0;
-    const uint8_t *val = NULL;
-    int vlen = 0;
+    uint64_t v = 0;
+    bool found = false;
+    fdb_error_t err = calls_get_le64(rs->c, tr2, wk, &v, &found);
 
-    *saw = false;
-    f = rs->c->transaction_get(tr2, wk->buf, (int)wk->len, 0 /* conflicting read */);
-    if (f == NULL) {
-        return FDB_ERR_PLATFORM_ERROR;
-    }
-    err = rs_block(rs, f);
-    if (err == 0) {
-        err = rs->c->future_get_error(f);
-    }
-    if (err == 0) {
-        err = rs->c->future_get_value(f, &present, &val, &vlen);
-    }
-    if (err == 0 && present != 0 && vlen == 8) {
-        *saw = (fdb_le64_get(val) == seq);
-    }
-    rs->c->future_destroy(f);
+    *saw = (err == 0 && found && v == seq);
     return err;
 }
 
@@ -866,24 +889,28 @@ struct id_pool {
 static _Thread_local struct id_pool tl_pools[ID_POOL_COUNT];
 
 struct refill_ctx {
-    struct fdb_key key;
-    uint64_t       first; /**< First id of the reserved batch. */
+    const struct fdb_txn_calls *c;
+    struct fdb_key              key;
+    uint64_t                    first; /**< First id of the reserved batch. */
 };
 
+/* Reserve the next batch: read the counter (conflicting, so two refills
+ * of one counter serialise) and advance it.  Unlike other bodies this
+ * one goes through the call table, so a test can script the refill's
+ * commit outcome (fdb_txn.h, Injection). */
 static int refill_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
 {
     struct refill_ctx *rc = arg;
-    uint8_t buf[8];
-    size_t len = 0;
+    uint8_t v[8];
     bool found = false;
-    uint64_t cur;
+    uint64_t cur = 0;
     fdb_error_t err;
 
-    err = fdb_txn_get(tr, &rc->key, false, buf, sizeof(buf), &len, &found);
+    err = calls_get_le64(rc->c, tr, &rc->key, &cur, &found);
     if (err != 0) {
         return (int)err;
     }
-    if (!found || !fdb_le64_decode(buf, len, &cur)) {
+    if (!found) {
         *st_out = MDS_ERR_IO; /* counter absent or corrupt: not bootstrapped */
         return FDB_BODY_DONE;
     }
@@ -891,10 +918,44 @@ static int refill_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
         *st_out = MDS_ERR_NOSPC;
         return FDB_BODY_DONE;
     }
-    fdb_txn_set_le64(tr, &rc->key, cur + MDS_FILEID_BATCH);
+    fdb_le64_put(v, cur + MDS_FILEID_BATCH);
+    rc->c->transaction_set(tr, rc->key.buf, (int)rc->key.len, v, (int)sizeof(v));
     rc->first = cur + 1U;
     *st_out = MDS_OK;
     return FDB_BODY_COMMIT;
+}
+
+/*
+ * Reserve a fresh batch for @p pool.  A refill whose commit outcome
+ * stayed unresolved is reported as MDS_ERR_DELAY, not INDOUBT: the
+ * batch it may have reserved is never handed out, ids stay unique
+ * because a batch is never reused (the counter only advances and the
+ * next refill reads it back), so a lost batch is only a gap in a
+ * monotonic counter -- and the caller's operation has committed nothing
+ * user-visible yet, so it is safe to retry, which INDOUBT (NFS4ERR_IO
+ * at the protocol) would deny it.
+ */
+static enum mds_status pool_refill(struct fdb_backend *b, enum fdb_meta_key counter,
+                                   struct id_pool *pool)
+{
+    struct refill_ctx rc;
+    enum mds_status st;
+
+    memset(&rc, 0, sizeof(rc));
+    rc.c = (b->calls != NULL) ? b->calls : &g_real_calls;
+    fdb_key_meta(&rc.key, &b->prefix, counter);
+    st = fdb_run_txn(b, FDB_TXN_MUTATING, "alloc_id", refill_body, &rc);
+    if (st == MDS_ERR_INDOUBT) {
+        MDS_LOG_WARN(LOG_COMP_CAT, "fdb alloc_id: refill outcome unresolved, the batch is "
+                     "abandoned (a gap in counter %u): MDS_ERR_DELAY", (unsigned)counter);
+        return MDS_ERR_DELAY;
+    }
+    if (st != MDS_OK) {
+        return st;
+    }
+    pool->next = rc.first;
+    pool->remaining = MDS_FILEID_BATCH;
+    return MDS_OK;
 }
 
 enum mds_status fdb_backend_alloc_id(struct fdb_backend *b, enum fdb_meta_key counter,
@@ -914,17 +975,11 @@ enum mds_status fdb_backend_alloc_id(struct fdb_backend *b, enum fdb_meta_key co
         pool->remaining = 0;
     }
     if (pool->remaining == 0) {
-        struct refill_ctx rc;
-        enum mds_status st;
+        enum mds_status st = pool_refill(b, counter, pool);
 
-        memset(&rc, 0, sizeof(rc));
-        fdb_key_meta(&rc.key, &b->prefix, counter);
-        st = fdb_run_txn(b, FDB_TXN_MUTATING, "alloc_id", refill_body, &rc);
         if (st != MDS_OK) {
             return st;
         }
-        pool->next = rc.first;
-        pool->remaining = MDS_FILEID_BATCH;
     }
     *id = pool->next;
     pool->next++;

@@ -21,6 +21,8 @@
  *   body errors 1020 / 1007 / 1031  retried; 2103 -> MDS_ERR_IO
  *   read-only body                  never committed, retried on 1007
  *   FDB_BODY_DONE                   status passes through, no commit
+ *   alloc_id refill unresolved      MDS_ERR_DELAY, the batch abandoned;
+ *                                   the next refill starts above it
  *
  * When the local cluster is reachable the same runner is exercised once
  * for real (a mutating body, a read-back, the id allocator and a fence
@@ -86,17 +88,21 @@ static int test_failed;
  *
  * Transactions are slots in a table; futures are heap objects (so a
  * leaked future shows up under ASan and in g_futures_live).  The
- * "database" is the single witness key: present / value.  Commits pop
- * steps from a script; a step says which error the commit reports and
- * whether the transaction's last set landed in the database.
+ * "database" is two cells: the witness key (present / value) and one
+ * META counter (the id allocator's refill reads and sets it; a key is
+ * told apart by the type byte after backend_init's one-byte prefix).
+ * Commits pop steps from a script; a step says which error the commit
+ * reports and whether the transaction's last sets landed.
  * ----------------------------------------------------------------------- */
 
 #define MOCK_TRS 32
 
 struct mock_tr {
     bool     used;
-    int      sets;          /* transaction_set calls since (re)start */
+    int      sets;          /* witness transaction_set calls since (re)start */
     uint8_t  last_val[8];
+    bool     meta_set;      /* a META counter set since (re)start */
+    uint8_t  last_meta[8];
     bool     read_cr;       /* add_conflict_range READ seen */
     bool     write_cr;      /* add_conflict_range WRITE seen */
     uint32_t timeout_ms;    /* last TIMEOUT option */
@@ -118,6 +124,8 @@ static int                 g_trs_created;
 static int                 g_futures_live;
 static bool                g_db_present;
 static uint8_t             g_db_val[8];
+static bool                g_meta_present;
+static uint8_t             g_meta_val[8];
 static struct commit_step  g_script[32];
 static int                 g_script_n;
 static int                 g_script_i;
@@ -139,6 +147,8 @@ static void mock_reset(void)
     g_futures_live = 0;
     g_db_present = false;
     memset(g_db_val, 0, sizeof(g_db_val));
+    g_meta_present = false;
+    memset(g_meta_val, 0, sizeof(g_meta_val));
     memset(g_script, 0, sizeof(g_script));
     g_script_n = 0;
     g_script_i = 0;
@@ -166,6 +176,18 @@ static void script_add(fdb_error_t err, bool apply)
 static struct mock_tr *tr_of(FDBTransaction *tr)
 {
     return (struct mock_tr *)tr;
+}
+
+/* backend_init's prefix is one byte, so the table selector is key[1]. */
+static bool key_is_meta(const uint8_t *key, int key_len)
+{
+    return key_len > 1 && key[1] == (uint8_t)FDB_KT_META;
+}
+
+static void mock_meta_seed(uint64_t v)
+{
+    g_meta_present = true;
+    fdb_le64_put(g_meta_val, v);
 }
 
 static struct mock_future *future_new(fdb_error_t err)
@@ -206,6 +228,7 @@ static void m_transaction_reset(FDBTransaction *tr)
     struct mock_tr *t = tr_of(tr);
 
     t->sets = 0;
+    t->meta_set = false;
     t->read_cr = false;
     t->write_cr = false;
 }
@@ -227,8 +250,13 @@ static void m_transaction_set(FDBTransaction *tr, const uint8_t *key, int key_le
 {
     struct mock_tr *t = tr_of(tr);
 
-    (void)key;
-    (void)key_len;
+    if (key_is_meta(key, key_len)) {
+        t->meta_set = true;
+        if (value_len == 8) {
+            memcpy(t->last_meta, value, 8);
+        }
+        return;
+    }
     t->sets++;
     if (value_len == 8) {
         memcpy(t->last_val, value, 8);
@@ -245,6 +273,13 @@ static FDBFuture *m_transaction_get(FDBTransaction *tr, const uint8_t *key, int 
 
     (void)tr;
     (void)snapshot;
+    if (key_is_meta(key, key_len)) {
+        if (f != NULL) {
+            f->present = g_meta_present;
+            memcpy(f->val, g_meta_val, 8);
+        }
+        return (FDBFuture *)f;
+    }
     g_probes++;
     if (key_len > 0 && key_len <= (int)FDB_KEY_MAX) {
         memcpy(g_last_probe_key.buf, key, (size_t)key_len);
@@ -302,6 +337,10 @@ static FDBFuture *m_transaction_commit(FDBTransaction *tr)
     if (step.apply && t->sets > 0) {
         g_db_present = true;
         memcpy(g_db_val, t->last_val, 8);
+    }
+    if (step.apply && t->meta_set) {
+        g_meta_present = true;
+        memcpy(g_meta_val, t->last_meta, 8);
     }
     return (FDBFuture *)future_new(step.err);
 }
@@ -742,12 +781,14 @@ static void w_transaction_destroy(FDBTransaction *tr)
     m_transaction_destroy(tr);
 }
 
+/* Probe reads only: a body's META counter read is never failed here. */
 static FDBFuture *w_transaction_get(FDBTransaction *tr, const uint8_t *key, int key_len,
                                     fdb_bool_t snapshot)
 {
     struct mock_future *f = (struct mock_future *)m_transaction_get(tr, key, key_len, snapshot);
 
-    if (f != NULL && g_w_probe_err != 0 && g_w_probe_err_left != 0) {
+    if (f != NULL && !key_is_meta(key, key_len) && g_w_probe_err != 0 &&
+        g_w_probe_err_left != 0) {
         f->err = g_w_probe_err;
         if (g_w_probe_err_left > 0) {
             g_w_probe_err_left--;
@@ -1002,6 +1043,98 @@ static void test_fence_round_unknown_result(void)
     ASSERT_EQ(g_w_destroys, 3);
     ASSERT_EQ(mock_live_transactions(), 0);
     ASSERT_EQ(fdb_le64_get(g_db_val), g_witness_vals[1]);
+    ASSERT_EQ(g_futures_live, 0);
+}
+
+/* -----------------------------------------------------------------------
+ * Id allocator over the mock: a refill whose commit outcome stays
+ * unresolved is MDS_ERR_DELAY, never INDOUBT -- the batch it may have
+ * reserved is simply never handed out.  Two shapes: the refill landed
+ * (1021, then every probe fails until the deadline) -- the counter
+ * advanced, that batch is lost and the next refill starts above it;
+ * the refill never landed (1031, every fence times out) -- the counter
+ * is untouched and the next refill hands out the first id.  The pool
+ * is keyed by instance_seq, so values no real handle uses keep these
+ * thread-local batches away from the real-cluster tests.
+ * ----------------------------------------------------------------------- */
+
+#define ALLOC_MOCK_INSTANCE 0x5EEDULL
+#define ALLOC_MOCK_SEED     1000ULL
+
+static void test_alloc_id_unresolved_refill(void)
+{
+    struct fdb_backend b;
+    uint64_t id = 0;
+    int commits;
+    int i;
+
+    /* Landed, never resolved: the batch is lost, ids stay unique. */
+    wrap_reset(&b);
+    b.instance_seq = ALLOC_MOCK_INSTANCE;
+    b.op_deadline_ms = 500;
+    g_clock_step_ns = 60ULL * 1000000ULL;
+    mock_meta_seed(ALLOC_MOCK_SEED);
+    script_add(1021, true);
+    g_w_probe_err = 1031;
+    g_w_probe_err_left = -1;
+    ASSERT_EQ(fdb_backend_alloc_id(&b, FDB_META_GC_SEQ, &id), MDS_ERR_DELAY);
+    ASSERT_EQ(atomic_load(&b.stats.indoubt), 1);      /* the runner's verdict ... */
+    ASSERT_EQ(fdb_le64_get(g_meta_val), ALLOC_MOCK_SEED + MDS_FILEID_BATCH); /* ... landed */
+    ASSERT_EQ(g_futures_live, 0);
+    ASSERT_EQ(mock_live_transactions(), 0);
+    /* The next call refills above the lost batch and serves from it. */
+    g_w_probe_err = 0;
+    g_clock_step_ns = 1000000ULL;
+    ASSERT_EQ(fdb_backend_alloc_id(&b, FDB_META_GC_SEQ, &id), MDS_OK);
+    ASSERT_EQ(id, ALLOC_MOCK_SEED + MDS_FILEID_BATCH + 1U);
+    ASSERT_EQ(fdb_le64_get(g_meta_val), ALLOC_MOCK_SEED + 2U * MDS_FILEID_BATCH);
+    commits = g_commits;
+    ASSERT_EQ(fdb_backend_alloc_id(&b, FDB_META_GC_SEQ, &id), MDS_OK);
+    ASSERT_EQ(id, ALLOC_MOCK_SEED + MDS_FILEID_BATCH + 2U);
+    ASSERT_EQ(g_commits, commits);                     /* from the batch, no refill */
+    ASSERT_EQ(g_futures_live, 0);
+
+    /* Never landed, never resolved: nothing is lost. */
+    mock_reset();
+    backend_init(&b);
+    b.instance_seq = ALLOC_MOCK_INSTANCE + 1U;
+    b.op_deadline_ms = 500;
+    g_clock_step_ns = 60ULL * 1000000ULL;
+    mock_meta_seed(ALLOC_MOCK_SEED);
+    for (i = 0; i < 32; i++) {
+        script_add(1031, false);
+    }
+    ASSERT_EQ(fdb_backend_alloc_id(&b, FDB_META_GC_SEQ, &id), MDS_ERR_DELAY);
+    ASSERT_EQ(atomic_load(&b.stats.indoubt), 1);
+    ASSERT_TRUE(g_fence_commits >= 1);
+    ASSERT_EQ(fdb_le64_get(g_meta_val), ALLOC_MOCK_SEED);
+    ASSERT_EQ(g_futures_live, 0);
+    g_script_i = g_script_n;                           /* commits succeed from here */
+    g_clock_step_ns = 1000000ULL;
+    ASSERT_EQ(fdb_backend_alloc_id(&b, FDB_META_GC_SEQ, &id), MDS_OK);
+    ASSERT_EQ(id, ALLOC_MOCK_SEED + 1U);
+    ASSERT_EQ(fdb_le64_get(g_meta_val), ALLOC_MOCK_SEED + MDS_FILEID_BATCH);
+    ASSERT_EQ(g_futures_live, 0);
+
+    /* Definitive aborts to the deadline stay DELAY; an absent counter is
+     * IO (not bootstrapped) and commits nothing. */
+    mock_reset();
+    backend_init(&b);
+    b.instance_seq = ALLOC_MOCK_INSTANCE + 2U;
+    b.op_deadline_ms = 500;
+    g_clock_step_ns = 60ULL * 1000000ULL;
+    mock_meta_seed(ALLOC_MOCK_SEED);
+    for (i = 0; i < 32; i++) {
+        script_add(1020, false);
+    }
+    ASSERT_EQ(fdb_backend_alloc_id(&b, FDB_META_GC_SEQ, &id), MDS_ERR_DELAY);
+    ASSERT_EQ(atomic_load(&b.stats.indoubt), 0);
+    ASSERT_EQ(fdb_le64_get(g_meta_val), ALLOC_MOCK_SEED);
+    mock_reset();
+    backend_init(&b);
+    b.instance_seq = ALLOC_MOCK_INSTANCE + 3U;
+    ASSERT_EQ(fdb_backend_alloc_id(&b, FDB_META_GC_SEQ, &id), MDS_ERR_IO);
+    ASSERT_EQ(g_commits, 0);
     ASSERT_EQ(g_futures_live, 0);
 }
 
@@ -1445,6 +1578,7 @@ int main(void)
     RUN_TEST(test_landed_then_probes_fail);
     RUN_TEST(test_fence_round_unknown_result);
     RUN_TEST(test_read_version_pinned);
+    RUN_TEST(test_alloc_id_unresolved_refill);
     RUN_TEST(test_real_cluster);
     RUN_TEST(test_real_fence_premise);
     RUN_TEST(test_real_client_stats);
