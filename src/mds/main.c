@@ -1608,10 +1608,16 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	/* 6d. Open state table (shared with resilver for writer fencing). */
+	/* 6d. Open state table (shared with resilver for writer fencing).
+	 * Failure takes the common cleanup path like every other fatal
+	 * step: the subsystems created above (DS cache and capacity
+	 * probe, cluster transport, session table, DS health monitor)
+	 * are torn down there, and lock_tbl is still NULL so its own
+	 * destroy is a no-op. */
 	if (lock_table_init(cfg.self.id, &lock_tbl) != 0) {
 		MDS_LOG_ERROR(LOG_COMP_MDS, "lock_table_init failed");
-		return EXIT_FAILURE;
+		exit_code = EXIT_FAILURE;
+		goto cleanup;
 	}
 
 	if (open_state_table_init_ex(cfg.self.id,
@@ -1823,6 +1829,7 @@ int main(int argc, char *argv[])
 					"GSS init failed for "
 					"nfs_auth_mode=%d",
 					(int)cfg.nfs_auth_mode);
+				exit_code = EXIT_FAILURE;
 				goto cleanup;
 			}
 			MDS_LOG_INFO(LOG_COMP_MDS,
@@ -2366,6 +2373,11 @@ int main(int argc, char *argv[])
 		(unsigned)cluster_transport_server_port(ct_srv),
 		"",
 		"");
+	/* stdout is a pipe under systemd and therefore fully buffered:
+	 * without this flush the banner (and the grace / failover lines
+	 * above it) reach the journal only at exit, i.e. never while the
+	 * daemon is being watched for its listener to come up. */
+	(void)fflush(stdout);
 
 	/* 10. Wait for shutdown signal via sigwait().
 	 *     SIGINT/SIGTERM were blocked before thread creation;
@@ -2511,8 +2523,20 @@ cleanup:
 	 * writes into.  ds_capacity_stop joins the worker thread. */
 	ds_capacity_stop(ds_cap);
 	ds_cap = NULL;
+	/* Every DS cache reader is down at this point: the RPC workers
+	 * (pool joined and servers destroyed in Phase 1), the transport
+	 * admin handlers (Phase 3), the prealloc pool and the capacity
+	 * probe (both just above).  cq never carried a cache reference in
+	 * this daemon (it is NULL, step 6a). */
+	ds_cache_destroy(ds_cache);
+	ds_cache = NULL;
 	session_table_destroy(session_tbl);
 	open_state_table_destroy(ot);
+	/* The lock table's only readers are the COMPOUND path (Phase 1)
+	 * and the session table's client-expiry path, which is gone with
+	 * the table destroyed just above. */
+	lock_table_destroy(lock_tbl);
+	lock_tbl = NULL;
 	commit_queue_destroy(cq);
 	mds_proxy_ctx_destroy(proxy);
 	/* Drain + tear down the LAYOUTCOMMIT aggregator BEFORE the
@@ -2543,6 +2567,17 @@ cleanup:
 		parent_touch_destroy(s_pt);
 		s_pt = NULL;
 	}
+	/* Cluster map and membership go last among the subsystems: their
+	 * readers were the heartbeat thread (joined in Phase 3b), the
+	 * transport listener (Phase 3), the failover context / watchdog
+	 * and the split evaluator (Phase 4) and the COMPOUND path
+	 * (Phase 1).  The membership holds a pointer to the map, so it is
+	 * destroyed first; both are NULL-safe for the early-exit paths
+	 * that never created them. */
+	cluster_membership_destroy(membership);
+	membership = NULL;
+	subtree_map_destroy(smap);
+	smap = NULL;
 	if (cat != NULL) {
 		mds_catalogue_close(cat);
 		cat = NULL;
