@@ -61,6 +61,13 @@ set(CONFORMANCE_LINK_LIBS
 
 # conformance_add(<target> <source> <labels>) -- <labels> is a CMake
 # list ("unit;conformance" registers under both).
+#
+# With ENABLE_FDB every binary carries libfdb_c (PUBLIC in
+# pnfs_mds_core); the LeakSanitizer / ThreadSanitizer suppressions for
+# the uninstrumented client (tests/lsan-fdb.supp, tests/tsan-fdb.supp)
+# reach the test through ctest's environment, exactly as
+# tests/CMakeLists.txt does for the unit tests, so a sanitizer configure
+# runs green without manual exports.
 function(conformance_add target source label)
     add_executable(${target} ${source} $<TARGET_OBJECTS:conformance_harness>)
     target_include_directories(${target} PRIVATE
@@ -75,6 +82,11 @@ function(conformance_add target source label)
         LABELS "${label}"
         SKIP_RETURN_CODE 77
     )
+    if(ENABLE_FDB)
+        set_property(TEST ${target} APPEND PROPERTY ENVIRONMENT
+            "LSAN_OPTIONS=suppressions=${PROJECT_SOURCE_DIR}/tests/lsan-fdb.supp"
+            "TSAN_OPTIONS=suppressions=${PROJECT_SOURCE_DIR}/tests/tsan-fdb.supp")
+    endif()
 endfunction()
 
 conformance_add(conformance_token_semantics test_token_semantics.c unit)

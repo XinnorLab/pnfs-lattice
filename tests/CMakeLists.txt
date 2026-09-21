@@ -722,3 +722,40 @@ target_link_libraries(test_fdb_coord PRIVATE
 add_test(NAME test_fdb_coord COMMAND test_fdb_coord)
 set_tests_properties(test_fdb_coord PROPERTIES LABELS "unit" SKIP_RETURN_CODE 77)
 # End of fdb-coord track block.
+
+# -------------------------------------------------------------------
+# Sanitizer suppressions for the FoundationDB client (ENABLE_FDB).
+#
+# pnfs_mds_core links libfdb_c PUBLIC, so every test that links the
+# core archive -- and the daemon that daemon_smoke starts -- carries
+# the uninstrumented client, which trips LeakSanitizer (allocations
+# kept for the life of the network thread) and ThreadSanitizer (future
+# completion it cannot see) on its own account.  tests/lsan-fdb.supp
+# and tests/tsan-fdb.supp scope both down to this tree's code; ctest
+# hands them over through the environment so `ctest -L unit` is green
+# in an -fsanitize=address / -fsanitize=thread configure without any
+# manual export.  Only the sanitizer runtimes read the variables, so a
+# plain build is unaffected.  The tests that do not link the core
+# archive (test_fdb_codec, test_lease_*) are left alone; the
+# conformance suite sets the same property in its own CMakeLists.
+# Must stay after the last add_test() of this directory: the TESTS
+# directory property holds the tests registered so far.
+# -------------------------------------------------------------------
+if(ENABLE_FDB)
+    set(PNFS_FDB_SANITIZER_ENV
+        "LSAN_OPTIONS=suppressions=${PROJECT_SOURCE_DIR}/tests/lsan-fdb.supp"
+        "TSAN_OPTIONS=suppressions=${PROJECT_SOURCE_DIR}/tests/tsan-fdb.supp")
+    get_directory_property(pnfs_registered_tests TESTS)
+    foreach(registered_test IN LISTS pnfs_registered_tests)
+        if(NOT TARGET ${registered_test})
+            continue()
+        endif()
+        get_target_property(registered_libs ${registered_test} LINK_LIBRARIES)
+        if(registered_libs AND "pnfs_mds_core" IN_LIST registered_libs)
+            set_property(TEST ${registered_test} APPEND PROPERTY
+                ENVIRONMENT ${PNFS_FDB_SANITIZER_ENV})
+        endif()
+    endforeach()
+    set_property(TEST daemon_smoke APPEND PROPERTY
+        ENVIRONMENT ${PNFS_FDB_SANITIZER_ENV})
+endif()
