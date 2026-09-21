@@ -13,7 +13,9 @@
  * for the second configure); the plain run still catches crashes and
  * cross-handle interference.
  *
- *   1. 200 open/use/close cycles on one thread.
+ *   1. open/use/close cycles on one thread: 200 by default, 20 on
+ *      RonDB (see cycle_count()); CATALOGUE_TEST_CYCLES overrides
+ *      either for soak runs.
  *   2. 8 handles open at the same time, each driven from its own
  *      thread, then closed in a shuffled (but reproducible) order.
  *      Handles are independent stores on memdb and independent
@@ -21,6 +23,7 @@
  *      its own names.
  */
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,15 +32,51 @@
 #include "harness.h"
 #include "check.h"
 
-#define CYCLES        200
+#define CYCLES_DEFAULT 200
+/* Every RonDB open is a full cluster connect (several seconds), so the
+ * default would run for tens of minutes there; 20 still crosses the
+ * handle-reuse and connection-pool boundaries the test is after. */
+#define CYCLES_RONDB   20
+/* CATALOGUE_TEST_CYCLES bounds: a soak run of that size still finishes
+ * in a bounded time on every backend. */
+#define CYCLES_MIN     1
+#define CYCLES_MAX     10000
+#define CYCLES_ENV     "CATALOGUE_TEST_CYCLES"
 #define HANDLES       8
 #define OPS_PER_THREAD 64
 
-static void test_open_close_cycles(void)
+/*
+ * Open/close cycles for this run: CATALOGUE_TEST_CYCLES when set to an
+ * integer in [CYCLES_MIN, CYCLES_MAX], else the backend default.  A
+ * value outside the range or not a number is reported and ignored
+ * rather than silently clamped, so a typo cannot pass for a soak run.
+ */
+static int cycle_count(void)
+{
+    const char *env = getenv(CYCLES_ENV);
+    int fallback = conformance_backend_is("rondb") ? CYCLES_RONDB : CYCLES_DEFAULT;
+    char *end = NULL;
+    long v;
+
+    if (env == NULL || env[0] == '\0') {
+        return fallback;
+    }
+    errno = 0;
+    v = strtol(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' || v < CYCLES_MIN || v > CYCLES_MAX) {
+        (void)fprintf(stderr, "  %s='%s' ignored (want %d..%d); using %d\n", CYCLES_ENV,
+                      env, CYCLES_MIN, CYCLES_MAX, fallback);
+        return fallback;
+    }
+    return (int)v;
+}
+
+static void test_open_close_cycles(int cycles)
 {
     int i;
 
-    for (i = 0; i < CYCLES; i++) {
+    (void)printf("  open/close cycles: %d\n", cycles);
+    for (i = 0; i < cycles; i++) {
         struct mds_catalogue *cat = NULL;
         struct mds_inode child, seen;
         uint64_t dir = 0;
@@ -171,7 +210,7 @@ int main(void)
     (void)printf("test_lifecycle (backend=%s):\n", conformance_backend_name());
     mds_catalogue_close(probe);
 
-    test_open_close_cycles();
+    test_open_close_cycles(cycle_count());
     test_concurrent_handles();
 
     rc = check_summary("test_lifecycle");
