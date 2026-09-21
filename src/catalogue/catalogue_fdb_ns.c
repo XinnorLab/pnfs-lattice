@@ -36,9 +36,10 @@
  *   ns_rename*           R src dirent || R dst dirent || R src parent blob
  *                        || R dst parent blob -> RR src child [|| RR victim
  *                        || RR victim dirents limit 1]; W clear src dirent +
- *                        seq, victim purge / W victim blob, W dst dirent +
- *                        seq, [W src child blob (parent_fileid)], A nlink
- *                        moves, parent touches
+ *                        seq, victim purge (INODE / XATTR / INLINE; the
+ *                        STRIPE rows stay for the caller) / W victim blob,
+ *                        W dst dirent + seq, [W src child blob
+ *                        (parent_fileid)], A nlink moves, parent touches
  *   ns_readdir           per page: RR dirents (read-only)
  *   ns_readdir_plus_from per page: RR dirent_seq -> N parallel RR inodes
  *   dirent_name_for_child per page: RR dirents (read-only)
@@ -368,9 +369,10 @@ static void parent_touch(FDBTransaction *tr, const struct fdb_key_prefix *p, uin
     fdb_txn_set_le64(tr, &k, ns);
 }
 
-/* Everything hanging off a deleted inode: the INODE range, xattrs,
- * inline data and stripe rows. */
-static void inode_purge(FDBTransaction *tr, const struct fdb_key_prefix *p, uint64_t fileid)
+/* Everything hanging off a deleted inode except its stripe map: the
+ * INODE range, xattrs and inline data. */
+static void inode_purge_keep_stripes(FDBTransaction *tr, const struct fdb_key_prefix *p,
+                                     uint64_t fileid)
 {
     struct fdb_key_range r;
     struct fdb_key k;
@@ -383,14 +385,35 @@ static void inode_purge(FDBTransaction *tr, const struct fdb_key_prefix *p, uint
     if (fdb_key_range_prefix(&r, &r.begin)) {
         fdb_txn_clear_range(tr, &r);
     }
+    fdb_key_inline(&k, p, fileid);
+    fdb_txn_clear(tr, &k);
+}
+
+/* The stripe map of @p fileid: the STRIPE_HDR row and the STRIPE_ENT range. */
+static void stripe_rows_purge(FDBTransaction *tr, const struct fdb_key_prefix *p,
+                              uint64_t fileid)
+{
+    struct fdb_key_range r;
+    struct fdb_key k;
+
     fdb_key_stripe_ent_prefix(&r.begin, p, fileid);
     if (fdb_key_range_prefix(&r, &r.begin)) {
         fdb_txn_clear_range(tr, &r);
     }
     fdb_key_stripe_hdr(&k, p, fileid);
     fdb_txn_clear(tr, &k);
-    fdb_key_inline(&k, p, fileid);
-    fdb_txn_clear(tr, &k);
+}
+
+/* A final unlink through REMOVE drops everything, the stripe map
+ * included: op_remove snapshots the map BEFORE the mutation
+ * (compound_namespace.c op_remove_prepare_final_unlink; the fused
+ * ns_remove_known_gc carries the GC rows derived from it), so nothing
+ * reads the rows after the commit -- the same shape as memdb's unlink
+ * and the RonDB ns_remove.  RENAME is different: see rename_drop_victim. */
+static void inode_purge(FDBTransaction *tr, const struct fdb_key_prefix *p, uint64_t fileid)
+{
+    inode_purge_keep_stripes(tr, p, fileid);
+    stripe_rows_purge(tr, p, fileid);
 }
 
 /* Start a "has at least one entry" read of directory @p dir. */
@@ -1488,7 +1511,16 @@ static int rename_wave2(FDBTransaction *tr, const struct rename_ctx *c, struct r
 
 /* Overwritten destination inode: a directory victim is deleted and the
  * destination parent loses its ".." link; a file victim loses a link and
- * on its last one is deleted or kept as an UNLINK_ORPHAN row. */
+ * on its last one is deleted or kept as an UNLINK_ORPHAN row.
+ *
+ * A deleted victim keeps its stripe map.  op_rename
+ * (compound_namespace.c) prefetches only the inline 1x1 binding of the
+ * victim; for a wide file it reads the map AFTER the rename committed
+ * to queue the DS objects for GC and then drops the rows itself, and
+ * compound_orphan_finalize does the same for a kept orphan.  A rename
+ * that purged the rows would leave the overwritten file's DS objects
+ * uncollectable.  memdb and the RonDB rename leave them too; only the
+ * REMOVE paths purge them (inode_purge). */
 static int rename_drop_victim(FDBTransaction *tr, const struct rename_ctx *c,
                               struct rename_plan *pl, struct timespec now)
 {
@@ -1498,7 +1530,7 @@ static int rename_drop_victim(FDBTransaction *tr, const struct rename_ctx *c,
         return 0;
     }
     if (pl->dst_is_dir) {
-        inode_purge(tr, &c->b->prefix, v->fileid);
+        inode_purge_keep_stripes(tr, &c->b->prefix, v->fileid);
         {
             struct fdb_key k;
 
@@ -1519,7 +1551,7 @@ static int rename_drop_victim(FDBTransaction *tr, const struct rename_ctx *c,
         v->change++;
         return inode_write_blob(tr, &c->b->prefix, v);
     }
-    inode_purge(tr, &c->b->prefix, v->fileid);
+    inode_purge_keep_stripes(tr, &c->b->prefix, v->fileid);
     return 0;
 }
 

@@ -28,6 +28,11 @@
  *                          regular file answers NOTDIR (never NOENT for
  *                          the name it cannot hold), nothing changes; a
  *                          parent that does not exist is NOTFOUND
+ *   rename_over_keeps_stripes
+ *                          a rename over the last link of a wide file
+ *                          deletes the victim's inode but leaves its
+ *                          stripe map for the caller, who reads it after
+ *                          the commit to GC the DS objects and drops it
  *   remove_gc_fold_stale   ns_remove_known_gc re-validates in its own
  *                          transaction: stale child (name rebound, or
  *                          the snapshot's link shape contradicted by a
@@ -838,6 +843,113 @@ static void rename_notdir_parent(struct ctx *c)
         parent_after.change != parent_before.change ||
         parent_after.nlink != parent_before.nlink) {
         ctx_fail(c, "directory counters changed on refused renames");
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * rename_over_keeps_stripes
+ * ----------------------------------------------------------------------- */
+
+/* Stripes and DS ids of the wide victim; small so the map cannot be
+ * mistaken for an inline 1x1 binding. */
+#define RNM_OVER_STRIPES 2U
+#define RNM_OVER_UNIT    65536U
+
+/* op_rename (compound_namespace.c) snapshots only the inline 1x1
+ * binding of a doomed destination before the rename; for a wide file
+ * it calls stripe_map_get AFTER the commit to queue the DS objects for
+ * GC and then stripe_map_del.  A backend whose rename purged the map
+ * would make every DS object of an overwritten wide file uncollectable
+ * -- silently: that get answers NOTFOUND and the GC helper returns.  So
+ * the rename must delete exactly the victim's inode and nothing of its
+ * stripe map. */
+static void rename_over_keeps_stripes(struct ctx *c)
+{
+    struct mds_inode v, s, seen;
+    struct mds_ds_map_entry in[RNM_OVER_STRIPES];
+    struct mds_ds_map_entry *out = NULL;
+    uint32_t sc = 0, su = 0, mc = 0;
+    uint32_t i;
+    enum mds_status st;
+
+    memset(&v, 0, sizeof(v));
+    memset(&s, 0, sizeof(s));
+    if (mds_cat_ns_create(c->cat, NULL, c->dir, "v", MDS_FTYPE_REG, 0644,
+                          0, 0, NULL, &v) != MDS_OK ||
+        mds_cat_ns_create(c->cat, NULL, c->dir, "s", MDS_FTYPE_REG, 0644,
+                          0, 0, NULL, &s) != MDS_OK) {
+        ctx_fail(c, "setup (two files) failed");
+        return;
+    }
+    memset(in, 0, sizeof(in));
+    for (i = 0; i < RNM_OVER_STRIPES; i++) {
+        in[i].ds_id = 10U + i;
+        in[i].nfs_fh_len = 4;
+        in[i].nfs_fh[0] = (uint8_t)(0xC0U + i);
+        in[i].nfs_fh[3] = (uint8_t)i;
+    }
+    st = mds_cat_stripe_map_put(c->cat, NULL, v.fileid, RNM_OVER_STRIPES,
+                                RNM_OVER_UNIT, 1, in);
+    if (st == MDS_ERR_NOSUPPORT) {
+        ctx_skip(c, "stripe_map_put not provided by this backend");
+        return;
+    }
+    if (st != MDS_OK) {
+        ctx_fail(c, "stripe_map_put returned %s", status_name(st));
+        return;
+    }
+    /* Flags 0: no keep-orphan, the victim's last link goes. */
+    st = mds_cat_ns_rename(c->cat, NULL, c->dir, "s", c->dir, "v");
+    if (st != MDS_OK) {
+        ctx_fail(c, "rename over the victim returned %s", status_name(st));
+        return;
+    }
+    if (mds_cat_ns_lookup(c->cat, c->dir, "v", &seen) != MDS_OK ||
+        seen.fileid != s.fileid) {
+        ctx_fail(c, "'v' does not resolve to the renamed inode");
+    }
+    if (mds_cat_ns_lookup(c->cat, c->dir, "s", &seen) != MDS_ERR_NOTFOUND) {
+        ctx_fail(c, "'s' still resolves after the rename");
+    }
+    /* Exactly the inode row went ... */
+    st = mds_cat_ns_getattr(c->cat, v.fileid, &seen);
+    if (st != MDS_ERR_NOTFOUND) {
+        ctx_fail(c, "victim inode after rename-over: %s (want NOTFOUND)",
+                 status_name(st));
+    }
+    /* ... and the stripe map is still there for the post-rename GC. */
+    st = mds_cat_stripe_map_get(c->cat, v.fileid, &sc, &su, &mc, &out);
+    if (st != MDS_OK) {
+        ctx_fail(c, "victim stripe map after rename-over: %s (want OK)",
+                 status_name(st));
+        return;
+    }
+    if (sc != RNM_OVER_STRIPES || su != RNM_OVER_UNIT || mc != 1 ||
+        out == NULL) {
+        ctx_fail(c, "victim stripe map geometry %u x %u unit %u after "
+                 "rename-over", sc, mc, su);
+    } else {
+        for (i = 0; i < RNM_OVER_STRIPES; i++) {
+            if (out[i].ds_id != in[i].ds_id ||
+                out[i].nfs_fh_len != in[i].nfs_fh_len ||
+                memcmp(out[i].nfs_fh, in[i].nfs_fh, in[i].nfs_fh_len) != 0) {
+                ctx_fail(c, "victim stripe entry %u changed", i);
+            }
+        }
+    }
+    free(out);
+    out = NULL;
+    /* The caller's drop works and is the last trace of the map. */
+    st = mds_cat_stripe_map_del(c->cat, NULL, v.fileid);
+    if (st != MDS_OK) {
+        ctx_fail(c, "stripe_map_del of the victim returned %s",
+                 status_name(st));
+    }
+    st = mds_cat_stripe_map_get(c->cat, v.fileid, &sc, &su, &mc, &out);
+    free(out);
+    if (st != MDS_ERR_NOTFOUND) {
+        ctx_fail(c, "victim stripe map after del: %s (want NOTFOUND)",
+                 status_name(st));
     }
 }
 
@@ -1699,6 +1811,7 @@ static const struct subtest subtests[] = {
     { "link_vs_final_unlink",  link_vs_final_unlink,  true  },
     { "rename_coherence",      rename_coherence,      true  },
     { "rename_notdir_parent",  rename_notdir_parent,  true  },
+    { "rename_over_keeps_stripes", rename_over_keeps_stripes, true },
     { "remove_gc_fold_stale",  remove_gc_fold_stale,  true  },
     { "layout_union_recall",   layout_union_recall,   true  },
     { "replay_idempotency",    replay_idempotency,    true  },
