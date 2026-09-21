@@ -404,6 +404,7 @@ static void tables_assemble(void)
     if (!g_tables_ready) {
         memset(&g_auth_ops, 0, sizeof(g_auth_ops));
         catalogue_fdb_ns_register(&g_auth_ops);
+        catalogue_fdb_ext_register(&g_auth_ops);
         g_tables_ready = true;
     }
     (void)pthread_mutex_unlock(&g_net_lock);
@@ -551,8 +552,8 @@ enum mds_status catalogue_fdb_open(const struct mds_config *cfg, struct mds_cata
     cat->caps = MDS_CAT_CAP_SHARED_AUTHORITY | MDS_CAT_CAP_MULTI_PROCESS;
     cat->ops = &fdb_lifecycle_ops;
     cat->auth_ops = &g_auth_ops;
-    cat->coord_ops = NULL;   /* coordination slots: follow-up unit */
-    cat->cluster_ops = NULL; /* cluster slots: follow-up unit */
+    cat->coord_ops = &fdb_coordination_ops; /* catalogue_fdb_coord.c */
+    cat->cluster_ops = &fdb_cluster_ops;    /* catalogue_fdb_cluster.c */
     cat->backend_private = b;
     *out = cat;
     return MDS_OK;

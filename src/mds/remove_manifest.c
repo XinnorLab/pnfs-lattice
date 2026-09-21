@@ -458,7 +458,19 @@ static bool rm_execute(struct remove_manifest *rm,
 		/* Retryable backend failure (NDB unavailable, timeout,
 		 * NOSUPPORT on a downgraded backend).  Leave the row;
 		 * the claim lease lapse re-queues it here or on a
-		 * peer. */
+		 * peer.
+		 *
+		 * MDS_ERR_INDOUBT deliberately takes this branch too.
+		 * Re-running the guarded remove after an unresolved
+		 * commit is safe because the operation is idempotent by
+		 * construction: the guard is (child_fileid, generation),
+		 * so when the first attempt landed the re-run sees
+		 * STALE / NOTFOUND and the branch above finalizes the
+		 * DELETE_PENDING inode instead of removing anything
+		 * twice, and when it did not land the re-run is the first
+		 * real execution.  No client is waiting on this path, so
+		 * the retry is a server-internal lease lapse, not a
+		 * retry-inviting DELAY. */
 		MDS_BRANCH_ADD(remove_async_drain_fail, 1U);
 		(void)mds_cat_remove_pending_bump_retry(rm->cat,
 							w->remove_seq);
@@ -578,10 +590,22 @@ int remove_manifest_submit(struct remove_manifest *rm,
 	}
 	pthread_mutex_lock(&st->lock);
 	if (cst != MDS_OK) {
+		/*
+		 * Roll the tombstone back on EVERY non-OK outcome, the
+		 * in-doubt one included: a tombstone whose seq was never
+		 * published (seq == 0) is skipped by the orphan scrub, so
+		 * keeping it for a row that did not land would hide a
+		 * live name forever.  If the row did land the drainer
+		 * finds it by its own peek and completes it (its guard is
+		 * the row's fileid + generation, not this tombstone).
+		 * The in-doubt case differs only in what the caller may
+		 * do next: never the synchronous remove.
+		 */
 		rm_remove_locked(rm, st, dir_fileid, name);
 		pthread_mutex_unlock(&st->lock);
 		MDS_BRANCH_ADD(remove_async_manifest_insert_fail, 1U);
-		return -1;
+		return (cst == MDS_ERR_INDOUBT)
+			? REMOVE_MANIFEST_SUBMIT_INDOUBT : -1;
 	}
 	e = rm_find_locked(st, dir_fileid, name);
 	if (e != NULL) {

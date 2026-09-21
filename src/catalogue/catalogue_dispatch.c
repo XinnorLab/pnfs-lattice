@@ -2890,6 +2890,22 @@ enum mds_status mds_cluster_partition_put(struct mds_catalogue *cat,
                                            state, subtree_path, insert_only);
 }
 
+enum mds_status mds_cluster_partition_cas(struct mds_catalogue *cat,
+                                          uint32_t partition_id,
+                                          uint32_t expected_owner,
+                                          uint32_t new_owner,
+                                          uint8_t new_state)
+{
+    if (cat == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (cat->cluster_ops == NULL || cat->cluster_ops->partition_cas == NULL) {
+        return MDS_ERR_NOSUPPORT;
+    }
+    return cat->cluster_ops->partition_cas(cat, partition_id, expected_owner,
+                                           new_owner, new_state);
+}
+
 bool mds_cluster_supported(const struct mds_catalogue *cat)
 {
     const struct mds_cluster_ops *ops;

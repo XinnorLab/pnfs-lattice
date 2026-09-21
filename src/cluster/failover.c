@@ -154,16 +154,25 @@ static enum mds_status snapshot_partner_paths(struct failover_ctx *ctx)
     return MDS_OK;
 }
 
-/** Roll back taken-over subtrees to the original partner owner. */
+/** Roll back taken-over subtrees to the original partner owner --
+ *  store first (the CAS that took them is reversed, expected = self),
+ *  then memory, through the same transfer path as the takeover.  An
+ *  entry the takeover skipped is still the partner's and answers
+ *  STALE here, which is the intended no-op. */
 static void rollback_taken_paths(struct failover_ctx *ctx)
 {
     for (uint32_t i = 0; i < ctx->taken_count; i++) {
-        struct subtree_entry ent;
-        if (subtree_map_lookup_exact(ctx->map,
-                ctx->taken_paths[i], &ent) == MDS_OK) {
-            subtree_map_set_owner(ctx->map,
-                ctx->taken_paths[i],
-                ctx->partner_id, ent.version);
+        enum mds_status st;
+
+        st = subtree_map_failover_transfer(ctx->map, ctx->cat,
+                                           ctx->taken_paths[i],
+                                           ctx->self_id, ctx->partner_id);
+        if (st != MDS_OK && st != MDS_ERR_STALE &&
+            st != MDS_ERR_NOTFOUND) {
+            MDS_LOG_WARN(LOG_COMP_CLUSTER,
+                    "failover rollback: %s could not be returned to "
+                    "MDS %u: %s", ctx->taken_paths[i],
+                    (unsigned)ctx->partner_id, mds_status_str(st));
         }
     }
     clear_taken_state(ctx);
@@ -347,9 +356,14 @@ enum mds_status failover_promote(struct failover_ctx *ctx)
     }
 
     /* Phase 4b: Transfer subtree ownership (failover-specific path
-     * that bypasses owner_role_ok). */
-    st = subtree_map_failover_take_over(ctx->map, ctx->partner_id,
-                                        ctx->self_id, &taken);
+     * that bypasses owner_role_ok).  Each partition row is CAS'd from
+     * the partner to self in the catalogue before the in-memory map
+     * follows, so the takeover survives the next partition-map
+     * refresh and a second standby racing for the same partner loses
+     * the CAS instead of also believing it owns the subtrees. */
+    st = subtree_map_failover_take_over(ctx->map, ctx->cat,
+                                        ctx->partner_id, ctx->self_id,
+                                        &taken);
     if (st != MDS_OK) {
         clear_taken_state(ctx);
         ctx->role = FAILOVER_STANDBY;

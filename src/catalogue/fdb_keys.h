@@ -454,4 +454,89 @@ static inline void fdb_key_witness(struct fdb_key *k, const struct fdb_key_prefi
     fdb_key_be32(k, slot);
 }
 
+/* -----------------------------------------------------------------------
+ * ext track (catalogue_fdb_ext.c): typed builders for the extended
+ * authority tables, in the layouts documented at the top of this file.
+ * Append-only; nothing above this line is changed by the track.
+ * ----------------------------------------------------------------------- */
+
+/** REMOVE_PENDING alone: the range base of the whole delete manifest. */
+static inline void fdb_key_remove_pending_prefix(struct fdb_key *k,
+                                                 const struct fdb_key_prefix *p)
+{
+    fdb_key_init(k, p, FDB_KT_REMOVE_PENDING);
+}
+
+static inline void fdb_key_remove_pending(struct fdb_key *k, const struct fdb_key_prefix *p,
+                                          uint64_t remove_seq)
+{
+    fdb_key_remove_pending_prefix(k, p);
+    fdb_key_be64(k, remove_seq);
+}
+
+/** GC alone: the range base of the whole GC queue. */
+static inline void fdb_key_gc_prefix(struct fdb_key *k, const struct fdb_key_prefix *p)
+{
+    fdb_key_init(k, p, FDB_KT_GC);
+}
+
+/** DS alone: the range base of the DS registry. */
+static inline void fdb_key_ds_prefix(struct fdb_key *k, const struct fdb_key_prefix *p)
+{
+    fdb_key_init(k, p, FDB_KT_DS);
+}
+
+static inline void fdb_key_ds(struct fdb_key *k, const struct fdb_key_prefix *p, uint32_t ds_id)
+{
+    fdb_key_ds_prefix(k, p);
+    fdb_key_be32(k, ds_id);
+}
+
+static inline void fdb_key_ds_provision(struct fdb_key *k, const struct fdb_key_prefix *p,
+                                        uint32_t ds_id)
+{
+    fdb_key_init(k, p, FDB_KT_DS_PROVISION);
+    fdb_key_be32(k, ds_id);
+}
+
+static inline void fdb_key_quota_rule(struct fdb_key *k, const struct fdb_key_prefix *p,
+                                      uint8_t scope_type, uint64_t scope_id)
+{
+    fdb_key_init(k, p, FDB_KT_QUOTA_RULE);
+    fdb_key_u8(k, scope_type);
+    fdb_key_be64(k, scope_id);
+}
+
+static inline void fdb_key_quota_usage(struct fdb_key *k, const struct fdb_key_prefix *p,
+                                       uint8_t usage_type, uint64_t scope_id)
+{
+    fdb_key_init(k, p, FDB_KT_QUOTA_USAGE);
+    fdb_key_u8(k, usage_type);
+    fdb_key_be64(k, scope_id);
+}
+
+static inline void fdb_key_shard_fileid(struct fdb_key *k, const struct fdb_key_prefix *p,
+                                        uint64_t fileid)
+{
+    fdb_key_init(k, p, FDB_KT_SHARD_FILEID);
+    fdb_key_be64(k, fileid);
+}
+
+static inline void fdb_key_ext_dirent(struct fdb_key *k, const struct fdb_key_prefix *p,
+                                      uint64_t parent, const char *name)
+{
+    fdb_key_init(k, p, FDB_KT_EXT_DIRENT);
+    fdb_key_be64(k, parent);
+    fdb_key_name(k, name, false);
+}
+
+static inline void fdb_key_link_anchor(struct fdb_key *k, const struct fdb_key_prefix *p,
+                                       uint64_t anchor_id)
+{
+    fdb_key_init(k, p, FDB_KT_LINK_ANCHOR);
+    fdb_key_be64(k, anchor_id);
+}
+
+/* End of ext track section. */
+
 #endif /* FDB_KEYS_H */

@@ -875,16 +875,37 @@ static int holder_cb(uint64_t clientid, const struct nfs4_stateid *stateid,
     return 0;
 }
 
+/* Layout rows are keyed by fileid, and a persistent store (RonDB) keeps
+ * rows across test binaries: a fixed fileid such as 500 collides with
+ * whatever an earlier run or another suite granted on it.  Take the
+ * fileid of a file created in this run's scratch directory instead;
+ * fileids are never reused, so its layout table is empty. */
+static uint64_t fresh_layout_fileid(struct ctx *c, const char *name)
+{
+    struct mds_inode out;
+
+    memset(&out, 0, sizeof(out));
+    if (mds_cat_ns_create(c->cat, NULL, c->dir, name, MDS_FTYPE_REG, 0644,
+                          0, 0, NULL, &out) != MDS_OK) {
+        ctx_fail(c, "create %s failed", name);
+        return 0;
+    }
+    return out.fileid;
+}
+
 static void layout_union_recall(struct ctx *c)
 {
     struct nfs4_stateid sid;
     struct holder_count h;
     uint32_t ds_ids[1] = { 1 };
     uint64_t off = 0, len = 0, got_fid = 0;
-    const uint64_t fileid = 500;
+    const uint64_t fileid = fresh_layout_fileid(c, "union");
     const uint64_t clientid = 7;
     enum mds_status st;
 
+    if (fileid == 0) {
+        return;
+    }
     memset(&sid, 0, sizeof(sid));
     sid.seqid = 1;
     memset(sid.other, 0x51, sizeof(sid.other));
@@ -1145,9 +1166,12 @@ static void callback_reentrancy(struct ctx *c)
     struct reentrant_readdir rd;
     struct mds_inode out;
     uint32_t ds_ids[1] = { 1 };
-    const uint64_t fileid = 600;
+    const uint64_t fileid = fresh_layout_fileid(c, "re-target");
     unsigned i;
 
+    if (fileid == 0) {
+        return;
+    }
     if (watchdog_start(&wd, &wd_thread, "callback_reentrancy",
                        REENTRANCY_TIMEOUT_SEC) != 0) {
         ctx_fail(c, "watchdog thread failed to start");
@@ -1174,6 +1198,8 @@ static void callback_reentrancy(struct ctx *c)
         ctx_fail(c, "layout iteration: %u callbacks, %u nested lookups OK "
                  "(want 3/3)", it.calls, it.nested_ok);
     }
+    /* The readdir part below counts exactly the five entries it creates. */
+    (void)mds_cat_ns_remove(c->cat, NULL, c->dir, "re-target");
 
     for (i = 0; i < 5; i++) {
         char name[32];
@@ -1502,7 +1528,7 @@ static const struct subtest subtests[] = {
     { "link_vs_final_unlink",  link_vs_final_unlink,  true  },
     { "rename_coherence",      rename_coherence,      true  },
     { "remove_gc_fold_stale",  remove_gc_fold_stale,  true  },
-    { "layout_union_recall",   layout_union_recall,   false },
+    { "layout_union_recall",   layout_union_recall,   true  },
     { "replay_idempotency",    replay_idempotency,    true  },
     { "callback_reentrancy",   callback_reentrancy,   true  },
     { "readdir_paging",        readdir_paging,        true  },

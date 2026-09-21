@@ -66,6 +66,7 @@
 #include "hpc_shared.h"
 #include "mds_cluster.h"
 #include "catalog_image.h"
+#include "failover_watchdog.h"
 
 /** Maximum concurrent RPC listener threads. */
 #define MAX_RPC_LISTENERS 32
@@ -101,9 +102,21 @@ static void *rpc_listener_thread(void *arg)
  * The argument block is written completely (including smap and
  * membership) BEFORE pthread_create and never written afterwards, so
  * the thread reads it without synchronisation.
+ *
+ * Supersession: node_register replaces a row whose boot_epoch is lower
+ * (mds_cluster.h), so a second daemon started later under this mds_id
+ * takes the row over and every heartbeat from here answers
+ * MDS_ERR_STALE.  Continuing to serve unregistered would leave two
+ * heads behind one id with no standby watching this one, so the thread
+ * fences this daemon: it logs the superseding epoch, sets
+ * cluster_superseded (main turns that into EXIT_FAILURE and skips the
+ * deregister, which would be STALE too) and raises the process-wide
+ * SIGTERM that main's sigwait() consumes -- the same cleanup path the
+ * startup deadline takes.
  * ----------------------------------------------------------------------- */
 
 static _Atomic bool cluster_hb_flag = true;
+static _Atomic bool cluster_superseded = false;
 
 struct cluster_hb_arg {
 	struct mds_catalogue *cat;
@@ -121,11 +134,27 @@ static void *cluster_hb_fn(void *a)
 	uint32_t cycle = 0;
 
 	while (atomic_load(arg->running)) {
-		/* The status is discarded exactly as the previous
-		 * backend-specific thread did: NOTFOUND (row gone) and
-		 * transient errors alike are simply retried next cycle. */
-		(void)mds_cluster_node_heartbeat(
-			arg->cat, arg->mds_id, arg->boot_epoch);
+		uint64_t superseder = 0;
+		enum mds_status hb_st;
+
+		/* NOTFOUND (row gone) and transient errors are retried
+		 * next cycle, as before; STALE is fatal (see above). */
+		hb_st = cluster_heartbeat_tick(arg->cat, arg->mds_id,
+					       arg->boot_epoch, &superseder);
+		if (hb_st == MDS_ERR_STALE) {
+			MDS_LOG_FATAL(LOG_COMP_MDS,
+				"node registry row for mds_id %u now carries "
+				"boot_epoch %llu, not ours (%llu): a newer "
+				"incarnation registered while this one is "
+				"running; fencing this daemon (shutting down, "
+				"deregister skipped)",
+				(unsigned)arg->mds_id,
+				(unsigned long long)superseder,
+				(unsigned long long)arg->boot_epoch);
+			atomic_store(&cluster_superseded, true);
+			(void)kill(getpid(), SIGTERM);
+			break;
+		}
 
 		/* Refresh subtree map + membership every 3rd cycle (~15s)
 		 * to pick up ownership and peer changes from other MDS
@@ -2345,6 +2374,11 @@ int main(int argc, char *argv[])
 		int caught_sig = 0;
 		(void)sigwait(&shutdown_set, &caught_sig);
 	}
+	/* A SIGTERM raised by the heartbeat thread on supersession is a
+	 * failure exit, not an operator stop. */
+	if (atomic_load(&cluster_superseded)) {
+		exit_code = EXIT_FAILURE;
+	}
 
 	/* Orderly shutdown -- ordering matters:
 	 * 1. Stop RPC servers + join threads (no new COMPOUNDs)
@@ -2354,6 +2388,10 @@ int main(int argc, char *argv[])
 cleanup:
 	if (exit_code == EXIT_SUCCESS) {
 		(void)fprintf(stdout, "pnfs-mds shutting down.\n");
+	} else if (atomic_load(&cluster_superseded)) {
+		MDS_LOG_ERROR(LOG_COMP_MDS,
+			"pnfs-mds superseded by a newer incarnation, "
+			"cleaning up.");
 	} else {
 		MDS_LOG_ERROR(LOG_COMP_MDS, "pnfs-mds startup failed, cleaning up.");
 	}
@@ -2428,11 +2466,21 @@ cleanup:
 		image = NULL;
 	}
 	if (cat != NULL && mds_cluster_supported(cat)) {
-		(void)mds_cluster_node_deregister(cat, cfg.self.id,
-						  mds_boot_epoch);
-		MDS_LOG_INFO(LOG_COMP_MDS,
-			"node %u deregistered",
-			(unsigned)cfg.self.id);
+		if (atomic_load(&cluster_superseded)) {
+			/* The row belongs to the newer incarnation; the
+			 * epoch-guarded delete would be STALE and must not
+			 * even be attempted against its registration. */
+			MDS_LOG_INFO(LOG_COMP_MDS,
+				"node %u superseded; registry row left to "
+				"the newer incarnation",
+				(unsigned)cfg.self.id);
+		} else {
+			(void)mds_cluster_node_deregister(cat, cfg.self.id,
+							  mds_boot_epoch);
+			MDS_LOG_INFO(LOG_COMP_MDS,
+				"node %u deregistered",
+				(unsigned)cfg.self.id);
+		}
 	}
 
 	/* Phase 4: remaining subsystems. */

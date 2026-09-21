@@ -232,9 +232,28 @@ enum mds_status mds_cluster_node_scan_stale(struct mds_catalogue *cat,
  * and returns MDS_ERR_EXISTS otherwise (the root claim at startup, so a
  * transient error can never rewrite the real owner); insert_only ==
  * false is an upsert and is reserved for seeding a never-owned initial
- * shard layout.  A failed partition_list at startup is fatal for the
- * caller after a bounded retry (subtree_map_init_from_catalogue), never
- * "empty map".
+ * shard layout.  partition_cas moves ownership of an EXISTING row and
+ * is the only way an owned row changes hands: the write lands only
+ * while the row's owner still equals the caller's expected owner
+ * (MDS_ERR_STALE otherwise, MDS_ERR_NOTFOUND for an absent row, nothing
+ * written in either case), so two standbys promoting against the same
+ * dead primary cannot both believe they own its partitions, and a
+ * takeover the store refused is never held in memory.  A failed
+ * partition_list at startup is fatal for the caller after a bounded
+ * retry (subtree_map_init_from_catalogue), never "empty map".
+ *
+ * Pre-seeded root.  A store MAY create partition 0 = (owner 0, "/")
+ * when it bootstraps its schema; owner 0 means "unowned: every head
+ * serves root" (compound.c never gates owner 0).  A node starting on
+ * such a store finds root in partition_list and never claims it; if
+ * two nodes race the claim on a store that does not seed, the loser's
+ * insert-only put sees MDS_ERR_EXISTS and adopts the winner's row --
+ * the claim path exists for stores that do not seed.  RonDB seeds
+ * (rondb_shim_bootstrap_metadata), so on RonDB root is always unowned
+ * and only the /shardN rows carry ownership; memdb does not seed, so
+ * the first opener of a memdb instance owns root.  The two therefore
+ * differ in who owns "/": deployed semantics on RonDB, in-process
+ * test semantics on memdb.
  * ----------------------------------------------------------------------- */
 
 /**
@@ -269,6 +288,26 @@ enum mds_status mds_cluster_partition_put(struct mds_catalogue *cat,
                                           uint8_t state,
                                           const char *subtree_path,
                                           bool insert_only);
+
+/**
+ * Compare-and-swap the owner of one partition-map row.
+ *
+ * @param cat             Catalogue handle.
+ * @param partition_id    Partition id (row key).
+ * @param expected_owner  Owner the row must currently record.
+ * @param new_owner       Owner to record.
+ * @param new_state       One of MDS_PARTITION_STATE_*, written with it.
+ * @return MDS_OK when the row was rewritten; MDS_ERR_NOTFOUND when no
+ *         row exists for @partition_id; MDS_ERR_STALE when the row's
+ *         owner is not @expected_owner (nothing written);
+ *         MDS_ERR_NOSUPPORT when the backend has no CAS; MDS_ERR_INVAL
+ *         on a NULL handle; or the backend's status.
+ */
+enum mds_status mds_cluster_partition_cas(struct mds_catalogue *cat,
+                                          uint32_t partition_id,
+                                          uint32_t expected_owner,
+                                          uint32_t new_owner,
+                                          uint8_t new_state);
 
 /**
  * True when the store can carry a multi-process MDS cluster: the

@@ -1834,6 +1834,24 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 			}
 			goto fill_layoutget_result;
 		}
+		/*
+		 * Commit outcome unresolved (MDS_ERR_INDOUBT): the
+		 * layout_state row for fused_sid MAY have been written.
+		 * This is terminal for the operation -- NOT a member of
+		 * the fallback ladder below: a second grant through the
+		 * split path would mint another stateid for the same
+		 * client window and could leave two live rows, and a
+		 * revoke here would assume the row exists.  Grant
+		 * nothing and return the hard error the mapping gives
+		 * INDOUBT (NFS4ERR_IO, never DELAY).  fused_sid was never
+		 * handed to the client, so an orphan row is unreachable
+		 * by recall and is reclaimed by the client-expiry path
+		 * (layout_del_all_for_client).
+		 */
+		if (st == MDS_ERR_INDOUBT) {
+			free(entries);
+			return mds_status_to_nfs4(st);
+		}
 		/* Fused path failed.  Fall back to non-fused
 		 * (separate txns) for any transient or non-fatal error;
 		 * NOSUPPORT cannot happen after the capability check
@@ -3325,8 +3343,23 @@ enum nfs4_status op_layoutcommit(struct compound_data *cd,
 				merged_mask |= MDS_ATTR_FLAGS;
 			}
 
+			/*
+			 * RFC 8881 S18.42.3: the client MAY suggest a
+			 * modification time; when it does not (the Linux
+			 * client never sets loca_time_modify), the metadata
+			 * server uses the time of the LAYOUTCOMMIT.  pNFS
+			 * data writes go straight to the DSes, so this is the
+			 * only point where the MDS learns the file changed;
+			 * without it mtime stayed at the creation time for
+			 * every file written through a layout.  Same rule as
+			 * the aggregator branch above; folded into the one
+			 * masked write, no extra round trip.
+			 */
 			if (a->time_modify_set) {
 				lc_inode.mtime = a->time_modify;
+				merged_mask |= MDS_ATTR_MTIME;
+			} else if (a->new_offset) {
+				clock_gettime(CLOCK_REALTIME, &lc_inode.mtime);
 				merged_mask |= MDS_ATTR_MTIME;
 			}
 

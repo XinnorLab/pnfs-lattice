@@ -5531,6 +5531,106 @@ static void test_nametoolong_flag_paths(void)
 	close_test_db(db, path);
 }
 
+/* -----------------------------------------------------------------------
+ * test_layoutcommit_stamps_mtime_without_client_time
+ *
+ * RFC 8881 S18.42.3: when loca_time_modify is absent (the Linux client
+ * never sets it) the metadata server uses the time of the LAYOUTCOMMIT
+ * as the modification time.  The plain (non-aggregator) path used to
+ * write mtime only when the client supplied one, so a file written
+ * through a pNFS layout kept its creation mtime forever (lab
+ * nfs_client_test T11.1).  Pin both directions: no client time ->
+ * mtime advances past a deliberately old value (with change/ctime), and
+ * a client-supplied time is stored verbatim.
+ * ----------------------------------------------------------------------- */
+
+static struct nfs4_op mk_layoutcommit(uint64_t last_write_offset)
+{
+	struct nfs4_op op;
+
+	memset(&op, 0, sizeof(op));
+	op.opnum = OP_LAYOUTCOMMIT;
+	op.arg.layoutcommit.offset = 0;
+	op.arg.layoutcommit.length = UINT64_MAX;
+	op.arg.layoutcommit.new_offset = true;
+	op.arg.layoutcommit.last_write_offset = last_write_offset;
+	op.arg.layoutcommit.stateid.seqid = 1;
+	memset(op.arg.layoutcommit.stateid.other, 0x4c,
+	       sizeof(op.arg.layoutcommit.stateid.other));
+	return op;
+}
+
+static void test_layoutcommit_stamps_mtime_without_client_time(void)
+{
+	struct mds_catalogue *db;
+	struct compound_data cd;
+	struct nfs4_op ops[3];
+	struct nfs4_result res[3];
+	struct mds_inode before, after, attrs;
+	uint64_t fid;
+	uint32_t n;
+	char *path;
+
+	memset(res, 0, sizeof(res));
+	db = open_test_db(&path);
+
+	compound_init(&cd);
+	cd.cat = g_test_cat;
+	cd.prealloc = g_prealloc;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_create("lc_mtime", MDS_FTYPE_REG, 0644);
+	n = compound_process(&cd, ops, res, 3);
+	ASSERT_EQ(n, (uint32_t)3);
+	ASSERT_EQ(res[2].status, NFS4_OK);
+	fid = res[2].res.create.inode.fileid;
+
+	/* Park mtime far in the past so "advanced" is unambiguous. */
+	memset(&attrs, 0, sizeof(attrs));
+	attrs.mtime.tv_sec = 1000;
+	ASSERT_EQ(mds_cat_ns_setattr(g_test_cat, NULL, fid, &attrs,
+				     MDS_ATTR_MTIME), MDS_OK);
+	ASSERT_EQ(mds_cat_ns_getattr(g_test_cat, fid, &before), MDS_OK);
+	ASSERT_EQ((long long)before.mtime.tv_sec, 1000LL);
+
+	/* LAYOUTCOMMIT reporting new data and NO client mtime. */
+	compound_init(&cd);
+	cd.cat = g_test_cat;
+	cd.prealloc = g_prealloc;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putfh(fid);
+	ops[2] = mk_layoutcommit(4095);
+	n = compound_process(&cd, ops, res, 3);
+	ASSERT_EQ(n, (uint32_t)3);
+	ASSERT_EQ(res[2].status, NFS4_OK);
+	ASSERT_TRUE(res[2].res.layoutcommit.new_size);
+
+	ASSERT_EQ(mds_cat_ns_getattr(g_test_cat, fid, &after), MDS_OK);
+	ASSERT_EQ((long long)after.size, 4096LL);
+	ASSERT_TRUE(after.mtime.tv_sec > before.mtime.tv_sec);
+	ASSERT_TRUE(after.change > before.change);
+
+	/* A client-supplied time is honoured verbatim. */
+	compound_init(&cd);
+	cd.cat = g_test_cat;
+	cd.prealloc = g_prealloc;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putfh(fid);
+	ops[2] = mk_layoutcommit(8191);
+	ops[2].arg.layoutcommit.time_modify_set = true;
+	ops[2].arg.layoutcommit.time_modify.tv_sec = 2000000000;
+	ops[2].arg.layoutcommit.time_modify.tv_nsec = 7;
+	n = compound_process(&cd, ops, res, 3);
+	ASSERT_EQ(n, (uint32_t)3);
+	ASSERT_EQ(res[2].status, NFS4_OK);
+	ASSERT_EQ(mds_cat_ns_getattr(g_test_cat, fid, &after), MDS_OK);
+	ASSERT_EQ((long long)after.size, 8192LL);
+	ASSERT_EQ((long long)after.mtime.tv_sec, 2000000000LL);
+	ASSERT_EQ((long long)after.mtime.tv_nsec, 7LL);
+
+	close_test_db(db, path);
+}
+
 int main(void)
 {
 	fprintf(stdout, "Running compound dispatch tests:\n");
@@ -5575,6 +5675,7 @@ int main(void)
 	RUN_TEST(test_layoutget_ds_pending_without_proxy_unavailable);
 	RUN_TEST(test_layoutget_ds_pending_patched_ready_clears_pending);
 	RUN_TEST(test_layoutreturn);
+	RUN_TEST(test_layoutcommit_stamps_mtime_without_client_time);
 	RUN_TEST(test_openattr_create_remove);
 	RUN_TEST(test_openattr_read_write);
 	RUN_TEST(test_gc_on_remove);

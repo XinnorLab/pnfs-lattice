@@ -6444,6 +6444,15 @@ static int rondb_txn_read_stripe_entry_count(NdbTransaction *tx,
 /*
  * Queue PK deletes for mds_stripe_maps + mds_stripe_entries rows.
  * Caller commits the transaction.
+ *
+ * stripe_count is the caller's snapshot of the geometry; the rows it
+ * names may already be gone (a stripe map dropped concurrently, or a
+ * caller counting stripes a file never had).  Each delete therefore
+ * carries AO_IgnoreError: an absent row is a no-op for that operation
+ * only -- the post-condition "no stripe rows for fileid" holds either
+ * way -- instead of NDB 626 aborting the whole transaction, which for
+ * ns_remove used to be misreported as an idempotent success with the
+ * name still in place.
  */
 static int rondb_txn_append_stripe_pk_deletes(NdbTransaction *tx,
                                               const NdbDictionary::Table *hdr_tbl,
@@ -6465,17 +6474,23 @@ static int rondb_txn_append_stripe_pk_deletes(NdbTransaction *tx,
     if (op == nullptr) {
         return -1;
     }
-    op->deleteTuple();
-    (void)rondb_equal_u64(op, RONDB_SM_COL_FILEID, fileid);
+    if (op->deleteTuple() != 0 ||
+        rondb_equal_u64(op, RONDB_SM_COL_FILEID, fileid) != 0 ||
+        op->setAbortOption(NdbOperation::AO_IgnoreError) != 0) {
+        return -1;
+    }
 
     for (uint32_t i = 0; i < capped; i++) {
         op = tx->getNdbOperation(ent_tbl);
         if (op == nullptr) {
             return -1;
         }
-        op->deleteTuple();
-        (void)rondb_equal_u64(op, RONDB_SE_COL_FILEID, fileid);
-        op->equal(RONDB_SE_COL_ORDINAL, (Uint32)i);
+        if (op->deleteTuple() != 0 ||
+            rondb_equal_u64(op, RONDB_SE_COL_FILEID, fileid) != 0 ||
+            op->equal(RONDB_SE_COL_ORDINAL, (Uint32)i) != 0 ||
+            op->setAbortOption(NdbOperation::AO_IgnoreError) != 0) {
+            return -1;
+        }
     }
     return 0;
 }
@@ -8414,7 +8429,52 @@ static int rondb_txn_rmdir_guard(NdbTransaction *tx,
  * A directory target is guarded by rondb_txn_rmdir_guard (NOTEMPTY ->
  * rc 3) and, having exactly one name, is always deleted outright:
  * delete_child is overridden for it.
+ *
+ * The caller's picture of the child (fileid, nlink) is a SNAPSHOT taken
+ * outside this transaction, so both mutations are guarded at the data
+ * node by interpreted programs -- no extra round trip on the common
+ * path, and a stale snapshot can never delete the wrong row:
+ *
+ *   dirent   deleted only if child_fileid still equals the snapshot's
+ *            fileid; otherwise the name was replaced (remove+create or
+ *            rename-over) and the transaction aborts with 6002 -> rc 4.
+ *   inode    final unlink (delete) only if nlink == 1; non-final
+ *            (nlink -1) only if nlink != 1.  A link or another unlink
+ *            that landed since the snapshot aborts with 6003 -> rc 5
+ *            and the caller re-reads and decides again.
+ *
+ * fileids are never reused (per-thread batches off a monotonic counter),
+ * so the fileid guard subsumes a generation guard.  Directories skip the
+ * nlink guard: rondb_txn_rmdir_guard already holds their inode row.
  * ----------------------------------------------------------------------- */
+
+/* interpret_exit_nok codes (NdbOperation reserves 6000-6999 and 626 for
+ * user exit codes; 6001 is the create-time parent-type guard). */
+static const Uint32 k_rm_dirent_mismatch = 6002;  /* name -> other fileid */
+static const Uint32 k_rm_nlink_mismatch  = 6003;  /* nlink shape changed */
+
+/* Interpreted equality guard: abort the operation with @nok_code unless
+ * column @col_name of the row equals @expected (@len bytes in the
+ * column's native layout).  Same program shape as the node-registry
+ * epoch guard; must come after equal() and before any setValue(). */
+static int rondb_emit_col_eq_guard(NdbOperation *op,
+                                   const NdbDictionary::Table *tbl,
+                                   const char *col_name,
+                                   const void *expected, Uint32 len,
+                                   Uint32 nok_code)
+{
+    const NdbDictionary::Column *col = tbl->getColumn(col_name);
+
+    if (col == nullptr) { return -1; }
+    if (op->branch_col_eq((Uint32)col->getColumnNo(), expected, len,
+                          false, 0U) != 0 ||
+        op->interpret_exit_nok(nok_code) != 0 ||
+        op->def_label(0) < 0 ||
+        op->interpret_exit_ok() != 0) {
+        return -1;
+    }
+    return 0;
+}
 
 static int rondb_shim_ns_remove_once(void *handle,
                          uint64_t parent_fileid, const char *name,
@@ -8536,25 +8596,42 @@ static int rondb_shim_ns_remove_once(void *handle,
         }
     }
 
-    /* 1. Delete dirent. */
+    /* 1. Delete dirent -- only while it still names the snapshot's
+     *    child (6002 otherwise: the name was replaced under us). */
     op_dirent = tx->getNdbOperation(dir_tbl);
     if (op_dirent == nullptr) { goto ns_remove_err; }
-    op_dirent->deleteTuple();
-    (void)rondb_equal_u64(op_dirent, RONDB_DIR_COL_PARENT, parent_fileid);
-    op_dirent->equal(RONDB_DIR_COL_NAME,
-                     (const char *)name_value,
-                     name_value_len);
+    {
+        const Uint64 expect_fid = (Uint64)child_fileid;
 
-    /* 2. Child inode: delete or interpreted-update.
+        if (op_dirent->interpretedDeleteTuple() != 0 ||
+            rondb_equal_u64(op_dirent, RONDB_DIR_COL_PARENT,
+                            parent_fileid) != 0 ||
+            op_dirent->equal(RONDB_DIR_COL_NAME,
+                             (const char *)name_value,
+                             name_value_len) != 0 ||
+            rondb_emit_col_eq_guard(op_dirent, dir_tbl,
+                                    RONDB_DIR_COL_CHILD_FID,
+                                    &expect_fid, sizeof(expect_fid),
+                                    k_rm_dirent_mismatch) != 0) {
+            goto ns_remove_err;
+        }
+    }
+
+    /* 2. Child inode: delete or interpreted-update, each guarded by
+     *    the LIVE nlink (6003 when the snapshot's shape is stale).
      *
-     * For delete_child (the nlink==1 common case) we emit a
-     * deleteTuple as before.
+     * For delete_child (the nlink==1 common case) we emit an
+     * interpreted delete that only fires while nlink == 1: a link
+     * that landed since the caller's read must not lose its inode.
      *
      * For the hardlink case (nlink > 1) we emit an
      * interpretedUpdateTuple that subtracts 1 from nlink, increments
      * the change counter, and stamps ctime -- all atomically at the
-     * data node.  Symmetric to the interpreted parent update used on
-     * ns_create.  Wins vs. the previous full-row updateTuple:
+     * data node -- but only while nlink != 1: if another unlink made
+     * this the last name, decrementing would leave a nameless nlink=0
+     * row, so the caller must re-read and delete instead.  Symmetric
+     * to the interpreted parent update used on ns_create.  Wins vs.
+     * the previous full-row updateTuple:
      *   * No read-modify-write race with a concurrent setattr/link on
      *     the same inode (WAW lost-update gone).
      *   * Wire payload for the hardlink-remove case shrinks from the
@@ -8564,21 +8641,49 @@ static int rondb_shim_ns_remove_once(void *handle,
      *     mtime from the caller's snapshot, which is harmless but
      *     wrong-shaped.
      *
+     * A directory is deleted unguarded: rondb_txn_rmdir_guard holds
+     * its row LM_Exclusive and proved it empty inside this transaction.
+     *
      * The child_ino / child_shard deserialised from child_inode_buf
      * stay available for other future refinements; they are unused
      * on this path today. */
     op_child = tx->getNdbOperation(ino_tbl);
     if (op_child == nullptr) { goto ns_remove_err; }
-    if (delete_child) {
+    if (delete_child && child_is_dir) {
         op_child->deleteTuple();
         (void)rondb_equal_u64(op_child, RONDB_INO_COL_FILEID, child_fileid);
+    } else if (delete_child) {
+        const Uint32 final_nlink = 1;
+
+        if (op_child->interpretedDeleteTuple() != 0 ||
+            rondb_equal_u64(op_child, RONDB_INO_COL_FILEID,
+                            child_fileid) != 0 ||
+            rondb_emit_col_eq_guard(op_child, ino_tbl, RONDB_INO_COL_NLINK,
+                                    &final_nlink, sizeof(final_nlink),
+                                    k_rm_nlink_mismatch) != 0) {
+            goto ns_remove_err;
+        }
     } else {
+        const NdbDictionary::Column *nlink_col =
+            ino_tbl->getColumn(RONDB_INO_COL_NLINK);
+        const Uint32 final_nlink = 1;
         struct timespec now;
 
-        op_child->interpretedUpdateTuple();
-        (void)rondb_equal_u64(op_child, RONDB_INO_COL_FILEID, child_fileid);
-        op_child->subValue(RONDB_INO_COL_NLINK, (Uint32)1);
-        op_child->incValue(RONDB_INO_COL_CHANGE, (Uint64)1);
+        if (nlink_col == nullptr) { goto ns_remove_err; }
+        if (op_child->interpretedUpdateTuple() != 0 ||
+            rondb_equal_u64(op_child, RONDB_INO_COL_FILEID,
+                            child_fileid) != 0 ||
+            /* nlink == 1 -> label 0 -> exit_nok(6003). */
+            op_child->branch_col_eq((Uint32)nlink_col->getColumnNo(),
+                                    &final_nlink, sizeof(final_nlink),
+                                    false, 0U) != 0 ||
+            op_child->subValue(RONDB_INO_COL_NLINK, (Uint32)1) != 0 ||
+            op_child->incValue(RONDB_INO_COL_CHANGE, (Uint64)1) != 0 ||
+            op_child->interpret_exit_ok() != 0 ||
+            op_child->def_label(0) < 0 ||
+            op_child->interpret_exit_nok(k_rm_nlink_mismatch) != 0) {
+            goto ns_remove_err;
+        }
         clock_gettime(CLOCK_REALTIME, &now);
         (void)rondb_set_value_u64(op_child, RONDB_INO_COL_CTIME_SEC,
                                   (uint64_t)now.tv_sec);
@@ -8652,21 +8757,33 @@ static int rondb_shim_ns_remove_once(void *handle,
     }
 
     if (tx->execute(NdbTransaction::Commit) == -1) {
+        const NdbOperation *failed_op = tx->getNdbErrorOperation();
+
         err = tx->getNdbError();
         rondb_get_ndb(state)->closeTransaction(tx);
         if (err.code == 266 || err.code == 274) { return err.code; }
-        /* 626 "Tuple did not exist": the dirent (and, atomically with
-         * it, the child inode / stripe / parent rows) was already
-         * removed by a prior committed ns_remove -- a duplicate or
-         * retransmitted REMOVE, seen on the referral path under a
-         * concurrent -N cross-client delete storm. The unlink post-
-         * condition (name absent) already holds, so this is an
+        /* Guard verdicts (nothing was mutated: the whole transaction
+         * aborted at the data node). */
+        if (err.code == k_rm_dirent_mismatch) { return 4; }
+        if (err.code == k_rm_nlink_mismatch) { return 5; }
+        /* 626 "Tuple did not exist" on the DIRENT: the name (and,
+         * atomically with it, the child inode / stripe / parent rows)
+         * was already removed by a prior committed ns_remove -- a
+         * duplicate or retransmitted REMOVE, seen on the referral path
+         * under a concurrent -N cross-client delete storm. The unlink
+         * post-condition (name absent) already holds, so this is an
          * idempotent success, not an I/O error. Mirrors the idempotency
          * ds_gc already relies on and stops the client-visible
          * "unlink() failed" reports without leaving orphaned state.
          * Fused GC rows (if any) were aborted with the transaction;
-         * the earlier winning remove already queued its own. */
-        if (err.code == 626) { return 0; }
+         * the earlier winning remove already queued its own.
+         *
+         * 626 on any OTHER operation (the dirent is still there but
+         * the inode it names is gone) is a stale plan, not a replay:
+         * report rc 4 so the caller re-resolves the name. */
+        if (err.code == 626) {
+            return (failed_op == op_dirent) ? 0 : 4;
+        }
         return rondb_report_error(err, "ns_remove commit");
     }
 
@@ -8735,12 +8852,33 @@ int rondb_shim_ns_remove_gc(void *handle,
  *   0. If the overwritten destination is a directory: lock its inode
  *      row and probe its emptiness (rondb_txn_rmdir_guard, NoCommit)
  *   1. Delete src dirent
- *   2. Write dst dirent (writeTuple = upsert for overwrite case)
+ *   2. Write dst dirent
  *   3. Update src parent inode
  *   4. Update dst parent inode (if cross-dir)
- *   5. Update src child inode (parent_fileid change for cross-dir)
+ *   5. Update src child inode (ctime, change; parent_fileid for cross-dir)
  *   6. If overwrite: update/delete dst child inode.  A directory
  *      victim has exactly one name and is always deleted.
+ *
+ * The caller resolved source and destination OUTSIDE this transaction,
+ * so -- as in rondb_shim_ns_remove_once -- every mutation that depends
+ * on that snapshot is guarded at the data node, with no extra round
+ * trip on the common path:
+ *   src dirent   interpreted delete only while child_fileid == the
+ *                source the caller resolved (6002)
+ *   dst dirent   no victim: insertTuple, so a name that appeared since
+ *                the prologue is a PK conflict (630); victim:
+ *                interpreted update only while child_fileid == the
+ *                victim the caller resolved (6002)
+ *   victim inode final unlink: interpreted delete only while nlink == 1;
+ *                kept (hard link / keep-orphan): interpreted decrement
+ *                only while nlink == the count the plan was derived
+ *                from (6003).  A directory victim is locked and proven
+ *                empty by the rmdir guard instead.
+ *   src child    interpreted ctime/change(/parent) update -- never the
+ *                full-row rewrite from the snapshot the previous shape
+ *                did, which lost a concurrent LINK's nlink bump.
+ * Any guard failure aborts the whole transaction with nothing mutated
+ * and is reported as rc 4: the caller re-resolves and tries again.
  *
  * TC locality hint: src_parent (majority of ops touch that partition).
  * ----------------------------------------------------------------------- */
@@ -8798,8 +8936,11 @@ int rondb_shim_rename(void *handle,
                                 &sc_ino, &sc_shard) != 0) {
         return -1;
     }
-    if (dst_exists && !delete_dst_child && dst_child_buf != nullptr) {
-        if (rondb_inode_deserialize(dst_child_buf, dc_len,
+    /* A victim that keeps its row is described by dst_child_buf (its
+     * post-rename nlink and flags); step 6 derives its guard from it. */
+    if (dst_exists && !delete_dst_child) {
+        if (dst_child_buf == nullptr ||
+            rondb_inode_deserialize(dst_child_buf, dc_len,
                                     &dc_ino, &dc_shard) != 0) {
             return -1;
         }
@@ -8843,23 +8984,55 @@ int rondb_shim_rename(void *handle,
         }
     }
 
-    /* 1. Delete src dirent. */
+    /* 1. Delete src dirent -- only while it still names the source
+     *    the caller resolved. */
     op = tx->getNdbOperation(dir_tbl);
     if (op == nullptr) { goto rename_err; }
-    op->deleteTuple();
-    (void)rondb_equal_u64(op, RONDB_DIR_COL_PARENT, src_parent);
-    op->equal(RONDB_DIR_COL_NAME,
-              (const char *)src_name_value,
-              src_name_value_len);
+    {
+        const Uint64 expect_src = (Uint64)src_child_fid;
 
-    /* 2. Write dst dirent (writeTuple handles both insert and overwrite). */
+        if (op->interpretedDeleteTuple() != 0 ||
+            rondb_equal_u64(op, RONDB_DIR_COL_PARENT, src_parent) != 0 ||
+            op->equal(RONDB_DIR_COL_NAME,
+                      (const char *)src_name_value,
+                      src_name_value_len) != 0 ||
+            rondb_emit_col_eq_guard(op, dir_tbl, RONDB_DIR_COL_CHILD_FID,
+                                    &expect_src, sizeof(expect_src),
+                                    k_rm_dirent_mismatch) != 0) {
+            goto rename_err;
+        }
+    }
+
+    /* 2. Dst dirent.  No victim: insert, so a destination that appeared
+     *    since the prologue is a PK conflict, not a silent overwrite of
+     *    a name (and inode) the caller never saw.  Victim: update only
+     *    while the row still names the victim the caller resolved, so
+     *    a replaced victim is never repointed (nor its inode deleted
+     *    in step 6). */
     op = tx->getNdbOperation(dir_tbl);
     if (op == nullptr) { goto rename_err; }
-    op->writeTuple();
-    (void)rondb_equal_u64(op, RONDB_DIR_COL_PARENT, dst_parent);
-    op->equal(RONDB_DIR_COL_NAME,
-              (const char *)dst_name_value,
-              dst_name_value_len);
+    if (dst_exists == 0) {
+        if (op->insertTuple() != 0 ||
+            rondb_equal_u64(op, RONDB_DIR_COL_PARENT, dst_parent) != 0 ||
+            op->equal(RONDB_DIR_COL_NAME,
+                      (const char *)dst_name_value,
+                      dst_name_value_len) != 0) {
+            goto rename_err;
+        }
+    } else {
+        const Uint64 expect_dst = (Uint64)dst_child_fid;
+
+        if (op->interpretedUpdateTuple() != 0 ||
+            rondb_equal_u64(op, RONDB_DIR_COL_PARENT, dst_parent) != 0 ||
+            op->equal(RONDB_DIR_COL_NAME,
+                      (const char *)dst_name_value,
+                      dst_name_value_len) != 0 ||
+            rondb_emit_col_eq_guard(op, dir_tbl, RONDB_DIR_COL_CHILD_FID,
+                                    &expect_dst, sizeof(expect_dst),
+                                    k_rm_dirent_mismatch) != 0) {
+            goto rename_err;
+        }
+    }
     (void)rondb_set_value_u64(op, RONDB_DIR_COL_CHILD_FID, src_child_fid);
     op->setValue(RONDB_DIR_COL_CHILD_TYPE, (Uint32)src_child_type);
 
@@ -8877,24 +9050,84 @@ int rondb_shim_rename(void *handle,
         }
     }
 
-    /* 5. Update src child inode (parent_fileid change for cross-dir). */
+    /* 5. Src child inode: ctime + change (+ parent_fileid when it moves
+     *    between directories), applied at the data node.  POSIX
+     *    rename(2) touches ctime only; nothing else of the row is
+     *    rename's to write. */
     op = tx->getNdbOperation(ino_tbl);
     if (op == nullptr) { goto rename_err; }
-    op->updateTuple();
-    (void)rondb_equal_u64(op, RONDB_INO_COL_FILEID, sc_ino.fileid);
-    rondb_set_inode_values(op, &sc_ino, sc_shard);
+    {
+        struct timespec now;
+
+        if (op->interpretedUpdateTuple() != 0 ||
+            rondb_equal_u64(op, RONDB_INO_COL_FILEID, src_child_fid) != 0 ||
+            op->incValue(RONDB_INO_COL_CHANGE, (Uint64)1) != 0) {
+            goto rename_err;
+        }
+        clock_gettime(CLOCK_REALTIME, &now);
+        (void)rondb_set_value_u64(op, RONDB_INO_COL_CTIME_SEC,
+                                  (uint64_t)now.tv_sec);
+        op->setValue(RONDB_INO_COL_CTIME_NSEC, (Uint32)now.tv_nsec);
+        if (cross_dir) {
+            (void)rondb_set_value_u64(op, RONDB_INO_COL_PARENT, dst_parent);
+        }
+        (void)sc_ino;
+        (void)sc_shard;
+    }
 
     /* 6. Overwrite: update or delete dst child inode. */
     if (dst_exists) {
         op = tx->getNdbOperation(ino_tbl);
         if (op == nullptr) { goto rename_err; }
-        if (delete_dst_child) {
+        if (dst_is_dir) {
+            /* Locked and proven empty by the rmdir guard above. */
             op->deleteTuple();
             (void)rondb_equal_u64(op, RONDB_INO_COL_FILEID, dst_child_fid);
+        } else if (delete_dst_child) {
+            const Uint32 final_nlink = 1;
+
+            if (op->interpretedDeleteTuple() != 0 ||
+                rondb_equal_u64(op, RONDB_INO_COL_FILEID,
+                                dst_child_fid) != 0 ||
+                rondb_emit_col_eq_guard(op, ino_tbl, RONDB_INO_COL_NLINK,
+                                        &final_nlink, sizeof(final_nlink),
+                                        k_rm_nlink_mismatch) != 0) {
+                goto rename_err;
+            }
         } else {
-            op->updateTuple();
-            (void)rondb_equal_u64(op, RONDB_INO_COL_FILEID, dc_ino.fileid);
-            rondb_set_inode_values(op, &dc_ino, dc_shard);
+            /* The victim keeps its row: a hard link loses one name
+             * (nlink n -> n-1) or the last link becomes a keep-orphan
+             * (nlink 1 -> 0 + MDS_IFLAG_UNLINK_ORPHAN, set by the
+             * caller in dc_ino.flags).  The caller derived that plan
+             * from nlink == dc_ino.nlink + 1; refuse when the live
+             * count moved. */
+            const NdbDictionary::Column *nlink_col =
+                ino_tbl->getColumn(RONDB_INO_COL_NLINK);
+            const Uint32 expect_nlink = (Uint32)dc_ino.nlink + 1U;
+            struct timespec now;
+
+            if (nlink_col == nullptr) { goto rename_err; }
+            if (op->interpretedUpdateTuple() != 0 ||
+                rondb_equal_u64(op, RONDB_INO_COL_FILEID,
+                                dst_child_fid) != 0 ||
+                op->branch_col_eq((Uint32)nlink_col->getColumnNo(),
+                                  &expect_nlink, sizeof(expect_nlink),
+                                  false, 0U) != 0 ||
+                op->interpret_exit_nok(k_rm_nlink_mismatch) != 0 ||
+                op->def_label(0) < 0 ||
+                op->subValue(RONDB_INO_COL_NLINK, (Uint32)1) != 0 ||
+                op->incValue(RONDB_INO_COL_CHANGE, (Uint64)1) != 0 ||
+                op->interpret_exit_ok() != 0) {
+                goto rename_err;
+            }
+            clock_gettime(CLOCK_REALTIME, &now);
+            (void)rondb_set_value_u64(op, RONDB_INO_COL_CTIME_SEC,
+                                      (uint64_t)now.tv_sec);
+            op->setValue(RONDB_INO_COL_CTIME_NSEC, (Uint32)now.tv_nsec);
+            if ((dc_ino.flags & MDS_IFLAG_UNLINK_ORPHAN) != 0U) {
+                op->setValue(RONDB_INO_COL_FLAGS, (Uint32)dc_ino.flags);
+            }
+            (void)dc_shard;
         }
     }
 
@@ -8903,6 +9136,17 @@ int rondb_shim_rename(void *handle,
         err = tx->getNdbError();
         rondb_get_ndb(state)->closeTransaction(tx);
         if (rondb_is_temporary(err)) { return -2; }
+        /* The caller's plan no longer matches the store; nothing was
+         * mutated.  Guard verdicts (6002 / 6003), a row the plan relies
+         * on that is gone (626: source name, victim name or an inode),
+         * or a destination that appeared under a no-victim plan (630,
+         * the insert's PK conflict).  The caller re-resolves. */
+        if (err.code == k_rm_dirent_mismatch ||
+            err.code == k_rm_nlink_mismatch ||
+            err.code == 626 ||
+            err.classification == NdbError::ConstraintViolation) {
+            return 4;
+        }
         return rondb_report_error(err, "rename commit");
     }
 
@@ -8912,6 +9156,7 @@ int rondb_shim_rename(void *handle,
 rename_err:
     err = tx->getNdbError();
     rondb_get_ndb(state)->closeTransaction(tx);
+    if (rondb_is_temporary(err)) { return -2; }
     return rondb_report_error(err, "rename op");
 }
 
@@ -14099,6 +14344,15 @@ int rondb_shim_partition_map_cas(void *handle, uint32_t partition_id,
         rondb_get_ndb(state)->closeTransaction(tx);
         if (err.code == 626) { return 1; } /* NOTFOUND */
         return rondb_report_error(err, "pm_cas readExec");
+    }
+    /* Reads default to AO_IgnoreError: a missing row is reported on
+     * the operation, not the transaction (the branch above only sees
+     * it when the whole execute fails).  Without this check an absent
+     * partition read back as owner 0 and was answered as a CAS
+     * mismatch instead of NOTFOUND. */
+    if (read_op->getNdbError().code == 626) {
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return 1; /* NOTFOUND */
     }
     if (a_owner->u_32_value() != expected_owner) {
         rondb_get_ndb(state)->closeTransaction(tx);

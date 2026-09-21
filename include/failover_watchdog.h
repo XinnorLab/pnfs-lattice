@@ -112,4 +112,38 @@ enum mds_status failover_watchdog_start(
  */
 void failover_watchdog_stop(struct failover_watchdog *wd);
 
+/* -----------------------------------------------------------------------
+ * Writer side: one heartbeat tick with supersession detection
+ *
+ * node_register replaces a registry row whose boot_epoch is lower
+ * (mds_cluster.h), so a second daemon started later under the same
+ * mds_id takes the row over and this incarnation's heartbeats answer
+ * MDS_ERR_STALE from then on.  A daemon that kept serving after that
+ * would be a second, unregistered head for the same id -- the standby
+ * would never watch it and peers would never see it.  The heartbeat
+ * thread therefore treats STALE as fatal self-fencing; this helper is
+ * the decision it acts on, kept out of main.c so it can be tested with
+ * fabricated slots.
+ * ----------------------------------------------------------------------- */
+
+/**
+ * Refresh this incarnation's heartbeat and classify the outcome.
+ *
+ * Every status of mds_cluster_node_heartbeat() passes through
+ * unchanged.  On MDS_ERR_STALE the registry row is read back once (an
+ * exceptional path, one bounded scan) and its boot_epoch -- the
+ * incarnation that superseded @p boot_epoch -- is stored in
+ * *@p superseding_epoch; 0 when the row could not be read.
+ *
+ * @param cat                Catalogue handle.
+ * @param mds_id             This MDS's id.
+ * @param boot_epoch         This incarnation's boot epoch.
+ * @param superseding_epoch  Receives the row's epoch on STALE, else 0
+ *                           (may be NULL).
+ * @return The heartbeat status; MDS_ERR_INVAL on a NULL handle.
+ */
+enum mds_status cluster_heartbeat_tick(struct mds_catalogue *cat,
+				       uint32_t mds_id, uint64_t boot_epoch,
+				       uint64_t *superseding_epoch);
+
 #endif /* FAILOVER_WATCHDOG_H */

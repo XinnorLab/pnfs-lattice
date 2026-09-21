@@ -18,7 +18,7 @@
  * memdb column: the Phase 4 target for the reference backend -- every
  * authority slot it has today (including the cookie cursor
  * ns_readdir_plus_from), every coordination slot RonDB populates plus
- * lock_test, lock_scan_owner and layout_grant_union, all seven cluster
+ * lock_test, lock_scan_owner and layout_grant_union, all eight cluster
  * slots, no bootstrap, no native handle.  layoutget_fused stays absent:
  * it is a fused fast path with an explicit dispatcher fallback and
  * tests/unit/test_catalogue.c pins mds_coord_layoutget_fused_supported()
@@ -26,7 +26,7 @@
  *
  * rondb column: rondb_authority_ops / rondb_coordination_ops in
  * src/catalogue/catalogue_rondb.c (both authority tables populate the
- * same slot set), all seven cluster slots once rondb_cluster_ops is
+ * same slot set), all eight cluster slots once rondb_cluster_ops is
  * registered, bootstrap and backend_handle present.
  *
  * The optional changefeed slots (image_feed_start / image_feed_stop)
@@ -35,13 +35,15 @@
  *
  * fdb column: the Phase 5 foundation (src/catalogue/catalogue_fdb*.c)
  * -- every namespace authority slot the RonDB table has except the
- * fused ns_create_with_layout, plus close / probe / bootstrap.  The
- * remaining authority slots (xattr, inline, stripe map, DS registry and
- * provisioning, quota, GC, remove_pending, prealloc pool, shard,
- * ext_dirent, link_anchor, backend_client_stats), every coordination
- * slot and every cluster slot are absent until their follow-up units
- * land and flip the rows; ns_readdir_plus stays absent by design (the
- * cookie cursor ns_readdir_plus_from is the fused path, as on memdb).
+ * fused ns_create_with_layout, plus close / probe / bootstrap, plus the
+ * extended authority slots of catalogue_fdb_ext.c (inline, xattr,
+ * stripe map, DS registry and provisioning, quota, GC, remove_pending,
+ * shard, ext_dirent, link_anchor -- the memdb set).  prealloc_pool_*
+ * and backend_client_stats stay absent like on memdb; every
+ * coordination slot and every cluster slot are absent until their
+ * follow-up units land and flip the rows; ns_readdir_plus stays absent
+ * by design (the cookie cursor ns_readdir_plus_from is the fused path,
+ * as on memdb).
  */
 
 #ifndef CATALOGUE_CONFORMANCE_SLOT_MATRIX_EXPECTED_H
@@ -58,14 +60,14 @@
     X(ns_remove_known,                 false, true,  true)             \
     X(ns_remove_known_gc,              true,  true,  true)             \
     X(ns_parent_touch,                 true,  true,  true)             \
-    X(remove_pending_enqueue,          true,  true,  false)            \
-    X(remove_pending_enqueue_unlink,   true,  true,  false)            \
-    X(remove_pending_peek_batch,       true,  true,  false)            \
-    X(remove_pending_claim,            true,  true,  false)            \
-    X(remove_pending_complete,         true,  true,  false)            \
-    X(remove_pending_bump_retry,       true,  true,  false)            \
-    X(remove_pending_count,            true,  true,  false)            \
-    X(remove_pending_scan_all,         true,  true,  false)            \
+    X(remove_pending_enqueue,          true,  true,  true)             \
+    X(remove_pending_enqueue_unlink,   true,  true,  true)             \
+    X(remove_pending_peek_batch,       true,  true,  true)             \
+    X(remove_pending_claim,            true,  true,  true)             \
+    X(remove_pending_complete,         true,  true,  true)             \
+    X(remove_pending_bump_retry,       true,  true,  true)             \
+    X(remove_pending_count,            true,  true,  true)             \
+    X(remove_pending_scan_all,         true,  true,  true)             \
     X(ns_rename,                       true,  true,  true)             \
     X(ns_rename_flags,                 true,  true,  true)             \
     X(ns_link,                         true,  true,  true)             \
@@ -83,101 +85,102 @@
     X(dirent_put,                      true,  true,  true)             \
     X(dirent_insert,                   true,  true,  true)             \
     X(dirent_del,                      true,  true,  true)             \
-    X(inline_get,                      true,  true,  false)            \
-    X(inline_put,                      true,  true,  false)            \
-    X(inline_del,                      true,  true,  false)            \
-    X(xattr_get,                       true,  true,  false)            \
-    X(xattr_put,                       true,  true,  false)            \
-    X(xattr_del,                       true,  true,  false)            \
-    X(xattr_list,                      true,  true,  false)            \
-    X(xattr_exists,                    true,  true,  false)            \
-    X(stripe_map_get,                  true,  true,  false)            \
-    X(stripe_map_put,                  true,  true,  false)            \
-    X(stripe_map_del,                  true,  true,  false)            \
-    X(stripe_map_scan,                 true,  true,  false)            \
-    X(ds_get,                          true,  true,  false)            \
-    X(ds_put,                          true,  true,  false)            \
-    X(ds_del,                          true,  true,  false)            \
-    X(ds_list,                         true,  true,  false)            \
-    X(ds_provision_get,                true,  true,  false)            \
-    X(ds_provision_put,                true,  true,  false)            \
-    X(ds_provision_del,                true,  true,  false)            \
-    X(quota_rule_get,                  true,  true,  false)            \
-    X(quota_rule_put,                  true,  true,  false)            \
-    X(quota_usage_get,                 true,  true,  false)            \
-    X(quota_usage_put,                 true,  true,  false)            \
-    X(gc_enqueue,                      true,  true,  false)            \
-    X(gc_peek,                         true,  true,  false)            \
-    X(gc_dequeue,                      true,  true,  false)            \
-    X(gc_count,                        true,  true,  false)            \
-    X(gc_peek_batch,                   true,  true,  false)            \
+    X(inline_get,                      true,  true,  true)             \
+    X(inline_put,                      true,  true,  true)             \
+    X(inline_del,                      true,  true,  true)             \
+    X(xattr_get,                       true,  true,  true)             \
+    X(xattr_put,                       true,  true,  true)             \
+    X(xattr_del,                       true,  true,  true)             \
+    X(xattr_list,                      true,  true,  true)             \
+    X(xattr_exists,                    true,  true,  true)             \
+    X(stripe_map_get,                  true,  true,  true)             \
+    X(stripe_map_put,                  true,  true,  true)             \
+    X(stripe_map_del,                  true,  true,  true)             \
+    X(stripe_map_scan,                 true,  true,  true)             \
+    X(ds_get,                          true,  true,  true)             \
+    X(ds_put,                          true,  true,  true)             \
+    X(ds_del,                          true,  true,  true)             \
+    X(ds_list,                         true,  true,  true)             \
+    X(ds_provision_get,                true,  true,  true)             \
+    X(ds_provision_put,                true,  true,  true)             \
+    X(ds_provision_del,                true,  true,  true)             \
+    X(quota_rule_get,                  true,  true,  true)             \
+    X(quota_rule_put,                  true,  true,  true)             \
+    X(quota_usage_get,                 true,  true,  true)             \
+    X(quota_usage_put,                 true,  true,  true)             \
+    X(gc_enqueue,                      true,  true,  true)             \
+    X(gc_peek,                         true,  true,  true)             \
+    X(gc_dequeue,                      true,  true,  true)             \
+    X(gc_count,                        true,  true,  true)             \
+    X(gc_peek_batch,                   true,  true,  true)             \
     X(prealloc_pool_insert,            false, true,  false)            \
     X(prealloc_pool_delete,            false, true,  false)            \
     X(prealloc_pool_scan,              false, true,  false)            \
-    X(shard_fileid_get,                true,  false, false)            \
-    X(shard_fileid_put,                true,  false, false)            \
-    X(shard_fileid_del,                true,  false, false)            \
-    X(ext_dirent_get,                  true,  false, false)            \
-    X(ext_dirent_put,                  true,  false, false)            \
-    X(ext_dirent_del,                  true,  false, false)            \
-    X(link_anchor_put,                 true,  false, false)            \
-    X(link_anchor_del,                 true,  false, false)            \
+    X(shard_fileid_get,                true,  false, true)             \
+    X(shard_fileid_put,                true,  false, true)             \
+    X(shard_fileid_del,                true,  false, true)             \
+    X(ext_dirent_get,                  true,  false, true)             \
+    X(ext_dirent_put,                  true,  false, true)             \
+    X(ext_dirent_del,                  true,  false, true)             \
+    X(link_anchor_put,                 true,  false, true)             \
+    X(link_anchor_del,                 true,  false, true)             \
     X(backend_client_stats,            false, true,  false)
 
 /* --- struct mds_coordination_ops ------------------------------------- */
 #define CONFORMANCE_COORD_SLOTS(X)                                 \
-    X(journal_put,                     true,  true,  false)            \
-    X(journal_get,                     true,  true,  false)            \
-    X(journal_del,                     true,  true,  false)            \
-    X(journal_scan,                    true,  true,  false)            \
-    X(layout_grant,                    true,  true,  false)            \
-    X(layout_grant_union,              true,  true,  false)            \
-    X(layoutget_fused,                 false, true,  false)            \
-    X(layout_return,                   true,  true,  false)            \
-    X(layout_get_by_stateid,           true,  true,  false)            \
-    X(layout_scan_for_file,            true,  true,  false)            \
-    X(layout_del_all_for_client,       true,  true,  false)            \
-    X(ds_layout_idx_scan,              true,  true,  false)            \
-    X(layout_iter_file,                true,  true,  false)            \
-    X(recovery_put,                    true,  true,  false)            \
-    X(recovery_del,                    true,  true,  false)            \
-    X(recovery_get,                    true,  true,  false)            \
-    X(recovery_list,                   true,  true,  false)            \
-    X(open_put,                        true,  true,  false)            \
-    X(open_get,                        true,  true,  false)            \
-    X(open_del,                        true,  true,  false)            \
-    X(open_scan_file,                  true,  true,  false)            \
-    X(open_scan_client,                true,  true,  false)            \
-    X(lock_put,                        true,  true,  false)            \
-    X(lock_del,                        true,  true,  false)            \
-    X(lock_test,                       true,  false, false)            \
-    X(lock_scan_file,                  true,  true,  false)            \
-    X(lock_scan_owner,                 true,  false, false)            \
-    X(lock_reap_client,                true,  true,  false)            \
-    X(deleg_put,                       true,  true,  false)            \
-    X(deleg_get,                       true,  true,  false)            \
-    X(deleg_del,                       true,  true,  false)            \
-    X(deleg_scan_file,                 true,  true,  false)            \
-    X(deleg_scan_client,               true,  true,  false)            \
-    X(client_put,                      true,  true,  false)            \
-    X(client_get,                      true,  true,  false)            \
-    X(client_del,                      true,  true,  false)            \
-    X(session_put,                     true,  true,  false)            \
-    X(session_get,                     true,  true,  false)            \
-    X(session_del,                     true,  true,  false)            \
-    X(session_scan_client,             true,  true,  false)            \
-    X(slot_put,                        true,  true,  false)            \
-    X(slot_get,                        true,  true,  false)
+    X(journal_put,                     true,  true,  true)             \
+    X(journal_get,                     true,  true,  true)             \
+    X(journal_del,                     true,  true,  true)             \
+    X(journal_scan,                    true,  true,  true)             \
+    X(layout_grant,                    true,  true,  true)             \
+    X(layout_grant_union,              true,  true,  true)             \
+    X(layoutget_fused,                 false, true,  true)             \
+    X(layout_return,                   true,  true,  true)             \
+    X(layout_get_by_stateid,           true,  true,  true)             \
+    X(layout_scan_for_file,            true,  true,  true)             \
+    X(layout_del_all_for_client,       true,  true,  true)             \
+    X(ds_layout_idx_scan,              true,  true,  true)             \
+    X(layout_iter_file,                true,  true,  true)             \
+    X(recovery_put,                    true,  true,  true)             \
+    X(recovery_del,                    true,  true,  true)             \
+    X(recovery_get,                    true,  true,  true)             \
+    X(recovery_list,                   true,  true,  true)             \
+    X(open_put,                        true,  true,  true)             \
+    X(open_get,                        true,  true,  true)             \
+    X(open_del,                        true,  true,  true)             \
+    X(open_scan_file,                  true,  true,  true)             \
+    X(open_scan_client,                true,  true,  true)             \
+    X(lock_put,                        true,  true,  true)             \
+    X(lock_del,                        true,  true,  true)             \
+    X(lock_test,                       true,  false, true)             \
+    X(lock_scan_file,                  true,  true,  true)             \
+    X(lock_scan_owner,                 true,  false, true)             \
+    X(lock_reap_client,                true,  true,  true)             \
+    X(deleg_put,                       true,  true,  true)             \
+    X(deleg_get,                       true,  true,  true)             \
+    X(deleg_del,                       true,  true,  true)             \
+    X(deleg_scan_file,                 true,  true,  true)             \
+    X(deleg_scan_client,               true,  true,  true)             \
+    X(client_put,                      true,  true,  true)             \
+    X(client_get,                      true,  true,  true)             \
+    X(client_del,                      true,  true,  true)             \
+    X(session_put,                     true,  true,  true)             \
+    X(session_get,                     true,  true,  true)             \
+    X(session_del,                     true,  true,  true)             \
+    X(session_scan_client,             true,  true,  true)             \
+    X(slot_put,                        true,  true,  true)             \
+    X(slot_get,                        true,  true,  true)
 
 /* --- struct mds_cluster_ops ------------------------------------------ */
 #define CONFORMANCE_CLUSTER_SLOTS(X)                               \
-    X(node_register,                   true,  true,  false)            \
-    X(node_heartbeat,                  true,  true,  false)            \
-    X(node_deregister,                 true,  true,  false)            \
-    X(node_list,                       true,  true,  false)            \
-    X(node_scan_stale,                 true,  true,  false)            \
-    X(partition_list,                  true,  true,  false)            \
-    X(partition_put,                   true,  true,  false)
+    X(node_register,                   true,  true,  true)             \
+    X(node_heartbeat,                  true,  true,  true)             \
+    X(node_deregister,                 true,  true,  true)             \
+    X(node_list,                       true,  true,  true)             \
+    X(node_scan_stale,                 true,  true,  true)             \
+    X(partition_list,                  true,  true,  true)             \
+    X(partition_put,                   true,  true,  true)            \
+    X(partition_cas,                   true,  true,  true)
 
 /* --- struct mds_catalogue_ops (lifecycle) ---------------------------- */
 #define CONFORMANCE_LIFECYCLE_SLOTS(X)                             \
@@ -198,10 +201,9 @@
 /* --- Public predicates derived from the tables above ----------------- */
 #define CONFORMANCE_CLUSTER_SUPPORTED_MEMDB       false
 #define CONFORMANCE_CLUSTER_SUPPORTED_RONDB       true
-/* fdb carries MULTI_PROCESS but has no cluster slots yet. */
-#define CONFORMANCE_CLUSTER_SUPPORTED_FDB         false
+#define CONFORMANCE_CLUSTER_SUPPORTED_FDB         true
 #define CONFORMANCE_SHARED_STATE_SUPPORTED_MEMDB  true
 #define CONFORMANCE_SHARED_STATE_SUPPORTED_RONDB  true
-#define CONFORMANCE_SHARED_STATE_SUPPORTED_FDB    false
+#define CONFORMANCE_SHARED_STATE_SUPPORTED_FDB    true
 
 #endif /* CATALOGUE_CONFORMANCE_SLOT_MATRIX_EXPECTED_H */

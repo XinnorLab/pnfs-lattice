@@ -348,3 +348,55 @@ void failover_watchdog_stop(struct failover_watchdog *wd)
 	}
 	free(wd);
 }
+
+/* -----------------------------------------------------------------------
+ * Writer-side heartbeat tick (see failover_watchdog.h)
+ * ----------------------------------------------------------------------- */
+
+struct superseder_lookup {
+	uint32_t mds_id;
+	uint64_t boot_epoch;
+};
+
+static int superseder_cb(uint32_t mds_id, uint64_t boot_epoch,
+			 const char *hostname, uint16_t nfs_port,
+			 uint16_t grpc_port, uint64_t last_heartbeat_ns,
+			 void *ctx_void)
+{
+	struct superseder_lookup *ctx = ctx_void;
+
+	(void)hostname;
+	(void)nfs_port;
+	(void)grpc_port;
+	(void)last_heartbeat_ns;
+	if (mds_id != ctx->mds_id) {
+		return 0;
+	}
+	ctx->boot_epoch = boot_epoch;
+	return 1;
+}
+
+enum mds_status cluster_heartbeat_tick(struct mds_catalogue *cat,
+				       uint32_t mds_id, uint64_t boot_epoch,
+				       uint64_t *superseding_epoch)
+{
+	enum mds_status st;
+
+	if (superseding_epoch != NULL) {
+		*superseding_epoch = 0;
+	}
+	if (cat == NULL) {
+		return MDS_ERR_INVAL;
+	}
+	st = mds_cluster_node_heartbeat(cat, mds_id, boot_epoch);
+	if (st == MDS_ERR_STALE && superseding_epoch != NULL) {
+		struct superseder_lookup ctx = { .mds_id = mds_id,
+						 .boot_epoch = 0 };
+
+		/* Best effort: the fence decision is already made by the
+		 * STALE; the read-back only names the row for the log. */
+		(void)mds_cluster_node_list(cat, superseder_cb, &ctx);
+		*superseding_epoch = ctx.boot_epoch;
+	}
+	return st;
+}

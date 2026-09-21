@@ -236,6 +236,7 @@ int subtree_map_owner_for_root_fileid(const struct subtree_map *map,
 
 static void apply_subtree_upsert(struct subtree_map *m,
                                  const char *path,
+                                 uint32_t partition_id,
                                  uint32_t owner_mds_id,
                                  enum subtree_state state,
                                  uint64_t version)
@@ -247,6 +248,8 @@ static void apply_subtree_upsert(struct subtree_map *m,
         m->entries[idx].owner_mds_id = owner_mds_id;
         m->entries[idx].state = state;
         m->entries[idx].version = version;
+        m->entries[idx].partition_id = partition_id;
+        m->entries[idx].pm_backed = true;
     } else {
         if (grow_entries(m) == MDS_OK) {
             struct subtree_entry *e = &m->entries[m->count];
@@ -255,10 +258,28 @@ static void apply_subtree_upsert(struct subtree_map *m,
             e->owner_mds_id = owner_mds_id;
             e->state = state;
             e->version = version;
+            e->partition_id = partition_id;
+            e->pm_backed = true;
             m->count++;
         }
     }
 
+    pthread_rwlock_unlock(&m->lock);
+}
+
+/* Record that the entry at @path now has a partition-map row
+ * @partition_id (written by this node).  No-op for an unknown path. */
+static void mark_pm_backed(struct subtree_map *m, const char *path,
+                           uint32_t partition_id)
+{
+    int idx;
+
+    pthread_rwlock_wrlock(&m->lock);
+    idx = find_exact(m, path);
+    if (idx >= 0) {
+        m->entries[idx].partition_id = partition_id;
+        m->entries[idx].pm_backed = true;
+    }
     pthread_rwlock_unlock(&m->lock);
 }
 
@@ -438,11 +459,10 @@ static int pm_load_cb(uint32_t partition_id, uint32_t owner_mds_id,
     struct pm_load_ctx *lc = ctx;
     struct subtree_map *m = lc->map;
 
-    (void)partition_id;
     if (subtree_path == NULL || subtree_path[0] == '\0') {
         return 0;
     }
-    apply_subtree_upsert(m, subtree_path, owner_mds_id,
+    apply_subtree_upsert(m, subtree_path, partition_id, owner_mds_id,
                          (enum subtree_state)state, 1);
     lc->loaded++;
     return 0;
@@ -474,7 +494,7 @@ static enum mds_status pm_init_attempt(struct subtree_map *m,
     st = mds_cluster_partition_put(cat, 0, m->self_id,
                                    MDS_PARTITION_STATE_ACTIVE, "/", true);
     if (st == MDS_OK) {
-        apply_subtree_upsert(m, "/", m->self_id, SUBTREE_ACTIVE, 1);
+        apply_subtree_upsert(m, "/", 0, m->self_id, SUBTREE_ACTIVE, 1);
     }
     return st;
 }
@@ -660,6 +680,7 @@ static void seed_one_shard(struct subtree_map *map,
 		seed_log_put_failed(spath, mds_id, ast, pst);
 		return;
 	}
+	mark_pm_backed(map, spath, mds_id);
 	seed_log_persisted(spath, mds_id, ast);
 }
 
@@ -1180,31 +1201,143 @@ enum mds_status subtree_map_take_over(struct subtree_map *map,
  *
  * Bypasses owner_role_ok() because the promoting standby is not yet
  * ACTIVE_SERVING.
+ *
+ * Store first, memory second.  The partition map is the authority for
+ * ownership and every node's refresh re-reads it, so a takeover that
+ * only flipped this node's memory was undone by the next refresh
+ * (~100 s on the lab) and the dead partner's rows kept referring
+ * clients to it.  The CAS on (partition_id, expected = old_owner) is
+ * also what keeps two standbys racing for the same primary from both
+ * winning: exactly one CAS lands, the other sees STALE and leaves its
+ * memory alone.  The catalogue call runs outside the rwlock (lock
+ * contract at the top of this file); the entry is re-validated under
+ * the write lock before it moves.
  * ----------------------------------------------------------------------- */
 
+/* Flip the in-memory entry @path from @expected_owner to @new_owner
+ * under the write lock; NOTFOUND / STALE when it is not as expected. */
+static enum mds_status transfer_in_memory(struct subtree_map *map,
+                                          const char *path,
+                                          uint32_t expected_owner,
+                                          uint32_t new_owner)
+{
+    int idx;
+
+    pthread_rwlock_wrlock(&map->lock);
+    idx = find_exact(map, path);
+    if (idx < 0) {
+        pthread_rwlock_unlock(&map->lock);
+        return MDS_ERR_NOTFOUND;
+    }
+    if (map->entries[idx].owner_mds_id != expected_owner) {
+        pthread_rwlock_unlock(&map->lock);
+        return MDS_ERR_STALE;
+    }
+    map->entries[idx].owner_mds_id = new_owner;
+    map->entries[idx].version++;
+    pthread_rwlock_unlock(&map->lock);
+    return MDS_OK;
+}
+
+enum mds_status subtree_map_failover_transfer(struct subtree_map *map,
+                                              struct mds_catalogue *cat,
+                                              const char *path,
+                                              uint32_t expected_owner,
+                                              uint32_t new_owner)
+{
+    struct subtree_entry snap;
+    enum mds_status st;
+
+    if (map == NULL || path == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    st = subtree_map_lookup_exact(map, path, &snap);
+    if (st != MDS_OK) {
+        return st;
+    }
+    if (snap.owner_mds_id != expected_owner) {
+        return MDS_ERR_STALE;
+    }
+    if (cat != NULL && snap.pm_backed) {
+        st = mds_cluster_partition_cas(cat, snap.partition_id,
+                                       expected_owner, new_owner,
+                                       MDS_PARTITION_STATE_ACTIVE);
+        if (st == MDS_ERR_NOSUPPORT) {
+            /* Store without a CAS: memory-only, as before the slot. */
+            MDS_LOG_WARN(LOG_COMP_CLUSTER,
+                "partition_map has no owner CAS; ownership of %s "
+                "(partition %u) moves in memory only",
+                path, (unsigned)snap.partition_id);
+        } else if (st != MDS_OK) {
+            return st;
+        }
+    }
+    return transfer_in_memory(map, path, expected_owner, new_owner);
+}
+
+/* Log why one partner-owned entry was not taken.  Returns true when
+ * the cause was the store being unreachable (the CAS could not be
+ * decided), false when the store refused (another owner, or no row). */
+static bool take_over_note_failure(const struct subtree_entry *e,
+                                   uint32_t old_owner, enum mds_status st)
+{
+    if (st == MDS_ERR_STALE || st == MDS_ERR_NOTFOUND) {
+        MDS_LOG_WARN(LOG_COMP_CLUSTER,
+            "failover: partition %u (%s) not taken from MDS %u: %s; "
+            "the store no longer records that owner",
+            (unsigned)e->partition_id, e->path, (unsigned)old_owner,
+            mds_status_str(st));
+        return false;
+    }
+    MDS_LOG_WARN(LOG_COMP_CLUSTER,
+        "failover: partition %u (%s) not taken from MDS %u: "
+        "partition_map CAS failed (%s); left as is",
+        (unsigned)e->partition_id, e->path, (unsigned)old_owner,
+        mds_status_str(st));
+    return true;
+}
+
 enum mds_status subtree_map_failover_take_over(struct subtree_map *map,
+                                               struct mds_catalogue *cat,
                                                uint32_t old_owner,
                                                uint32_t new_owner,
                                                uint32_t *count_out)
 {
+    struct subtree_entry *owned = NULL;
+    uint32_t owned_n = 0;
     uint32_t taken = 0;
+    uint32_t store_failed = 0;
+    enum mds_status st;
 
     if (map == NULL || count_out == NULL) {
         return MDS_ERR_INVAL;
     }
+    *count_out = 0;
 
-    pthread_rwlock_wrlock(&map->lock);
-
-    for (uint32_t i = 0; i < map->count; i++) {
-        if (map->entries[i].owner_mds_id == old_owner) {
-            map->entries[i].owner_mds_id = new_owner;
-            map->entries[i].version++;
-            taken++;
-        }
+    /* Snapshot the partner's entries; the transfers below take the
+     * lock per entry and never hold it across the catalogue call. */
+    st = subtree_map_get_node_subtrees(map, old_owner, &owned, &owned_n);
+    if (st != MDS_OK) {
+        return st;
     }
 
-    pthread_rwlock_unlock(&map->lock);
+    for (uint32_t i = 0; i < owned_n; i++) {
+        st = subtree_map_failover_transfer(map, cat, owned[i].path,
+                                           old_owner, new_owner);
+        if (st == MDS_OK) {
+            taken++;
+        } else if (take_over_note_failure(&owned[i], old_owner, st)) {
+            store_failed++;
+        }
+    }
+    free(owned);
+
     *count_out = taken;
+    /* Nothing taken because the store could not be reached: the
+     * promotion must not proceed on a map the store never accepted. */
+    if (taken == 0 && store_failed > 0) {
+        return MDS_ERR_IO;
+    }
     return MDS_OK;
 }
 

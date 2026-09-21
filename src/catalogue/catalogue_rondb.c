@@ -994,6 +994,49 @@ static enum mds_status catalogue_rondb_ns_remove_known(struct mds_catalogue *cat
 						const struct mds_inode *child,
 						uint32_t stripe_count);
 
+/*
+ * Shim verdicts of the remove transaction -> mds_status.
+ *
+ * 4 / 5 are the data-node snapshot guards: the name no longer resolves
+ * to the caller's child (4) or its live nlink contradicts the
+ * final/non-final shape the caller derived from its snapshot (5).
+ * Nothing was mutated.  Both surface as MDS_ERR_STALE: the caller's
+ * final-unlink bookkeeping (GC rows, quota, layout recall) was derived
+ * from that same snapshot, so the remove must not silently retarget
+ * itself -- the caller re-resolves and decides again.
+ */
+static enum mds_status rondb_ns_remove_rc_status(int rc)
+{
+	switch (rc) {
+	case 0:
+		return MDS_OK;
+	case 1:
+		/* TOCTOU: concurrent remove beat us; row already gone. */
+		return MDS_ERR_NOTFOUND;
+	case 3:
+		/* Directory target still has entries; decided inside the
+		 * removing transaction (C3), nothing was mutated. */
+		return MDS_ERR_NOTEMPTY;
+	case 4:
+	case 5:
+		return MDS_ERR_STALE;
+	case -2:
+		/* Transient NDB contention (lock-wait timeouts) survived
+		 * every retry.  Surface as DELAY so the client backs off
+		 * and resends the REMOVE instead of failing the unlink
+		 * with EIO. */
+		return MDS_ERR_DELAY;
+	default:
+		return MDS_ERR_IO;
+	}
+}
+
+/* Bound on lookup -> guarded remove rounds in the plain ns_remove: a
+ * STALE verdict means a link/unlink/replace of the same name landed
+ * between our own lookup and our transaction; re-resolving once or
+ * twice covers any realistic race without an unbounded loop. */
+#define RONDB_REMOVE_RESOLVE_ATTEMPTS 3
+
 static enum mds_status catalogue_rondb_ns_remove(struct mds_catalogue *cat,
 					  uint64_t parent_fileid,
 					  const char *name)
@@ -1004,31 +1047,41 @@ static enum mds_status catalogue_rondb_ns_remove(struct mds_catalogue *cat,
 	uint8_t child_type = 0;
 	uint8_t child_buf[RONDB_INODE_MAX_SIZE];
 	uint32_t outlen = 0;
+	enum mds_status st = MDS_ERR_STALE;
 	int rc;
 
 	if (h == NULL || name == NULL) {
 		return MDS_ERR_INVAL;
 	}
 
-	rc = rondb_shim_ns_lookup(h, parent_fileid, name,
-				  &child_fid, &child_type,
-				  child_buf, sizeof(child_buf),
-				  &outlen);
-	if (rc == 1) {
-		return MDS_ERR_NOTFOUND;
+	/* The snapshot is our own and a moment old, so a STALE verdict is
+	 * safe to answer by re-resolving and deciding again: there is no
+	 * caller-side bookkeeping tied to the previous snapshot. */
+	for (int attempt = 0;
+	     attempt < RONDB_REMOVE_RESOLVE_ATTEMPTS && st == MDS_ERR_STALE;
+	     attempt++) {
+		rc = rondb_shim_ns_lookup(h, parent_fileid, name,
+					  &child_fid, &child_type,
+					  child_buf, sizeof(child_buf),
+					  &outlen);
+		if (rc == 1) {
+			return MDS_ERR_NOTFOUND;
+		}
+		if (rc == -2) {
+			return MDS_ERR_DELAY;
+		}
+		if (rc != 0) {
+			return MDS_ERR_IO;
+		}
+		if (rondb_inode_deserialize(child_buf, outlen,
+					   &child_ino, NULL) != 0) {
+			return MDS_ERR_IO;
+		}
+		st = catalogue_rondb_ns_remove_known(cat, parent_fileid, name,
+						     &child_ino, 0);
 	}
-	if (rc == -2) {
-		return MDS_ERR_DELAY;
-	}
-	if (rc != 0) {
-		return MDS_ERR_IO;
-	}
-	if (rondb_inode_deserialize(child_buf, outlen,
-				   &child_ino, NULL) != 0) {
-		return MDS_ERR_IO;
-	}
-	return catalogue_rondb_ns_remove_known(cat, parent_fileid, name,
-					       &child_ino, 0);
+	/* Still racing after every round: let the client resend. */
+	return (st == MDS_ERR_STALE) ? MDS_ERR_DELAY : st;
 }
 
 static enum mds_status catalogue_rondb_ns_remove_known(struct mds_catalogue *cat,
@@ -1079,24 +1132,8 @@ static enum mds_status catalogue_rondb_ns_remove_known(struct mds_catalogue *cat
 		rondb_transient_backoff(attempt);
 	}
 	rondb_transient_note_exhausted(rc);
-	if (rc == 1) {
-		/* TOCTOU: concurrent remove beat us; row already gone. */
-		return MDS_ERR_NOTFOUND;
-	}
-	if (rc == 3) {
-		/* Directory target still has entries; decided inside the
-		 * removing transaction (C3), nothing was mutated. */
-		return MDS_ERR_NOTEMPTY;
-	}
-	if (rc == -2) {
-		/* Transient NDB contention (lock-wait timeouts) survived
-		 * every retry.  Surface as DELAY so the client backs off
-		 * and resends the REMOVE instead of failing the unlink
-		 * with EIO.  Same mapping as catalogue_rondb_ns_remove. */
-		return MDS_ERR_DELAY;
-	}
 	if (rc != 0) {
-		return MDS_ERR_IO;
+		return rondb_ns_remove_rc_status(rc);
 	}
 
 	catalog_stat_inc(&cat->stats.authority_writes);
@@ -1196,17 +1233,12 @@ enum mds_status catalogue_rondb_ns_remove_known_gc(
 	}
 	rondb_transient_note_exhausted(rc);
 	free(rows);
-	if (rc == 1) {
-		return MDS_ERR_NOTFOUND;
-	}
-	if (rc == 3) {
-		return MDS_ERR_NOTEMPTY;
-	}
-	if (rc == -2) {
-		return MDS_ERR_DELAY;
-	}
 	if (rc != 0) {
-		return MDS_ERR_IO;
+		/* Includes the STALE verdicts the header contract promises
+		 * (dirent no longer resolves to @child, or its live nlink
+		 * says this is not the final link): nothing was committed,
+		 * *gc_folded stays false, the caller re-resolves. */
+		return rondb_ns_remove_rc_status(rc);
 	}
 
 	*gc_folded = true;
@@ -1718,6 +1750,12 @@ static enum mds_status rondb_ns_rename_attempt(
 		break;
 	case 3:
 		return MDS_ERR_NOTEMPTY;
+	case 4:
+		/* The store refused the plan (its data-node guards saw a
+		 * name repointed, a victim replaced or a link count that
+		 * moved since the reads above); nothing was mutated.  The
+		 * next attempt re-resolves from scratch. */
+		return MDS_ERR_STALE;
 	case -2:
 		return MDS_ERR_DELAY;
 	default:
@@ -1738,8 +1776,10 @@ static enum mds_status rondb_ns_rename_attempt(
  *
  * A rename over a non-empty directory is MDS_ERR_NOTEMPTY, decided by
  * the shim inside the rename transaction.  Attempts the shim reports
- * as stale or transient are re-resolved a bounded number of times;
- * exhaustion surfaces as MDS_ERR_DELAY so the client backs off.
+ * as stale (its snapshot guards refused the plan; retried at once with
+ * fresh reads) or transient (retried after a backoff) are re-resolved a
+ * bounded number of times; exhaustion of either surfaces as
+ * MDS_ERR_DELAY so the client backs off and resends the RENAME.
  */
 static enum mds_status rondb_ns_rename_resolved(
 	struct mds_catalogue *cat,
@@ -1758,13 +1798,16 @@ static enum mds_status rondb_ns_rename_resolved(
 					     dst_parent, dst_name,
 					     src_fid_out, src_type_out,
 					     rn_flags);
-		if (st != MDS_ERR_DELAY) {
+		if (st != MDS_ERR_DELAY && st != MDS_ERR_STALE) {
 			break;
 		}
-		rondb_transient_backoff(attempt);
+		if (st == MDS_ERR_DELAY) {
+			rondb_transient_backoff(attempt);
+		}
 	}
-	if (st == MDS_ERR_DELAY) {
+	if (st == MDS_ERR_DELAY || st == MDS_ERR_STALE) {
 		rondb_transient_note_exhausted(-2);
+		return MDS_ERR_DELAY;
 	}
 	return st;
 }
@@ -4976,7 +5019,10 @@ static enum mds_status rondb_cluster_partition_put(
     return rc == 0 ? MDS_OK : MDS_ERR_IO;
 }
 
-enum mds_status catalogue_rondb_partition_map_cas(
+/* Owner CAS (the failover takeover's persistence step): the shim reads
+ * the row LM_Exclusive and rewrites owner/state under that lock, so the
+ * compare and the write are one transaction. */
+static enum mds_status rondb_cluster_partition_cas(
     struct mds_catalogue *cat, uint32_t partition_id,
     uint32_t expected_owner, uint32_t new_owner, uint8_t new_state)
 {
@@ -5022,6 +5068,7 @@ static const struct mds_cluster_ops rondb_cluster_ops = {
     .node_scan_stale = rondb_cluster_node_scan_stale,
     .partition_list  = rondb_cluster_partition_list,
     .partition_put   = rondb_cluster_partition_put,
+    .partition_cas   = rondb_cluster_partition_cas,
 };
 
 /* -----------------------------------------------------------------------

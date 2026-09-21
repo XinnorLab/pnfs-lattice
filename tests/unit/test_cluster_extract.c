@@ -13,6 +13,11 @@
  *     list is fatal after a bounded retry and never seeds root, the
  *     root claim is insert-only and EXISTS means another node owns
  *     root, shard seeding stays an upsert;
+ *   - subtree_map_failover_take_over over mds_cluster_partition_cas:
+ *     every partner-owned row is CAS'd (expected = partner) before its
+ *     in-memory entry moves, a STALE row is skipped and stays the
+ *     partner's, and a store without the slot keeps the memory-only
+ *     behaviour;
  *   - cluster_membership_populate over mds_cluster_node_list, which
  *     merges only the registry's address fields into existing members
  *     (self keeps its configured standby role and partner);
@@ -143,6 +148,20 @@ static struct fake_pm_put   fake_pm_puts[FAKE_CALLS_MAX];
 static uint32_t             fake_pm_put_count;
 static enum mds_status      fake_pm_put_status;
 
+struct fake_pm_cas {
+    uint32_t partition_id;
+    uint32_t expected_owner;
+    uint32_t new_owner;
+    uint8_t  new_state;
+};
+
+static struct fake_pm_cas   fake_pm_cas_calls[FAKE_CALLS_MAX];
+static uint32_t             fake_pm_cas_count;
+/* Forced status for every CAS; MDS_OK means "apply the row rule":
+ * NOTFOUND for an unknown partition_id, STALE when the row's owner is
+ * not the expected one, otherwise the row is rewritten. */
+static enum mds_status      fake_pm_cas_status;
+
 static struct fake_node_row fake_node_rows[FAKE_ROWS_MAX];
 static uint32_t             fake_node_row_count;
 static enum mds_status      fake_node_list_status;
@@ -172,6 +191,9 @@ static void fake_reset(void)
     memset(fake_pm_puts, 0, sizeof(fake_pm_puts));
     fake_pm_put_count = 0;
     fake_pm_put_status = MDS_OK;
+    memset(fake_pm_cas_calls, 0, sizeof(fake_pm_cas_calls));
+    fake_pm_cas_count = 0;
+    fake_pm_cas_status = MDS_OK;
     memset(fake_node_rows, 0, sizeof(fake_node_rows));
     fake_node_row_count = 0;
     fake_node_list_status = MDS_OK;
@@ -354,6 +376,43 @@ static enum mds_status fake_partition_put(struct mds_catalogue *cat,
     return fake_pm_put_status;
 }
 
+static enum mds_status fake_partition_cas(struct mds_catalogue *cat,
+                                          uint32_t partition_id,
+                                          uint32_t expected_owner,
+                                          uint32_t new_owner,
+                                          uint8_t new_state)
+{
+    uint32_t i;
+
+    (void)cat;
+    if (fake_pm_cas_count < FAKE_CALLS_MAX) {
+        struct fake_pm_cas *c = &fake_pm_cas_calls[fake_pm_cas_count];
+
+        c->partition_id = partition_id;
+        c->expected_owner = expected_owner;
+        c->new_owner = new_owner;
+        c->new_state = new_state;
+    }
+    fake_pm_cas_count++;
+    if (fake_pm_cas_status != MDS_OK) {
+        return fake_pm_cas_status;
+    }
+    for (i = 0; i < fake_pm_row_count; i++) {
+        struct fake_pm_row *r = &fake_pm_rows[i];
+
+        if (r->partition_id != partition_id) {
+            continue;
+        }
+        if (r->owner != expected_owner) {
+            return MDS_ERR_STALE;
+        }
+        r->owner = new_owner;
+        r->state = new_state;
+        return MDS_OK;
+    }
+    return MDS_ERR_NOTFOUND;
+}
+
 static const struct mds_cluster_ops fake_ops_full = {
     .node_register   = fake_node_register,
     .node_heartbeat  = fake_node_heartbeat,
@@ -362,6 +421,7 @@ static const struct mds_cluster_ops fake_ops_full = {
     .node_scan_stale = fake_node_scan_stale,
     .partition_list  = fake_partition_list,
     .partition_put   = fake_partition_put,
+    .partition_cas   = fake_partition_cas,
 };
 
 /* Everything but the stale scan: what the watchdog needs is missing. */
@@ -370,6 +430,19 @@ static const struct mds_cluster_ops fake_ops_no_stale = {
     .node_heartbeat  = fake_node_heartbeat,
     .node_deregister = fake_node_deregister,
     .node_list       = fake_node_list,
+    .partition_list  = fake_partition_list,
+    .partition_put   = fake_partition_put,
+    .partition_cas   = fake_partition_cas,
+};
+
+/* A partition map that can list and put but not CAS: the pre-slot
+ * store, whose takeover stays memory-only. */
+static const struct mds_cluster_ops fake_ops_no_cas = {
+    .node_register   = fake_node_register,
+    .node_heartbeat  = fake_node_heartbeat,
+    .node_deregister = fake_node_deregister,
+    .node_list       = fake_node_list,
+    .node_scan_stale = fake_node_scan_stale,
     .partition_list  = fake_partition_list,
     .partition_put   = fake_partition_put,
 };
@@ -550,6 +623,27 @@ static void test_cluster_dispatch_args_and_passthrough(void)
     ASSERT_EQ(mds_cluster_partition_list(cat, NULL, NULL), MDS_ERR_INVAL);
     ASSERT_EQ(mds_cluster_partition_put(cat, 0, 1, 0, NULL, false),
               MDS_ERR_INVAL);
+    ASSERT_EQ(mds_cluster_partition_cas(NULL, 2, 2, 1,
+                                        MDS_PARTITION_STATE_ACTIVE),
+              MDS_ERR_INVAL);
+
+    /* partition_cas forwards verbatim and its OK / NOTFOUND / STALE
+     * reach the caller unchanged (C4). */
+    fake_pm_add(2, 2, MDS_PARTITION_STATE_ACTIVE, "/shard2");
+    ASSERT_EQ(mds_cluster_partition_cas(cat, 2, 2, 1,
+                                        MDS_PARTITION_STATE_ACTIVE), MDS_OK);
+    ASSERT_EQ(fake_pm_cas_count, 1U);
+    ASSERT_EQ(fake_pm_cas_calls[0].partition_id, 2U);
+    ASSERT_EQ(fake_pm_cas_calls[0].expected_owner, 2U);
+    ASSERT_EQ(fake_pm_cas_calls[0].new_owner, 1U);
+    ASSERT_EQ(fake_pm_cas_calls[0].new_state, MDS_PARTITION_STATE_ACTIVE);
+    ASSERT_EQ(fake_pm_rows[0].owner, 1U);
+    ASSERT_EQ(mds_cluster_partition_cas(cat, 2, 2, 1,
+                                        MDS_PARTITION_STATE_ACTIVE),
+              MDS_ERR_STALE);
+    ASSERT_EQ(mds_cluster_partition_cas(cat, 5, 2, 1,
+                                        MDS_PARTITION_STATE_ACTIVE),
+              MDS_ERR_NOTFOUND);
 
     /* Absent slots -> NOSUPPORT. */
     cat = make_fake_cat(&fake_ops_registry_only, &fake_lifecycle_no_feed,
@@ -557,6 +651,9 @@ static void test_cluster_dispatch_args_and_passthrough(void)
     ASSERT_EQ(mds_cluster_partition_put(cat, 0, 1,
                                         MDS_PARTITION_STATE_ACTIVE, "/",
                                         false), MDS_ERR_NOSUPPORT);
+    ASSERT_EQ(mds_cluster_partition_cas(cat, 2, 2, 1,
+                                        MDS_PARTITION_STATE_ACTIVE),
+              MDS_ERR_NOSUPPORT);
     cat = make_fake_cat(&fake_ops_no_stale, &fake_lifecycle_no_feed,
                         MDS_CAT_CAP_MULTI_PROCESS);
     ASSERT_EQ(mds_cluster_node_scan_stale(cat, 1, NULL, NULL),
@@ -1413,6 +1510,212 @@ static void test_open_unavailable_backend(void)
 }
 
 /* -------------------------------------------------------------------
+ * Failover takeover over the partition map (mds_cluster_partition_cas)
+ * ------------------------------------------------------------------- */
+
+/* Every partner-owned row is CAS'd with expected = partner before its
+ * in-memory entry moves; a row the store refuses (another node took
+ * it) is skipped and stays the partner's in memory; a refresh then
+ * agrees with the store; a replay finds nothing to take. */
+static void test_failover_take_over_persists_with_cas(void)
+{
+    struct mds_catalogue *cat;
+    struct subtree_map *map = NULL;
+    struct subtree_entry e;
+    uint32_t taken = 99;
+
+    fake_reset();
+    fake_pm_add(0, 0, MDS_PARTITION_STATE_ACTIVE, "/");   /* seeded root */
+    fake_pm_add(1, 1, MDS_PARTITION_STATE_ACTIVE, "/shard1");
+    fake_pm_add(2, 2, MDS_PARTITION_STATE_ACTIVE, "/shard2");
+    fake_pm_add(3, 2, MDS_PARTITION_STATE_ACTIVE, "/shard3");
+    cat = make_fake_cat(&fake_ops_full, &fake_lifecycle_no_feed,
+                        MDS_CAT_CAP_MULTI_PROCESS);
+    ASSERT_EQ(subtree_map_init_from_catalogue(cat, 1, "mds1.local", &map),
+              MDS_OK);
+    ASSERT_EQ(subtree_map_count(map), 4U);
+    ASSERT_EQ(subtree_map_lookup_exact(map, "/shard3", &e), MDS_OK);
+    ASSERT_TRUE(e.pm_backed);
+    ASSERT_EQ(e.partition_id, 3U);
+
+    /* Node 9 took /shard3 behind our back: our CAS on it is STALE. */
+    fake_pm_rows[3].owner = 9;
+
+    ASSERT_EQ(subtree_map_failover_take_over(map, cat, 2, 1, &taken), MDS_OK);
+    ASSERT_EQ(taken, 1U);
+    ASSERT_EQ(fake_pm_cas_count, 2U);
+    ASSERT_EQ(fake_pm_cas_calls[0].partition_id, 2U);
+    ASSERT_EQ(fake_pm_cas_calls[0].expected_owner, 2U);
+    ASSERT_EQ(fake_pm_cas_calls[0].new_owner, 1U);
+    ASSERT_EQ(fake_pm_cas_calls[0].new_state, MDS_PARTITION_STATE_ACTIVE);
+    ASSERT_EQ(fake_pm_cas_calls[1].partition_id, 3U);
+    ASSERT_EQ(fake_pm_cas_calls[1].expected_owner, 2U);
+    /* Store: /shard2 rewritten, /shard3 untouched. */
+    ASSERT_EQ(fake_pm_rows[2].owner, 1U);
+    ASSERT_EQ(fake_pm_rows[3].owner, 9U);
+    /* Memory: /shard2 moved; /shard3 was NOT flipped -- still what the
+     * last load said (the partner), never a claim the store refused. */
+    ASSERT_EQ(subtree_map_lookup_exact(map, "/shard2", &e), MDS_OK);
+    ASSERT_EQ(e.owner_mds_id, 1U);
+    ASSERT_EQ(subtree_map_lookup_exact(map, "/shard3", &e), MDS_OK);
+    ASSERT_EQ(e.owner_mds_id, 2U);
+    ASSERT_EQ(subtree_map_lookup_exact(map, "/shard1", &e), MDS_OK);
+    ASSERT_EQ(e.owner_mds_id, 1U);
+
+    /* The refresh agrees with the store on both. */
+    ASSERT_EQ(subtree_map_refresh_from_catalogue(map, cat), MDS_OK);
+    ASSERT_EQ(subtree_map_lookup_exact(map, "/shard2", &e), MDS_OK);
+    ASSERT_EQ(e.owner_mds_id, 1U);
+    ASSERT_EQ(subtree_map_lookup_exact(map, "/shard3", &e), MDS_OK);
+    ASSERT_EQ(e.owner_mds_id, 9U);
+
+    /* Replay: nothing of the partner's is left; no CAS is issued. */
+    fake_pm_cas_count = 0;
+    taken = 99;
+    ASSERT_EQ(subtree_map_failover_take_over(map, cat, 2, 1, &taken), MDS_OK);
+    ASSERT_EQ(taken, 0U);
+    ASSERT_EQ(fake_pm_cas_count, 0U);
+
+    /* Rollback direction (failover_promote after a later phase fails):
+     * the same transfer with expected = self hands the row back, and
+     * a second attempt is STALE because self no longer owns it. */
+    ASSERT_EQ(subtree_map_failover_transfer(map, cat, "/shard2", 1, 2),
+              MDS_OK);
+    ASSERT_EQ(fake_pm_rows[2].owner, 2U);
+    ASSERT_EQ(subtree_map_lookup_exact(map, "/shard2", &e), MDS_OK);
+    ASSERT_EQ(e.owner_mds_id, 2U);
+    ASSERT_EQ(subtree_map_failover_transfer(map, cat, "/shard2", 1, 2),
+              MDS_ERR_STALE);
+    ASSERT_EQ(subtree_map_failover_transfer(map, cat, "/nowhere", 2, 1),
+              MDS_ERR_NOTFOUND);
+    ASSERT_EQ(subtree_map_failover_transfer(NULL, cat, "/shard2", 2, 1),
+              MDS_ERR_INVAL);
+    subtree_map_destroy(map);
+    map = NULL;
+
+    /* Store unreachable: nothing moves in memory and IO is reported,
+     * so the promotion aborts instead of serving from a map the store
+     * never accepted. */
+    fake_reset();
+    fake_pm_add(0, 0, MDS_PARTITION_STATE_ACTIVE, "/");
+    fake_pm_add(2, 2, MDS_PARTITION_STATE_ACTIVE, "/shard2");
+    ASSERT_EQ(subtree_map_init_from_catalogue(cat, 1, NULL, &map), MDS_OK);
+    fake_pm_cas_status = MDS_ERR_IO;
+    taken = 99;
+    ASSERT_EQ(subtree_map_failover_take_over(map, cat, 2, 1, &taken),
+              MDS_ERR_IO);
+    ASSERT_EQ(taken, 0U);
+    ASSERT_EQ(fake_pm_cas_count, 1U);
+    ASSERT_EQ(subtree_map_lookup_exact(map, "/shard2", &e), MDS_OK);
+    ASSERT_EQ(e.owner_mds_id, 2U);
+    ASSERT_EQ(fake_pm_rows[1].owner, 2U);
+    subtree_map_destroy(map);
+    map = NULL;
+
+    /* Memory-only entries (subtree_map_add: local mode, splits) and a
+     * NULL catalogue never reach the store. */
+    fake_reset();
+    fake_pm_add(0, 0, MDS_PARTITION_STATE_ACTIVE, "/");
+    ASSERT_EQ(subtree_map_init_from_catalogue(cat, 1, NULL, &map), MDS_OK);
+    ASSERT_EQ(subtree_map_add(map, "/local", 2, NULL, SUBTREE_ACTIVE, 1),
+              MDS_OK);
+    ASSERT_EQ(subtree_map_lookup_exact(map, "/local", &e), MDS_OK);
+    ASSERT_TRUE(!e.pm_backed);
+    taken = 99;
+    ASSERT_EQ(subtree_map_failover_take_over(map, cat, 2, 1, &taken), MDS_OK);
+    ASSERT_EQ(taken, 1U);
+    ASSERT_EQ(fake_pm_cas_count, 0U);
+    ASSERT_EQ(subtree_map_lookup_exact(map, "/local", &e), MDS_OK);
+    ASSERT_EQ(e.owner_mds_id, 1U);
+    ASSERT_EQ(subtree_map_failover_transfer(map, NULL, "/local", 1, 2),
+              MDS_OK);
+    ASSERT_EQ(fake_pm_cas_count, 0U);
+    subtree_map_destroy(map);
+}
+
+/* A store that lists and puts but has no CAS keeps the pre-slot
+ * behaviour: the takeover moves the entries in memory only (and the
+ * store keeps the partner as owner, which is exactly the D3 exposure
+ * the slot closes). */
+static void test_failover_take_over_without_cas_slot(void)
+{
+    struct mds_catalogue *cat;
+    struct subtree_map *map = NULL;
+    struct subtree_entry e;
+    uint32_t taken = 99;
+
+    fake_reset();
+    fake_pm_add(0, 0, MDS_PARTITION_STATE_ACTIVE, "/");
+    fake_pm_add(2, 2, MDS_PARTITION_STATE_ACTIVE, "/shard2");
+    cat = make_fake_cat(&fake_ops_no_cas, &fake_lifecycle_no_feed,
+                        MDS_CAT_CAP_MULTI_PROCESS);
+    ASSERT_TRUE(mds_cluster_supported(cat));
+    ASSERT_EQ(subtree_map_init_from_catalogue(cat, 1, NULL, &map), MDS_OK);
+
+    ASSERT_EQ(subtree_map_failover_take_over(map, cat, 2, 1, &taken), MDS_OK);
+    ASSERT_EQ(taken, 1U);
+    ASSERT_EQ(fake_pm_cas_count, 0U);
+    ASSERT_EQ(subtree_map_lookup_exact(map, "/shard2", &e), MDS_OK);
+    ASSERT_EQ(e.owner_mds_id, 1U);
+    ASSERT_EQ(fake_pm_rows[1].owner, 2U);
+    subtree_map_destroy(map);
+}
+
+/* -------------------------------------------------------------------
+ * Writer-side heartbeat tick: the self-fencing decision main.c acts on
+ * ------------------------------------------------------------------- */
+
+static void test_heartbeat_tick_supersession(void)
+{
+    struct mds_catalogue *cat;
+    uint64_t superseder = 77;
+
+    fake_reset();
+    cat = make_fake_cat(&fake_ops_full, &fake_lifecycle_no_feed,
+                        MDS_CAT_CAP_MULTI_PROCESS);
+
+    /* OK / NOTFOUND / NOSUPPORT pass through; no read-back, epoch 0. */
+    fake_heartbeat_status = MDS_OK;
+    ASSERT_EQ(cluster_heartbeat_tick(cat, 3, 4242, &superseder), MDS_OK);
+    ASSERT_EQ(fake_heartbeat.calls, 1U);
+    ASSERT_EQ(fake_heartbeat.mds_id, 3U);
+    ASSERT_EQ(fake_heartbeat.boot_epoch, 4242U);
+    ASSERT_EQ(superseder, 0U);
+    fake_heartbeat_status = MDS_ERR_NOTFOUND;
+    superseder = 77;
+    ASSERT_EQ(cluster_heartbeat_tick(cat, 3, 4242, &superseder),
+              MDS_ERR_NOTFOUND);
+    ASSERT_EQ(superseder, 0U);
+
+    /* STALE: the row now carries the newer incarnation's epoch
+     * (fake_node_add stamps 100 + mds_id), which is named. */
+    fake_heartbeat_status = MDS_ERR_STALE;
+    fake_node_add(3, "mds3", 2049, 50051, 1);
+    ASSERT_EQ(cluster_heartbeat_tick(cat, 3, 4242, &superseder),
+              MDS_ERR_STALE);
+    ASSERT_EQ(superseder, 103U);
+
+    /* STALE with an unreadable registry: still STALE, epoch 0. */
+    fake_node_list_status = MDS_ERR_IO;
+    superseder = 77;
+    ASSERT_EQ(cluster_heartbeat_tick(cat, 3, 4242, &superseder),
+              MDS_ERR_STALE);
+    ASSERT_EQ(superseder, 0U);
+    fake_node_list_status = MDS_OK;
+
+    /* A NULL epoch out-pointer is allowed; NULL handle is INVAL. */
+    ASSERT_EQ(cluster_heartbeat_tick(cat, 3, 4242, NULL), MDS_ERR_STALE);
+    ASSERT_EQ(cluster_heartbeat_tick(NULL, 3, 4242, &superseder),
+              MDS_ERR_INVAL);
+
+    /* No registry at all: NOSUPPORT passes through. */
+    cat = make_fake_cat(NULL, &fake_lifecycle_no_feed,
+                        MDS_CAT_CAP_MULTI_PROCESS);
+    ASSERT_EQ(cluster_heartbeat_tick(cat, 3, 4242, &superseder),
+              MDS_ERR_NOSUPPORT);
+}
+
+/* -------------------------------------------------------------------
  * Config parsing of catalogue_backend in both build flavours
  * ------------------------------------------------------------------- */
 
@@ -1526,10 +1829,13 @@ int main(void)
     RUN_TEST(test_subtree_init_root_claim_insert_only);
     RUN_TEST(test_subtree_refresh_from_catalogue);
     RUN_TEST(test_subtree_seed_shards);
+    RUN_TEST(test_failover_take_over_persists_with_cas);
+    RUN_TEST(test_failover_take_over_without_cas_slot);
     RUN_TEST(test_membership_populate);
     RUN_TEST(test_watchdog_start_contract);
     RUN_TEST(test_heartbeat_plausibility_predicate);
     RUN_TEST(test_watchdog_indeterminate_partner_skips_tick);
+    RUN_TEST(test_heartbeat_tick_supersession);
     RUN_TEST(test_image_feed_dispatch);
     RUN_TEST(test_backend_names);
     RUN_TEST(test_backend_registry);

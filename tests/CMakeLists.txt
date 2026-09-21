@@ -583,3 +583,137 @@ target_link_libraries(test_fdb_txn PRIVATE
 add_test(NAME test_fdb_txn COMMAND test_fdb_txn)
 set_tests_properties(test_fdb_txn PROPERTIES LABELS "unit" SKIP_RETURN_CODE 77)
 # End of fdb track block.
+
+# -------------------------------------------------------------------
+# indoubt track (Phase 5 caller audit) -- MDS_ERR_INDOUBT.
+#
+# test_indoubt_mapping drives every enum mds_status value through the
+# name and NFS mappings, then runs CREATE / OPEN(CREATE)+LAYOUTGET /
+# REMOVE (fused, plain, async manifest) / RENAME / LAYOUTGET / LINK
+# through compound_process against a counting proxy over the memdb
+# backend whose slot under test answers MDS_ERR_INDOUBT: NFS4ERR_IO,
+# no follow-up slot call, one placement pop, store unchanged.  Needs
+# no external service.  Appended block.
+# -------------------------------------------------------------------
+add_executable(test_indoubt_mapping unit/test_indoubt_mapping.c)
+target_include_directories(test_indoubt_mapping PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src/catalogue
+    ${PROJECT_SOURCE_DIR}/tests
+)
+target_link_libraries(test_indoubt_mapping PRIVATE
+    pnfs_mds_core
+    pnfs_cluster
+    pnfs_fsal_obj
+    pnfs_common
+    pnfs_mds_core
+    pnfs_cluster
+    pnfs_mds_core
+    rondb_schema
+    pthread
+)
+add_test(NAME test_indoubt_mapping COMMAND test_indoubt_mapping)
+set_tests_properties(test_indoubt_mapping PROPERTIES LABELS "unit")
+# End of indoubt track block.
+
+# -------------------------------------------------------------------
+# RonDB lab instruments (not ctests): built only with the RonDB backend
+# and run by hand against a live cluster (RONDB_CONF names the daemon's
+# rondb.conf).  lab_cluster_drive drives the public mds_cluster_* /
+# mds_coord_recovery_* / mds_cat_ns_* dispatchers; lab_nr_hb_set writes
+# one registry row's last_heartbeat_ns through the NDB API for the
+# mixed clock-domain (rolling upgrade) experiment; lab_dirent_raw shows
+# the raw stored key bytes of one directory's dirent rows and reads
+# each back by primary key (dangling / phantom dirent diagnosis).
+# -------------------------------------------------------------------
+if(ENABLE_RONDB)
+    add_executable(lab_cluster_drive integration/lab_cluster_drive.c)
+    target_include_directories(lab_cluster_drive PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/src/catalogue
+        ${PROJECT_SOURCE_DIR}/tests
+    )
+    target_link_libraries(lab_cluster_drive PRIVATE
+        pnfs_mds_core
+        pnfs_cluster
+        pnfs_fsal_obj
+        pnfs_common
+        pnfs_mds_core
+        pnfs_cluster
+        pnfs_mds_core
+        rondb_schema
+        pthread
+    )
+
+    add_executable(lab_nr_hb_set integration/lab_nr_hb_set.cpp)
+    target_include_directories(lab_nr_hb_set PRIVATE ${RONDB_INCLUDE_DIR})
+    target_compile_features(lab_nr_hb_set PRIVATE cxx_std_11)
+    target_link_libraries(lab_nr_hb_set PRIVATE ${RONDB_LIBRARY} pthread)
+
+    add_executable(lab_dirent_raw integration/lab_dirent_raw.cpp)
+    target_include_directories(lab_dirent_raw PRIVATE ${RONDB_INCLUDE_DIR})
+    target_compile_features(lab_dirent_raw PRIVATE cxx_std_11)
+    target_link_libraries(lab_dirent_raw PRIVATE ${RONDB_LIBRARY} pthread)
+endif()
+
+# -------------------------------------------------------------------
+# fdb-ext track (Phase 5) -- FoundationDB extended authority slots
+# (src/catalogue/catalogue_fdb_ext.c: inline, xattr, stripe map, DS
+# registry / provisioning, quota, GC, delete manifest, shard,
+# ext_dirent, link_anchor).  Same shape as test_fdb_txn: links the
+# backend through pnfs_mds_core and exits 77 without ENABLE_FDB or a
+# reachable cluster.  Appended block.
+# -------------------------------------------------------------------
+add_executable(test_fdb_ext unit/test_fdb_ext.c)
+target_include_directories(test_fdb_ext PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src/catalogue
+    ${PROJECT_SOURCE_DIR}/tests
+)
+if(ENABLE_FDB)
+    target_include_directories(test_fdb_ext SYSTEM PRIVATE ${FDB_INCLUDE_DIR})
+endif()
+target_link_libraries(test_fdb_ext PRIVATE
+    pnfs_mds_core
+    pnfs_cluster
+    pnfs_fsal_obj
+    pnfs_common
+    pnfs_mds_core
+    pnfs_cluster
+    pnfs_mds_core
+    rondb_schema
+    pthread
+)
+add_test(NAME test_fdb_ext COMMAND test_fdb_ext)
+set_tests_properties(test_fdb_ext PROPERTIES LABELS "unit" SKIP_RETURN_CODE 77)
+# End of fdb-ext track block.
+
+# -------------------------------------------------------------------
+# fdb-coord track -- FoundationDB coordination and cluster slots
+# (catalogue_fdb_coord.c, catalogue_fdb_cluster.c).  Same link line
+# and skip rule as test_fdb_txn: exits 77 without ENABLE_FDB or a
+# reachable local cluster.  Appended block.
+# -------------------------------------------------------------------
+add_executable(test_fdb_coord unit/test_fdb_coord.c)
+target_include_directories(test_fdb_coord PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src/catalogue
+    ${PROJECT_SOURCE_DIR}/tests
+)
+if(ENABLE_FDB)
+    target_include_directories(test_fdb_coord SYSTEM PRIVATE ${FDB_INCLUDE_DIR})
+endif()
+target_link_libraries(test_fdb_coord PRIVATE
+    pnfs_mds_core
+    pnfs_cluster
+    pnfs_fsal_obj
+    pnfs_common
+    pnfs_mds_core
+    pnfs_cluster
+    pnfs_mds_core
+    rondb_schema
+    pthread
+)
+add_test(NAME test_fdb_coord COMMAND test_fdb_coord)
+set_tests_properties(test_fdb_coord PROPERTIES LABELS "unit" SKIP_RETURN_CODE 77)
+# End of fdb-coord track block.

@@ -27,6 +27,7 @@
 #include "pnfs_mds.h"
 #include "test_helpers.h"
 #include "mds_coordination.h"
+#include "mds_cluster.h"
 #include "failover.h"
 #include "subtree_map.h"
 #include "mds_catalogue.h"
@@ -431,7 +432,9 @@ static void test_subtree_takeover(void)
     ASSERT_EQ(st, MDS_OK);
 
     uint32_t taken = 0;
-    st = subtree_map_failover_take_over(map, PARTNER_ID, SELF_ID, &taken);
+    /* No catalogue: memory-only entries move in memory. */
+    st = subtree_map_failover_take_over(map, NULL, PARTNER_ID, SELF_ID,
+                                        &taken);
     ASSERT_EQ(st, MDS_OK);
     ASSERT_EQ(taken, 2U);
 
@@ -732,7 +735,8 @@ static void test_failover_take_over_local(void)
 
     uint32_t taken = 0;
     /* failover_take_over bypasses owner_role_ok. */
-    st = subtree_map_failover_take_over(map, PARTNER_ID, SELF_ID, &taken);
+    st = subtree_map_failover_take_over(map, NULL, PARTNER_ID, SELF_ID,
+                                        &taken);
     ASSERT_EQ(st, MDS_OK);
     ASSERT_EQ(taken, 2U);
 
@@ -968,6 +972,101 @@ static void test_promote_loads_only_partner_rows(void)
 }
 
 /* -------------------------------------------------------------------
+ * Partition-map persistence of the takeover
+ * ------------------------------------------------------------------- */
+
+struct pm_owner_ctx {
+    uint32_t partition_id;
+    uint32_t owner;
+    bool     found;
+};
+
+static int pm_owner_cb(uint32_t partition_id, uint32_t owner_mds_id,
+                       uint8_t state, const char *subtree_path, void *arg)
+{
+    struct pm_owner_ctx *c = arg;
+
+    (void)state;
+    (void)subtree_path;
+    if (partition_id == c->partition_id) {
+        c->owner = owner_mds_id;
+        c->found = true;
+    }
+    return 0;
+}
+
+static uint32_t pm_owner_of(struct mds_catalogue *cat, uint32_t partition_id)
+{
+    struct pm_owner_ctx c = { .partition_id = partition_id, .owner = 0,
+                              .found = false };
+
+    if (mds_cluster_partition_list(cat, pm_owner_cb, &c) != MDS_OK ||
+        !c.found) {
+        return UINT32_MAX;
+    }
+    return c.owner;
+}
+
+/* 18. A promotion over a catalogue-backed map rewrites the partner's
+ *     partition rows (CAS partner -> self) and a refresh from the store
+ *     keeps the takeover; the root row, owned by self, is untouched. */
+static void test_promote_persists_partition_ownership(void)
+{
+    struct subtree_map *map = NULL;
+    struct mds_catalogue *db = NULL;
+    struct failover_ctx *ctx = NULL;
+    struct subtree_entry e;
+    enum mds_status st;
+
+    grace_init();
+
+    db = open_partner_catalogue();
+    ASSERT_NE(db, NULL);
+    seed_recovery_records(db);
+
+    /* Self claims root; the partner's shard is a real partition row. */
+    st = subtree_map_init_from_catalogue(db, SELF_ID, "standby.local", &map);
+    ASSERT_EQ(st, MDS_OK);
+    ASSERT_EQ(mds_cluster_partition_put(db, 7, PARTNER_ID,
+                                        MDS_PARTITION_STATE_ACTIVE,
+                                        "/data", false), MDS_OK);
+    ASSERT_EQ(subtree_map_refresh_from_catalogue(map, db), MDS_OK);
+    ASSERT_EQ(subtree_map_lookup_exact(map, "/data", &e), MDS_OK);
+    ASSERT_EQ(e.owner_mds_id, (uint32_t)PARTNER_ID);
+    ASSERT_TRUE(e.pm_backed);
+    ASSERT_EQ(e.partition_id, 7U);
+
+    struct failover_cfg cfg = {
+        .self_id          = SELF_ID,
+        .partner_id       = PARTNER_ID,
+        .map              = map,
+        .cat              = db,
+        .grace_period_sec = 90,
+        .detect_cb        = detect_dead,
+        .detect_arg       = NULL,
+        .membership       = NULL,
+        .hm               = NULL,
+    };
+    ASSERT_EQ(failover_init(&cfg, &ctx), MDS_OK);
+    ASSERT_EQ(failover_promote(ctx), MDS_OK);
+    ASSERT_EQ(failover_get_role(ctx), FAILOVER_PRIMARY);
+
+    /* Store and memory agree, and a refresh does not revert it. */
+    ASSERT_EQ(pm_owner_of(db, 7), (uint32_t)SELF_ID);
+    ASSERT_EQ(pm_owner_of(db, 0), (uint32_t)SELF_ID);
+    ASSERT_EQ(subtree_map_lookup_exact(map, "/data", &e), MDS_OK);
+    ASSERT_EQ(e.owner_mds_id, (uint32_t)SELF_ID);
+    ASSERT_EQ(subtree_map_refresh_from_catalogue(map, db), MDS_OK);
+    ASSERT_EQ(subtree_map_lookup_exact(map, "/data", &e), MDS_OK);
+    ASSERT_EQ(e.owner_mds_id, (uint32_t)SELF_ID);
+
+    grace_exit();
+    failover_destroy(ctx);
+    subtree_map_destroy(map);
+    mds_catalogue_close(db);
+}
+
+/* -------------------------------------------------------------------
  * main
  * ------------------------------------------------------------------- */
 
@@ -995,6 +1094,9 @@ int main(void)
     /* Recovery-row ownership */
     RUN_TEST(test_recovery_rows_owned_by_partner);
     RUN_TEST(test_promote_loads_only_partner_rows);
+
+    /* Partition-map persistence of the takeover */
+    RUN_TEST(test_promote_persists_partition_ownership);
 
     fprintf(stdout, "\n  %d/%d tests passed.\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

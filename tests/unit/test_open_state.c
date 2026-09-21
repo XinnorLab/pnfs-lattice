@@ -121,6 +121,42 @@ static void cleanup_temp_db(const char *path)
 	}
 }
 
+/*
+ * Per-test scratch directory.  The compound tests below use fixed
+ * names ("doc.txt", "guard.txt", ...); on a persistent store
+ * (CATALOGUE_TEST_BACKEND=rondb) a second run would otherwise find
+ * the previous run's files and fail on EXIST / a wrong fileid.  Every
+ * compound test therefore opens its backend through
+ * open_scratch_db(), which also creates a fresh conformance scratch
+ * directory that mk_putscratch() puts on the compound's current FH in
+ * place of PUTROOTFH, and closes it through close_scratch_db(), which
+ * removes that directory and its entries.  The assertions are
+ * unchanged: the directory the ops run in is merely private.
+ */
+static uint64_t g_scratch_dir;
+
+static struct mds_catalogue *open_scratch_db(void)
+{
+	struct mds_catalogue *db = conformance_open_checked();
+
+	g_scratch_dir = 0;
+	if (conformance_scratch_dir(db, &g_scratch_dir) != MDS_OK) {
+		fprintf(stderr, "cannot create the scratch directory\n");
+		mds_catalogue_close(db);
+		return NULL;
+	}
+	return db;
+}
+
+static void close_scratch_db(struct mds_catalogue *db)
+{
+	if (g_scratch_dir != 0) {
+		conformance_scratch_cleanup(db, g_scratch_dir);
+		g_scratch_dir = 0;
+	}
+	mds_catalogue_close(db);
+}
+
 /* Op builder helpers. */
 static struct nfs4_op mk_sequence(void)
 {
@@ -128,15 +164,6 @@ static struct nfs4_op mk_sequence(void)
 
 	memset(&op, 0, sizeof(op));
 	op.opnum = OP_SEQUENCE;
-	return op;
-}
-
-static struct nfs4_op mk_putrootfh(void)
-{
-	struct nfs4_op op;
-
-	memset(&op, 0, sizeof(op));
-	op.opnum = OP_PUTROOTFH;
 	return op;
 }
 
@@ -148,6 +175,13 @@ static struct nfs4_op mk_putfh(uint64_t fileid)
 	op.opnum = OP_PUTFH;
 	op.arg.putfh.fh.fileid = fileid;
 	return op;
+}
+
+/* PUTFH of the test's scratch directory: the directory every compound
+ * below operates in (see open_scratch_db). */
+static struct nfs4_op mk_putscratch(void)
+{
+	return mk_putfh(g_scratch_dir);
 }
 
 static struct nfs4_op mk_getattr(void)
@@ -969,16 +1003,16 @@ static void test_compound_open_create_close(void)
 	char *path;
 
 	path = make_temp_db_path();
-	db = conformance_open_checked(); VERIFY(db != NULL);
+	db = open_scratch_db(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
-	/* SEQUENCE + PUTROOTFH + OPEN(create "doc.txt") + GETATTR + CLOSE */
+	/* SEQUENCE + PUTFH(scratch) + OPEN(create "doc.txt") + GETATTR + CLOSE */
 	compound_init(&cd);
 	cd.cat = db;
 	cd.ot = ot;
 
 	ops[0] = mk_sequence();
-	ops[1] = mk_putrootfh();
+	ops[1] = mk_putscratch();
 	ops[2] = mk_open_create("doc.txt", 0644,
 				OPEN4_SHARE_ACCESS_BOTH,
 				OPEN4_SHARE_DENY_NONE);
@@ -1014,7 +1048,7 @@ static void test_compound_open_create_close(void)
 	}
 
 	open_state_table_destroy(ot);
-	mds_catalogue_close(db);
+	close_scratch_db(db);
 	cleanup_temp_db(path);
 	free(path);
 }
@@ -1031,7 +1065,7 @@ static void test_compound_open_existing(void)
 	char *path;
 
 	path = make_temp_db_path();
-	db = conformance_open_checked(); VERIFY(db != NULL);
+	db = open_scratch_db(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
 	/* First: create the file via CREATE. */
@@ -1039,7 +1073,7 @@ static void test_compound_open_existing(void)
 	cd.cat = db;
 	cd.ot = ot;
 	ops[0] = mk_sequence();
-	ops[1] = mk_putrootfh();
+	ops[1] = mk_putscratch();
 	ops[2] = mk_create("existing.txt", MDS_FTYPE_REG, 0644);
 	n = compound_process(&cd, ops, res, 3);
 	ASSERT_EQ(n, (uint32_t)3);
@@ -1049,7 +1083,7 @@ static void test_compound_open_existing(void)
 	cd.cat = db;
 	cd.ot = ot;
 	ops[0] = mk_sequence();
-	ops[1] = mk_putrootfh();
+	ops[1] = mk_putscratch();
 	ops[2] = mk_open_existing("existing.txt",
 				  OPEN4_SHARE_ACCESS_READ,
 				  OPEN4_SHARE_DENY_NONE);
@@ -1070,7 +1104,7 @@ static void test_compound_open_existing(void)
 	}
 
 	open_state_table_destroy(ot);
-	mds_catalogue_close(db);
+	close_scratch_db(db);
 	cleanup_temp_db(path);
 	free(path);
 }
@@ -1087,14 +1121,14 @@ static void test_compound_open_noent(void)
 	char *path;
 
 	path = make_temp_db_path();
-	db = conformance_open_checked(); VERIFY(db != NULL);
+	db = open_scratch_db(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
 	compound_init(&cd);
 	cd.cat = db;
 	cd.ot = ot;
 	ops[0] = mk_sequence();
-	ops[1] = mk_putrootfh();
+	ops[1] = mk_putscratch();
 	ops[2] = mk_open_existing("ghost.txt",
 				  OPEN4_SHARE_ACCESS_READ,
 				  OPEN4_SHARE_DENY_NONE);
@@ -1104,7 +1138,7 @@ static void test_compound_open_noent(void)
 	ASSERT_EQ(res[2].status, NFS4ERR_NOENT);
 
 	open_state_table_destroy(ot);
-	mds_catalogue_close(db);
+	close_scratch_db(db);
 	cleanup_temp_db(path);
 	free(path);
 }
@@ -1121,7 +1155,7 @@ static void test_compound_open_guarded_exist(void)
 	char *path;
 
 	path = make_temp_db_path();
-	db = conformance_open_checked(); VERIFY(db != NULL);
+	db = open_scratch_db(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
 	/* Create the file first. */
@@ -1129,7 +1163,7 @@ static void test_compound_open_guarded_exist(void)
 	cd.cat = db;
 	cd.ot = ot;
 	ops[0] = mk_sequence();
-	ops[1] = mk_putrootfh();
+	ops[1] = mk_putscratch();
 	ops[2] = mk_open_create("guard.txt", 0644,
 				OPEN4_SHARE_ACCESS_READ,
 				OPEN4_SHARE_DENY_NONE);
@@ -1154,7 +1188,7 @@ static void test_compound_open_guarded_exist(void)
 	cd.cat = db;
 	cd.ot = ot;
 	ops[0] = mk_sequence();
-	ops[1] = mk_putrootfh();
+	ops[1] = mk_putscratch();
 	{
 		struct nfs4_op guarded_op;
 
@@ -1176,7 +1210,7 @@ static void test_compound_open_guarded_exist(void)
 	ASSERT_EQ(res[2].status, NFS4ERR_EXIST);
 
 	open_state_table_destroy(ot);
-	mds_catalogue_close(db);
+	close_scratch_db(db);
 	cleanup_temp_db(path);
 	free(path);
 }
@@ -1202,7 +1236,7 @@ static void test_compound_share_conflict(void)
 	static const uint8_t owner_b[] = { 'B', 'B', 'B', 'B' };
 
 	path = make_temp_db_path();
-	db = conformance_open_checked(); VERIFY(db != NULL);
+	db = open_scratch_db(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
 	/* First open: read, deny_write, owner A. */
@@ -1210,7 +1244,7 @@ static void test_compound_share_conflict(void)
 	cd.cat = db;
 	cd.ot = ot;
 	ops[0] = mk_sequence();
-	ops[1] = mk_putrootfh();
+	ops[1] = mk_putscratch();
 	ops[2] = mk_open_create("shared.txt", 0644,
 				OPEN4_SHARE_ACCESS_READ,
 				OPEN4_SHARE_DENY_WRITE);
@@ -1227,7 +1261,7 @@ static void test_compound_share_conflict(void)
 	cd.cat = db;
 	cd.ot = ot;
 	ops[0] = mk_sequence();
-	ops[1] = mk_putrootfh();
+	ops[1] = mk_putscratch();
 	ops[2] = mk_open_existing("shared.txt",
 				  OPEN4_SHARE_ACCESS_WRITE,
 				  OPEN4_SHARE_DENY_NONE);
@@ -1238,7 +1272,7 @@ static void test_compound_share_conflict(void)
 	ASSERT_EQ(res[2].status, NFS4ERR_SHARE_DENIED);
 
 	open_state_table_destroy(ot);
-	mds_catalogue_close(db);
+	close_scratch_db(db);
 	cleanup_temp_db(path);
 	free(path);
 }
@@ -1256,7 +1290,7 @@ static void test_compound_open_claim_fh(void)
 	char *path;
 
 	path = make_temp_db_path();
-	db = conformance_open_checked(); VERIFY(db != NULL);
+	db = open_scratch_db(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
 	/* Create file via namespace. */
@@ -1264,7 +1298,7 @@ static void test_compound_open_claim_fh(void)
 	cd.cat = db;
 	cd.ot = ot;
 	ops[0] = mk_sequence();
-	ops[1] = mk_putrootfh();
+	ops[1] = mk_putscratch();
 	ops[2] = mk_create("fhfile.txt", MDS_FTYPE_REG, 0644);
 	n = compound_process(&cd, ops, res, 3);
 	ASSERT_EQ(n, (uint32_t)3);
@@ -1295,7 +1329,7 @@ static void test_compound_open_claim_fh(void)
 	}
 
 	open_state_table_destroy(ot);
-	mds_catalogue_close(db);
+	close_scratch_db(db);
 	cleanup_temp_db(path);
 	free(path);
 }
@@ -1313,14 +1347,14 @@ static void test_compound_close_bad_stateid(void)
 	char *path;
 
 	path = make_temp_db_path();
-	db = conformance_open_checked(); VERIFY(db != NULL);
+	db = open_scratch_db(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
 	compound_init(&cd);
 	cd.cat = db;
 	cd.ot = ot;
 	ops[0] = mk_sequence();
-	ops[1] = mk_putrootfh();
+	ops[1] = mk_putscratch();
 
 	memset(&bogus, 0xBB, sizeof(bogus));
 	ops[2] = mk_close(&bogus);
@@ -1330,7 +1364,7 @@ static void test_compound_close_bad_stateid(void)
 	ASSERT_EQ(res[2].status, NFS4ERR_BAD_STATEID);
 
 	open_state_table_destroy(ot);
-	mds_catalogue_close(db);
+	close_scratch_db(db);
 	cleanup_temp_db(path);
 	free(path);
 }
@@ -1347,7 +1381,7 @@ static void test_compound_reopen_after_close(void)
 	char *path;
 
 	path = make_temp_db_path();
-	db = conformance_open_checked(); VERIFY(db != NULL);
+	db = open_scratch_db(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
 	/* Open with DENY_BOTH. */
@@ -1355,7 +1389,7 @@ static void test_compound_reopen_after_close(void)
 	cd.cat = db;
 	cd.ot = ot;
 	ops[0] = mk_sequence();
-	ops[1] = mk_putrootfh();
+	ops[1] = mk_putscratch();
 	ops[2] = mk_open_create("reopen.txt", 0644,
 				OPEN4_SHARE_ACCESS_BOTH,
 				OPEN4_SHARE_DENY_BOTH);
@@ -1370,7 +1404,7 @@ static void test_compound_reopen_after_close(void)
 		compound_init(&cd);
 		cd.cat = db;
 		cd.ot = ot;
-		ops[0] = mk_putrootfh(); /* need a valid FH for CLOSE */
+		ops[0] = mk_putscratch(); /* need a valid FH for CLOSE */
 		ops[1] = mk_close(&sid);
 		n = compound_process(&cd, ops, res, 2);
 		ASSERT_EQ(n, (uint32_t)2);
@@ -1382,7 +1416,7 @@ static void test_compound_reopen_after_close(void)
 	cd.cat = db;
 	cd.ot = ot;
 	ops[0] = mk_sequence();
-	ops[1] = mk_putrootfh();
+	ops[1] = mk_putscratch();
 	ops[2] = mk_open_existing("reopen.txt",
 				  OPEN4_SHARE_ACCESS_READ,
 				  OPEN4_SHARE_DENY_NONE);
@@ -1391,7 +1425,7 @@ static void test_compound_reopen_after_close(void)
 	ASSERT_EQ(res[2].status, NFS4_OK);
 
 	open_state_table_destroy(ot);
-	mds_catalogue_close(db);
+	close_scratch_db(db);
 	cleanup_temp_db(path);
 	free(path);
 }
@@ -1408,7 +1442,7 @@ static void test_compound_open_directory(void)
 	char *path;
 
 	path = make_temp_db_path();
-	db = conformance_open_checked(); VERIFY(db != NULL);
+	db = open_scratch_db(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
 	/* Create a directory. */
@@ -1416,7 +1450,7 @@ static void test_compound_open_directory(void)
 	cd.cat = db;
 	cd.ot = ot;
 	ops[0] = mk_sequence();
-	ops[1] = mk_putrootfh();
+	ops[1] = mk_putscratch();
 	ops[2] = mk_create("subdir", MDS_FTYPE_DIR, 0755);
 	n = compound_process(&cd, ops, res, 3);
 	ASSERT_EQ(n, (uint32_t)3);
@@ -1426,7 +1460,7 @@ static void test_compound_open_directory(void)
 	cd.cat = db;
 	cd.ot = ot;
 	ops[0] = mk_sequence();
-	ops[1] = mk_putrootfh();
+	ops[1] = mk_putscratch();
 	ops[2] = mk_open_existing("subdir",
 				  OPEN4_SHARE_ACCESS_READ,
 				  OPEN4_SHARE_DENY_NONE);
@@ -1435,7 +1469,7 @@ static void test_compound_open_directory(void)
 	ASSERT_EQ(res[2].status, NFS4ERR_ISDIR);
 
 	open_state_table_destroy(ot);
-	mds_catalogue_close(db);
+	close_scratch_db(db);
 	cleanup_temp_db(path);
 	free(path);
 }

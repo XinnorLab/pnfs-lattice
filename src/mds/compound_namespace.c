@@ -1391,12 +1391,31 @@ enum nfs4_status op_create(struct compound_data *cd,
 			   a->type, a->mode, eff_uid, eff_gid,
 			   cd->prealloc,
 		       &res->res.create.inode);
-	if (st == MDS_ERR_EXISTS) {
-		/* Concurrent mkdir/create: flush any negative dirent
-		 * cache entry so subsequent LOOKUPs on this client
-		 * session see the committed object. */
+	if (st == MDS_ERR_EXISTS || st == MDS_ERR_INDOUBT) {
+		/* EXISTS: concurrent mkdir/create -- flush any negative
+		 * dirent cache entry so subsequent LOOKUPs on this client
+		 * session see the committed object.  INDOUBT: the create
+		 * MAY have landed, so the same negative entry may be
+		 * stale. */
 		compound_dirent_invalidate(cd, cd->current_fh.fileid,
 					   a->name);
+	}
+	if (st == MDS_ERR_INDOUBT) {
+		/*
+		 * Commit outcome unresolved: inode, dirent and parent
+		 * update MAY be persisted.  Terminal for this request --
+		 * no retry (a second ns_create would consume a second
+		 * placement and, had the first landed, answer EXIST for
+		 * an object this client just created), no compensating
+		 * remove, and the placement the backend popped stays
+		 * consumed (ds_prealloc has no return path; a DS object
+		 * left without an inode is the orphan sweep's job, never
+		 * reclaimed here).  Only local caches are dropped: the
+		 * parent's cached change counter may be stale.  The
+		 * mapping yields NFS4ERR_IO, never DELAY.
+		 */
+		compound_inode_invalidate(cd, cd->current_fh.fileid);
+		return mds_status_to_nfs4(st);
 	}
 	if (st != MDS_OK) {
 		return mds_status_to_nfs4(st);
@@ -2005,19 +2024,31 @@ static enum nfs4_status op_remove_prepare_final_unlink(
  * durable transaction (manifest row + dirent DELETE + inode
  * DELETE_PENDING flag), so the name is gone on EVERY MDS before
  * the client is acked; the drainer finalizes the inode, DS
- * objects and quota off the request thread.  Any failure falls
- * through to the synchronous path (returns false).
+ * objects and quota off the request thread.  A definitive submit
+ * failure falls through to the synchronous path.
  *
- * Returns true when the remove was acked asynchronously (res filled).
+ * Returns REMOVE_ASYNC_ACKED when the remove was acked asynchronously
+ * (res filled), REMOVE_ASYNC_NOT_TAKEN when the caller must run the
+ * synchronous path, and REMOVE_ASYNC_INDOUBT when the manifest commit
+ * outcome is unknown: the caller answers NFS4ERR_IO and must NOT run
+ * the synchronous path (see remove_manifest_submit).
  */
-static bool op_remove_try_async(struct compound_data *cd,
-				const struct nfs4_op *op,
-				struct nfs4_result *res,
-				const struct op_remove_state *rs)
+enum op_remove_async_rc {
+	REMOVE_ASYNC_NOT_TAKEN = 0,
+	REMOVE_ASYNC_ACKED,
+	REMOVE_ASYNC_INDOUBT,
+};
+
+static enum op_remove_async_rc op_remove_try_async(
+	struct compound_data *cd,
+	const struct nfs4_op *op,
+	struct nfs4_result *res,
+	const struct op_remove_state *rs)
 {
 	struct timespec rm_async_now;
 	uint64_t rm_async_before = 0;
 	uint64_t rm_async_after = 0;
+	int rc;
 
 	if (!(cd->rmf != NULL && rs->lookup_st == MDS_OK &&
 	      rs->final_data_unlink && rs->fileid != 0 && cd->ot != NULL &&
@@ -2025,13 +2056,34 @@ static bool op_remove_try_async(struct compound_data *cd,
 	      compound_parent_defer_ok(cd) &&
 	      parent_touch_prepare(cd->pt, cd->current_fh.fileid,
 				   rs->change_before) == 0)) {
-		return false;
+		return REMOVE_ASYNC_NOT_TAKEN;
 	}
-	if (remove_manifest_submit(cd->rmf, cd->current_fh.fileid,
-				   op->arg.remove.name, rs->fileid,
-				   rs->child.generation, true) != 0) {
+	rc = remove_manifest_submit(cd->rmf, cd->current_fh.fileid,
+				    op->arg.remove.name, rs->fileid,
+				    rs->child.generation, true);
+	if (rc == REMOVE_MANIFEST_SUBMIT_INDOUBT) {
+		/*
+		 * The unlink-at-ack transaction (manifest row + dirent
+		 * delete + DELETE_PENDING flag) MAY have committed.  The
+		 * synchronous fallback below would be a second remove:
+		 * had the first landed it would answer NOENT for a remove
+		 * that succeeded, and its GC rows would be queued twice.
+		 * Terminal: the prepared parent bump is dropped (nothing
+		 * is known to have changed), the local caches that may
+		 * now be stale are flushed, and the caller answers
+		 * NFS4ERR_IO.  A landed row is completed by the drainer
+		 * from its own durable copy.
+		 */
 		parent_touch_abort_prepared(cd->pt, cd->current_fh.fileid);
-		return false;
+		compound_dirent_invalidate(cd, cd->current_fh.fileid,
+					   op->arg.remove.name);
+		compound_inode_invalidate(cd, cd->current_fh.fileid);
+		compound_inode_invalidate(cd, rs->fileid);
+		return REMOVE_ASYNC_INDOUBT;
+	}
+	if (rc != 0) {
+		parent_touch_abort_prepared(cd->pt, cd->current_fh.fileid);
+		return REMOVE_ASYNC_NOT_TAKEN;
 	}
 
 	clock_gettime(CLOCK_REALTIME, &rm_async_now);
@@ -2050,7 +2102,7 @@ static bool op_remove_try_async(struct compound_data *cd,
 	/* Ack txn mutated the child inode (DELETE_PENDING):
 	 * drop any cached copy. */
 	compound_inode_invalidate(cd, rs->fileid);
-	return true;
+	return REMOVE_ASYNC_ACKED;
 }
 
 /*
@@ -2062,17 +2114,32 @@ static bool op_remove_try_async(struct compound_data *cd,
  * the name is gone but the DS objects are not yet queued.
  *
  * Fallback ladder: NOSUPPORT (backend has no fused op, or the
- * fold was momentarily unavailable) and STALE (dirent no
- * longer resolves to the looked-up child) drop to the legacy
- * split path, which re-resolves and enqueues exactly as
- * before.  Any other status is the authoritative outcome of
- * the remove and is returned as-is.
+ * fold was momentarily unavailable) drops to the legacy split
+ * path, which enqueues exactly as before.  Any other status is
+ * the authoritative outcome of the remove and is returned as-is.
+ *
+ * STALE from either known-child path means the store re-validated
+ * our snapshot inside its transaction and refused: the name now
+ * resolves to another inode, or a concurrent LINK / REMOVE changed
+ * whether this is the final link.  Nothing was mutated.  Every
+ * decision above -- final_data_unlink, the GC entries, the quota
+ * delta, the layout recall -- was derived from that snapshot, so
+ * retrying with a different shape here would GC a live file's DS
+ * objects or leak the last link's.  Answer DELAY: the client
+ * resends the REMOVE and the whole op re-resolves.
+ *
+ * INDOUBT is explicitly terminal: the fused commit MAY have landed,
+ * so neither the split path (it would re-remove: NOENT for a remove
+ * that succeeded, and re-enqueue the GC rows) nor DELAY (a client
+ * retry under a new seqid is not covered by the DRC) is acceptable;
+ * it is returned as-is and maps to NFS4ERR_IO.
  */
 static enum mds_status op_remove_commit(struct compound_data *cd,
 					const struct nfs4_op *op,
 					struct op_remove_state *rs)
 {
 	enum mds_status fused_st = MDS_ERR_NOSUPPORT;
+	enum mds_status st;
 
 	rs->gc_folded = false;
 	if (rs->lookup_st == MDS_OK && rs->final_data_unlink &&
@@ -2093,16 +2160,26 @@ static enum mds_status op_remove_commit(struct compound_data *cd,
 		}
 		free(uniq);
 	}
-	if (fused_st != MDS_ERR_NOSUPPORT && fused_st != MDS_ERR_STALE) {
+	if (fused_st == MDS_ERR_INDOUBT) {
+		/* Never the legacy split path, never DELAY: see above. */
+		rs->gc_folded = false;
+		return fused_st;
+	}
+	if (fused_st == MDS_ERR_STALE) {
+		rs->gc_folded = false;
+		return MDS_ERR_DELAY;
+	}
+	if (fused_st != MDS_ERR_NOSUPPORT) {
 		return fused_st;
 	}
 	rs->gc_folded = false;
-	if (rs->lookup_st == MDS_OK) {
-		return cat_remove_known(cd, cd->current_fh.fileid,
-					op->arg.remove.name,
-					&rs->child, rs->sm_sc);
+	if (rs->lookup_st != MDS_OK) {
+		return cat_remove(cd, cd->current_fh.fileid,
+				  op->arg.remove.name);
 	}
-	return cat_remove(cd, cd->current_fh.fileid, op->arg.remove.name);
+	st = cat_remove_known(cd, cd->current_fh.fileid, op->arg.remove.name,
+			      &rs->child, rs->sm_sc);
+	return (st == MDS_ERR_STALE) ? MDS_ERR_DELAY : st;
 }
 
 /* Post-commit bookkeeping of a successful remove: quota, caches,
@@ -2219,14 +2296,37 @@ enum nfs4_status op_remove(struct compound_data *cd,
 		free(rs.sm_entries);
 		return nst;
 	}
-	if (op_remove_try_async(cd, op, res, &rs)) {
+	switch (op_remove_try_async(cd, op, res, &rs)) {
+	case REMOVE_ASYNC_ACKED:
 		free(rs.sm_entries);
 		return NFS4_OK;
+	case REMOVE_ASYNC_INDOUBT:
+		/* Never the synchronous path after an in-doubt manifest
+		 * commit (op_remove_try_async); the mapping is IO. */
+		free(rs.sm_entries);
+		return mds_status_to_nfs4(MDS_ERR_INDOUBT);
+	case REMOVE_ASYNC_NOT_TAKEN:
+	default:
+		break;
 	}
 
 	st = op_remove_commit(cd, op, &rs);
 	if (st == MDS_OK) {
 		op_remove_finish(cd, op, res, &rs);
+	} else if (st == MDS_ERR_INDOUBT) {
+		/*
+		 * The remove MAY have committed: no quota adjust, no GC
+		 * enqueue, no change_info (op_remove_finish assumes
+		 * success), only the local caches that may now be stale
+		 * are dropped.  rs.sm_entries is freed below without being
+		 * handed to the GC path.
+		 */
+		compound_dirent_invalidate(cd, cd->current_fh.fileid,
+					   op->arg.remove.name);
+		compound_inode_invalidate(cd, cd->current_fh.fileid);
+		if (rs.fileid != 0) {
+			compound_inode_invalidate(cd, rs.fileid);
+		}
 	}
 	free(rs.sm_entries);
 	return mds_status_to_nfs4(st);
@@ -2426,6 +2526,10 @@ enum nfs4_status op_rename(struct compound_data *cd,
 			if (cd->cat == NULL) {
 				return NFS4ERR_XDEV;
 			}
+			/* One backend transaction; every non-OK status,
+			 * MDS_ERR_INDOUBT included, is returned through
+			 * the mapping with no compensation and no 2PC
+			 * abort message (there is no journal here). */
 			st = cat_rename(cd,
 				cd->saved_fh.fileid, op->arg.rename.src_name,
 				cd->current_fh.fileid, op->arg.rename.dst_name);
@@ -2735,6 +2839,36 @@ enum nfs4_status op_rename(struct compound_data *cd,
 				cd->current_fh.fileid,
 				op->arg.rename.dst_name);
 	}
+	if (st == MDS_ERR_INDOUBT) {
+		/*
+		 * Commit outcome unresolved: the dirent swap, the parent
+		 * updates and -- on an overwrite -- the victim's unlink
+		 * MAY be persisted.  Terminal: no plain-rename retry, no
+		 * compensation (the shared-authority rename is ONE backend
+		 * transaction; there is no 2PC journal to roll back and
+		 * no abort message that could assume failure), no GC of
+		 * the overwritten file's DS objects, no stripe-row purge
+		 * and no quota adjust -- each of those assumes a known
+		 * outcome.  Only the local caches that may now be stale
+		 * are dropped.  The mapping yields NFS4ERR_IO, never
+		 * DELAY.
+		 */
+		compound_inode_invalidate(cd, cd->saved_fh.fileid);
+		compound_inode_invalidate(cd, cd->current_fh.fileid);
+		if (rnm_src_fileid != 0) {
+			compound_inode_invalidate(cd, rnm_src_fileid);
+		}
+		if (rnm_dst_overwrite_fileid != 0) {
+			compound_inode_invalidate(cd,
+				rnm_dst_overwrite_fileid);
+		}
+		compound_dirent_invalidate(cd, cd->saved_fh.fileid,
+					   op->arg.rename.src_name);
+		compound_dirent_invalidate(cd, cd->current_fh.fileid,
+					   op->arg.rename.dst_name);
+		free(rnm_sm_entries);
+		return mds_status_to_nfs4(st);
+	}
 	if (st == MDS_OK) {
 		/* Invalidate BEFORE post-mutation re-read. */
 		compound_inode_invalidate(cd, cd->saved_fh.fileid);
@@ -2939,9 +3073,16 @@ enum nfs4_status op_link(struct compound_data *cd,
 				cd->mds_id, cd->saved_fh.fileid,
 				MDS_FTYPE_REG, ext_anchor_id);
 			if (st != MDS_OK) {
-				(void)mds_cat_ns_nlink_adjust(
-					cd->saved_shard->cat,
-					cd->saved_fh.fileid, -1);
+				/* Compensate the nlink bump only for a
+				 * DEFINITIVE failure.  On MDS_ERR_INDOUBT
+				 * the ext_dirent MAY exist, and undoing
+				 * the count would leave a live link with
+				 * an nlink one too low. */
+				if (st != MDS_ERR_INDOUBT) {
+					(void)mds_cat_ns_nlink_adjust(
+						cd->saved_shard->cat,
+						cd->saved_fh.fileid, -1);
+				}
 				return mds_status_to_nfs4(st);
 			}
 			/* Touch link dir parent metadata. */
@@ -3043,6 +3184,17 @@ enum nfs4_status op_link(struct compound_data *cd,
 			res->res.change_info.after = link_parent_post.change;
 			res->res.change_info.before = link_change_before;
 		}
+	} else if (st == MDS_ERR_INDOUBT) {
+		/*
+		 * The link MAY exist (dirent, target nlink / ctime,
+		 * parent counters).  Terminal: no retry, no compensating
+		 * nlink adjustment; drop the caches that may now be
+		 * stale.  The mapping yields NFS4ERR_IO, never DELAY.
+		 */
+		compound_inode_invalidate(cd, cd->current_fh.fileid);
+		compound_inode_invalidate(cd, cd->saved_fh.fileid);
+		compound_dirent_invalidate(cd, cd->current_fh.fileid,
+					   op->arg.link.name);
 	}
 	return mds_status_to_nfs4(st);
 }

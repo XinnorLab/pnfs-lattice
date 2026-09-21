@@ -93,6 +93,35 @@ static void *server_thread(void *arg)
     return NULL;
 }
 
+/*
+ * A loopback port that is free right now.  rpc_server_create() treats
+ * port 0 as "use RPC_DEFAULT_PORT" (2049), not as an ephemeral bind, so
+ * asking it for 0 collides with any NFS server on the host (an MDS or
+ * knfsd) and the suite aborts in setup.  Reserve a kernel-chosen port
+ * with a throwaway socket and hand that number to the server; the
+ * window between close() and the server's bind() is the usual
+ * unit-test compromise.
+ */
+static uint16_t pick_free_port(void)
+{
+    struct sockaddr_in addr;
+    socklen_t alen = sizeof(addr);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    uint16_t port;
+
+    VERIFY(fd >= 0);
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = 0;
+    VERIFY(inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) == 1);
+    VERIFY(bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    VERIFY(getsockname(fd, (struct sockaddr *)&addr, &alen) == 0);
+    port = ntohs(addr.sin_port);
+    VERIFY(port != 0);
+    close(fd);
+    return port;
+}
+
 static void setup_test(struct test_ctx *ctx)
 {
     struct rpc_server_config cfg;
@@ -108,7 +137,7 @@ static void setup_test(struct test_ctx *ctx)
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.bind_addr = "127.0.0.1";
-    cfg.port = 0; /* Ephemeral port */
+    cfg.port = pick_free_port();
     cfg.cat = ctx->cat;
     cfg.st = ctx->st;  /* Sessions: EXCHANGE_ID/CREATE_SESSION/SEQUENCE. */
 
@@ -138,7 +167,7 @@ static void setup_test_pooled(struct test_ctx *ctx, uint32_t max_inflight)
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.bind_addr = "127.0.0.1";
-    cfg.port = 0; /* Ephemeral port */
+    cfg.port = pick_free_port();
     cfg.cat = ctx->cat;
     cfg.tp = ctx->tp;
     cfg.max_inflight_per_conn = max_inflight;

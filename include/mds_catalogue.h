@@ -464,7 +464,16 @@ enum mds_status mds_cat_ns_remove(struct mds_catalogue *cat,
 				  uint64_t parent_fileid,
 				  const char *name);
 
-/** Remove when the child inode was already looked up (skips re-read). */
+/**
+ * Remove when the child inode was already looked up (skips re-read).
+ *
+ * @p child is the caller's snapshot; a backend that re-validates it
+ * inside the removing transaction answers MDS_ERR_STALE -- nothing
+ * changed -- when the name no longer resolves to child->fileid or the
+ * live link count contradicts the final/non-final shape derived from
+ * child->nlink.  The caller re-resolves and decides again (a backend
+ * that resolves the name itself never answers STALE here).
+ */
 enum mds_status mds_cat_ns_remove_known(struct mds_catalogue *cat,
 					struct mds_cat_txn *txn,
 					uint64_t parent_fileid,
@@ -496,7 +505,9 @@ struct mds_ds_map_entry;
  * @return MDS_OK on success.  MDS_ERR_NOSUPPORT when the backend has
  *         no fused path (caller must run the legacy split path).
  *         MDS_ERR_STALE when the dirent no longer resolves to @child
- *         (concurrent replace; caller falls back and re-resolves).
+ *         (concurrent replace) or @child is no longer the final link
+ *         (concurrent LINK): nothing changed, *gc_folded is false, the
+ *         caller re-resolves.
  */
 enum mds_status mds_cat_ns_remove_known_gc(struct mds_catalogue *cat,
 					   struct mds_cat_txn *txn,

@@ -717,6 +717,14 @@ struct mds_cluster_ops {
     enum mds_status (*partition_put)(struct mds_catalogue *cat,
         uint32_t partition_id, uint32_t owner_mds_id, uint8_t state,
         const char *subtree_path, bool insert_only);
+    /** Compare-and-swap the owner of one row: owner_mds_id becomes
+     *  @new_owner and state @new_state only while the row's owner is
+     *  @expected_owner.  MDS_ERR_NOTFOUND when the row is absent,
+     *  MDS_ERR_STALE when the owner differs; nothing is written in
+     *  either case.  The failover takeover's persistence step. */
+    enum mds_status (*partition_cas)(struct mds_catalogue *cat,
+        uint32_t partition_id, uint32_t expected_owner,
+        uint32_t new_owner, uint8_t new_state);
 };
 
 /* -----------------------------------------------------------------------

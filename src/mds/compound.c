@@ -936,6 +936,17 @@ enum nfs4_status mds_status_to_nfs4(enum mds_status st)
 	case MDS_ERR_GRACE:       return NFS4ERR_GRACE;
 	case MDS_ERR_MOVED:       return NFS4ERR_MOVED;
 	case MDS_ERR_DELAY:       return NFS4ERR_DELAY;
+	/*
+	 * The backend could not resolve whether its commit landed
+	 * (pnfs_mds.h).  This must stay a hard error: NFS4ERR_DELAY
+	 * would invite the client to retry under a new seqid, which
+	 * the DRC does not cover, so a CREATE / REMOVE that did land
+	 * would come back NFS4ERR_EXIST / NFS4ERR_NOENT and be
+	 * misreported.  NFS4_OK is never an option: the mutation may
+	 * not exist.  Explicit case so it can never drift into the
+	 * default branch or be folded into DELAY.
+	 */
+	case MDS_ERR_INDOUBT:     return NFS4ERR_IO;
 	case MDS_ERR_NOTEMPTY:    return NFS4ERR_NOTEMPTY;
 	case MDS_ERR_ISDIR:       return NFS4ERR_ISDIR;
 	case MDS_ERR_NOTDIR:      return NFS4ERR_NOTDIR;

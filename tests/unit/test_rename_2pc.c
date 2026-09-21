@@ -128,24 +128,57 @@ static int loopback_abort(uint32_t remote_mds_id, uint64_t txn_id,
 /* Backend selected by CATALOGUE_TEST_BACKEND (memdb by default); an
  * unavailable backend exits 77 before the first test.  Each test opens
  * its own handle and the loopback transport shares that one handle, so
- * coordinator and participant see ONE store. */
+ * coordinator and participant see ONE store.
+ *
+ * Persistent-store isolation: every test works inside its own
+ * conformance scratch directory (g_dir) instead of the export root,
+ * journal txn_ids are derived from this process's pid so two runs never
+ * share a row, and each test deletes the journal rows it leaves behind
+ * by design (the "must survive recovery" rows) so the next run's
+ * rename_2pc_recover() starts from an empty journal, as the first run
+ * did.  No assertion is weakened. */
+static uint64_t g_dir;
+
 static struct mds_catalogue *open_test_db(void)
 {
-    return conformance_open_checked();
+    struct mds_catalogue *cat = conformance_open_checked();
+
+    g_dir = 0;
+    if (conformance_scratch_dir(cat, &g_dir) != MDS_OK) {
+        fprintf(stderr, "cannot create the scratch directory\n");
+        mds_catalogue_close(cat);
+        return NULL;
+    }
+    return cat;
+}
+
+static void close_test_db(struct mds_catalogue *cat)
+{
+    if (g_dir != 0) {
+        conformance_scratch_cleanup(cat, g_dir);
+        g_dir = 0;
+    }
+    mds_catalogue_close(cat);
+}
+
+/* Journal txn_id private to this run: the process id in the high bits,
+ * a small per-test tag in the low bits. */
+static uint64_t run_txn_id(uint32_t tag)
+{
+    return ((uint64_t)(uint32_t)getpid() << 20) | (uint64_t)tag;
 }
 
 static uint64_t create_test_reg(struct mds_catalogue *db, const char *name)
 {
     struct mds_inode out;
-    enum mds_status st = test_create_file(db, MDS_FILEID_ROOT,
-                                           name, 0644, &out);
+    enum mds_status st = test_create_file(db, g_dir, name, 0644, &out);
     return (st == MDS_OK) ? out.fileid : 0;
 }
 
 static uint64_t create_test_dir(struct mds_catalogue *db, const char *name)
 {
     struct mds_inode out;
-    enum mds_status st = mds_cat_ns_create(db, NULL, MDS_FILEID_ROOT, name,
+    enum mds_status st = mds_cat_ns_create(db, NULL, g_dir, name,
                                         MDS_FTYPE_DIR, 0755, 0, 0,
                                         NULL, &out);
     return (st == MDS_OK) ? out.fileid : 0;
@@ -209,23 +242,21 @@ static void test_2pc_commit_happy_path(void)
 
     enum mds_status st = rename_2pc_initiate(
         cat, &transport,
-        MDS_FILEID_ROOT, "src_file",
-        MDS_FILEID_ROOT, "dst_file", 1);
+        g_dir, "src_file",
+        g_dir, "dst_file", 1);
     ASSERT_EQ(st, MDS_OK);
 
     /* src_file should be gone. */
     uint64_t child; uint8_t type;
-    st = mds_cat_dirent_get(cat, MDS_FILEID_ROOT, "src_file",
-                            &child, &type);
+    st = mds_cat_dirent_get(cat, g_dir, "src_file", &child, &type);
     ASSERT_EQ(st, MDS_ERR_NOTFOUND);
 
     /* dst_file should exist. */
-    st = mds_cat_dirent_get(cat, MDS_FILEID_ROOT, "dst_file",
-                            &child, &type);
+    st = mds_cat_dirent_get(cat, g_dir, "dst_file", &child, &type);
     ASSERT_EQ(st, MDS_OK);
     ASSERT_EQ(type, (uint8_t)MDS_FTYPE_REG);
 
-    mds_catalogue_close(cat);
+    close_test_db(cat);
     PASS();
 }
 
@@ -256,17 +287,16 @@ static void test_2pc_abort_on_conflict(void)
 
     enum mds_status st = rename_2pc_initiate(
         cat, &transport,
-        MDS_FILEID_ROOT, "src_file",
-        MDS_FILEID_ROOT, "dst_file", 1);
+        g_dir, "src_file",
+        g_dir, "dst_file", 1);
     ASSERT_EQ(st, MDS_ERR_XDEV);
 
     /* Source should still exist. */
     uint64_t child; uint8_t type;
-    st = mds_cat_dirent_get(cat, MDS_FILEID_ROOT, "src_file",
-                            &child, &type);
+    st = mds_cat_dirent_get(cat, g_dir, "src_file", &child, &type);
     ASSERT_EQ(st, MDS_OK);
 
-    mds_catalogue_close(cat);
+    close_test_db(cat);
     PASS();
 }
 
@@ -295,16 +325,15 @@ static void test_2pc_dir_rejected(void)
 
     enum mds_status st = rename_2pc_initiate(
         cat, &transport,
-        MDS_FILEID_ROOT, "mydir",
-        MDS_FILEID_ROOT, "newdir", 1);
+        g_dir, "mydir",
+        g_dir, "newdir", 1);
     ASSERT_EQ(st, MDS_ERR_XDEV);
 
     uint64_t child; uint8_t type;
-    st = mds_cat_dirent_get(cat, MDS_FILEID_ROOT, "mydir",
-                            &child, &type);
+    st = mds_cat_dirent_get(cat, g_dir, "mydir", &child, &type);
     ASSERT_EQ(st, MDS_OK);
 
-    mds_catalogue_close(cat);
+    close_test_db(cat);
     PASS();
 }
 
@@ -323,14 +352,15 @@ static void test_2pc_recover(void)
     if (cat == NULL) SKIP("no RonDB");
 
     /* Write a PREPARED journal entry via coordination API. */
+    const uint64_t txn_id = run_txn_id(0x9999);
     struct mds_coord_journal_record rec;
     memset(&rec, 0, sizeof(rec));
-    rec.txn_id = 9999;
+    rec.txn_id = txn_id;
     rec.state = 1;  /* R2PC_PREPARED */
     rec.role = 0;   /* R2PC_COORDINATOR */
     rec.remote_mds_id = 1;
-    rec.src_parent_fileid = MDS_FILEID_ROOT;
-    rec.dst_parent_fileid = MDS_FILEID_ROOT;
+    rec.src_parent_fileid = g_dir;
+    rec.dst_parent_fileid = g_dir;
     snprintf(rec.src_name, sizeof(rec.src_name), "src");
     snprintf(rec.dst_name, sizeof(rec.dst_name), "dst");
 
@@ -345,10 +375,10 @@ static void test_2pc_recover(void)
 
     /* Entry should be gone -- verify via coordination API. */
     struct mds_coord_journal_record got;
-    st = mds_coord_journal_get(cat, NULL, 9999, 0, &got);
+    st = mds_coord_journal_get(cat, NULL, txn_id, 0, &got);
     ASSERT_EQ(st, MDS_ERR_NOTFOUND);
 
-    mds_catalogue_close(cat);
+    close_test_db(cat);
     PASS();
 }
 
@@ -377,16 +407,15 @@ static void test_2pc_transport_error(void)
 
     enum mds_status st = rename_2pc_initiate(
         cat, &transport,
-        MDS_FILEID_ROOT, "errfile",
-        MDS_FILEID_ROOT, "errfile_dst", 1);
+        g_dir, "errfile",
+        g_dir, "errfile_dst", 1);
     ASSERT_EQ(st, MDS_ERR_XDEV);
 
     uint64_t child; uint8_t type;
-    st = mds_cat_dirent_get(cat, MDS_FILEID_ROOT, "errfile",
-                            &child, &type);
+    st = mds_cat_dirent_get(cat, g_dir, "errfile", &child, &type);
     ASSERT_EQ(st, MDS_OK);
 
-    mds_catalogue_close(cat);
+    close_test_db(cat);
     PASS();
 }
 
@@ -420,8 +449,8 @@ static void test_2pc_commit_delivery_failure(void)
 
     enum mds_status st = rename_2pc_initiate(
         cat, &transport,
-        MDS_FILEID_ROOT, "lostfile",
-        MDS_FILEID_ROOT, "lostfile_dst", 1);
+        g_dir, "lostfile",
+        g_dir, "lostfile_dst", 1);
 
     /* Must NOT return MDS_OK -- commit delivery failed. */
     ASSERT_EQ(st, MDS_ERR_IO);
@@ -431,8 +460,7 @@ static void test_2pc_commit_delivery_failure(void)
      * commit RPC is acknowledged, so a delivery failure leaves
      * the source intact. */
     uint64_t child; uint8_t type;
-    st = mds_cat_dirent_get(cat, MDS_FILEID_ROOT, "lostfile",
-                            &child, &type);
+    st = mds_cat_dirent_get(cat, g_dir, "lostfile", &child, &type);
     ASSERT_EQ(st, MDS_OK);
 
     /* The coordinator's COMMITTED journal entry MUST still exist --
@@ -450,7 +478,13 @@ static void test_2pc_commit_delivery_failure(void)
     st = rename_2pc_recover(cat, NULL, NULL);
     ASSERT_EQ(st, MDS_ERR_DELAY);
 
-    mds_catalogue_close(cat);
+    /* The rows this test leaves by design (coordinator COMMITTED,
+     * participant PREPARED) would make the next run's recover() keep
+     * finding work; remove them now that they have been verified. */
+    ASSERT_EQ(mds_coord_journal_del(cat, NULL, lc.last_txn_id, 0), MDS_OK);
+    ASSERT_EQ(mds_coord_journal_del(cat, NULL, lc.last_txn_id, 1), MDS_OK);
+
+    close_test_db(cat);
     PASS();
 }
 
@@ -468,14 +502,15 @@ static void test_2pc_recover_committed_kept(void)
     if (cat == NULL) SKIP("no RonDB");
 
     /* Insert a COMMITTED+COORDINATOR journal entry. */
+    const uint64_t txn_id = run_txn_id(0x8888);
     struct mds_coord_journal_record rec;
     memset(&rec, 0, sizeof(rec));
-    rec.txn_id = 8888;
+    rec.txn_id = txn_id;
     rec.state = 2;  /* R2PC_COMMITTED */
     rec.role = 0;   /* R2PC_COORDINATOR */
     rec.remote_mds_id = 1;
-    rec.src_parent_fileid = MDS_FILEID_ROOT;
-    rec.dst_parent_fileid = MDS_FILEID_ROOT;
+    rec.src_parent_fileid = g_dir;
+    rec.dst_parent_fileid = g_dir;
 
     struct mds_cat_txn *txn = NULL;
     ASSERT_EQ(mds_cat_txn_begin(cat, MDS_CAT_TXN_WRITE, &txn), MDS_OK);
@@ -488,11 +523,14 @@ static void test_2pc_recover_committed_kept(void)
 
     /* Entry must still be present. */
     struct mds_coord_journal_record got;
-    st = mds_coord_journal_get(cat, NULL, 8888, 0, &got);
+    st = mds_coord_journal_get(cat, NULL, txn_id, 0, &got);
     ASSERT_EQ(st, MDS_OK);
     ASSERT_EQ(got.state, (uint8_t)2);
 
-    mds_catalogue_close(cat);
+    /* Verified; do not leave it for the next run's recover(). */
+    ASSERT_EQ(mds_coord_journal_del(cat, NULL, txn_id, 0), MDS_OK);
+
+    close_test_db(cat);
     PASS();
 }
 
@@ -510,14 +548,15 @@ static void test_2pc_recover_prepared_participant_kept(void)
     if (cat == NULL) SKIP("no RonDB");
 
     /* Insert a PREPARED+PARTICIPANT journal entry. */
+    const uint64_t txn_id = run_txn_id(0x7777);
     struct mds_coord_journal_record rec;
     memset(&rec, 0, sizeof(rec));
-    rec.txn_id = 7777;
+    rec.txn_id = txn_id;
     rec.state = 1;  /* R2PC_PREPARED */
     rec.role = 1;   /* R2PC_PARTICIPANT */
     rec.remote_mds_id = 2;
-    rec.src_parent_fileid = MDS_FILEID_ROOT;
-    rec.dst_parent_fileid = MDS_FILEID_ROOT;
+    rec.src_parent_fileid = g_dir;
+    rec.dst_parent_fileid = g_dir;
 
     struct mds_cat_txn *txn = NULL;
     ASSERT_EQ(mds_cat_txn_begin(cat, MDS_CAT_TXN_WRITE, &txn), MDS_OK);
@@ -530,12 +569,15 @@ static void test_2pc_recover_prepared_participant_kept(void)
 
     /* Entry must still be present. */
     struct mds_coord_journal_record got;
-    st = mds_coord_journal_get(cat, NULL, 7777, 1, &got);
+    st = mds_coord_journal_get(cat, NULL, txn_id, 1, &got);
     ASSERT_EQ(st, MDS_OK);
     ASSERT_EQ(got.state, (uint8_t)1);
     ASSERT_EQ(got.role, (uint8_t)1);
 
-    mds_catalogue_close(cat);
+    /* Verified; do not leave it for the next run's recover(). */
+    ASSERT_EQ(mds_coord_journal_del(cat, NULL, txn_id, 1), MDS_OK);
+
+    close_test_db(cat);
     PASS();
 }
 

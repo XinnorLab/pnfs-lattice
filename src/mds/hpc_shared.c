@@ -532,10 +532,12 @@ static enum mds_status hpc_wide_create_check_args(
  * Step 3 of the wide create: the single fused catalogue transaction.
  * On failure the captured DS bundle is GC-enqueued only when the
  * create is PROVEN not to have published a live file at child->fileid
- * -- on an indeterminate result (MDS_ERR_DELAY) the commit may have
- * landed, so we must not GC a possibly-live file's backing store; the
- * pending-recovery scan / reconciliation handles that case.  The batch
- * is destroyed on failure; on success the caller still owns it.
+ * -- on an indeterminate result (MDS_ERR_DELAY, MDS_ERR_INDOUBT) the
+ * commit may have landed, so we must not GC a possibly-live file's
+ * backing store; the pending-recovery scan / reconciliation handles
+ * that case.  The batch is destroyed on failure (heap bookkeeping
+ * only -- the DS objects themselves are untouched); on success the
+ * caller still owns it.
  */
 static enum mds_status hpc_wide_create_commit(
     struct mds_catalogue *cat, uint64_t parent_fileid, const char *name,
@@ -548,6 +550,13 @@ static enum mds_status hpc_wide_create_commit(
         cat, parent_fileid, name, child, batch->stripe_count,
         batch->stripe_unit, batch->mirror_count, batch->entries,
         &safe_to_discard);
+    if (st == MDS_ERR_INDOUBT) {
+        /* The dispatcher and every backend leave safe_to_discard
+         * false on an unresolved commit (mds_catalogue.h contract);
+         * pin it here too, at the one place that acts on it, so no
+         * backend can ever turn an in-doubt create into a reclaim. */
+        safe_to_discard = false;
+    }
     if (st != MDS_OK) {
         MDS_LOG_WARN(LOG_COMP_MDS,
             "hpc wide-create '%s' parent=%llu fileid=%llu: catalogue "

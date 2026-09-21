@@ -9,6 +9,9 @@
  *   catalogue_fdb.c     lifecycle: client network, open/close/probe/
  *                       bootstrap, process shutdown, vtable assembly
  *   catalogue_fdb_ns.c  namespace authority slots
+ *   catalogue_fdb_ext.c extended authority slots (inline, xattr, stripe
+ *                       map, DS registry, quota, GC, delete manifest,
+ *                       shard / ext_dirent / link_anchor)
  *   fdb_keys.h          key space registry
  *   fdb_codec.[ch]      value formats
  *   fdb_txn.[ch]        transaction runner and commit-outcome protocol
@@ -119,5 +122,42 @@ void catalogue_fdb_ns_register(struct mds_authority_ops *ops);
  */
 int catalogue_fdb_inode_write(struct FDB_transaction *tr, const struct fdb_key_prefix *p,
                               const struct mds_inode *ino);
+
+/**
+ * Fill the extended authority slots of @p ops (catalogue_fdb_ext.c:
+ * inline data, xattrs, stripe maps, DS registry and provisioning,
+ * quota, GC queue, delete manifest, shard routing, cross-shard dirents,
+ * link anchors).  Called once by catalogue_fdb.c after
+ * catalogue_fdb_ns_register(); the prealloc pool and
+ * backend_client_stats slots are left untouched (NULL).
+ */
+void catalogue_fdb_ext_register(struct mds_authority_ops *ops);
+
+/* --- fdb-coord track: coordination and cluster tables ------------------- */
+
+struct mds_coordination_ops;
+struct mds_cluster_ops;
+
+/** Coordination slots (catalogue_fdb_coord.c); installed as
+ *  cat->coord_ops by catalogue_fdb_open(). */
+extern const struct mds_coordination_ops fdb_coordination_ops;
+
+/** Cluster slots (catalogue_fdb_cluster.c); installed as
+ *  cat->cluster_ops by catalogue_fdb_open(). */
+extern const struct mds_cluster_ops fdb_cluster_ops;
+
+/**
+ * Compare-and-swap of a partition's owner in ONE transaction: read the
+ * PARTITION_MAP row, MDS_ERR_NOTFOUND when absent, MDS_ERR_STALE when
+ * its owner is not @p expected_owner (nothing written), else set the
+ * owner and state (the subtree path is kept).  Registered as
+ * mds_cluster_ops.partition_cas by the cluster-slot integration.
+ *
+ * @return MDS_OK; MDS_ERR_NOTFOUND; MDS_ERR_STALE; MDS_ERR_INVAL for a
+ *         non-fdb handle; the transaction runner's status otherwise.
+ */
+enum mds_status fdb_cluster_partition_cas(struct mds_catalogue *cat, uint32_t partition_id,
+                                          uint32_t expected_owner, uint32_t new_owner,
+                                          uint8_t new_state);
 
 #endif /* CATALOGUE_FDB_H */

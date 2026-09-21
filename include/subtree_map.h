@@ -37,6 +37,15 @@ struct subtree_entry {
                                        *  (0 = unresolved).  Lets FH-based
                                        *  ancestry walks recognise a
                                        *  junction without a path. */
+    /** Catalogue partition-map row this entry mirrors.  pm_backed is
+     *  true only for entries loaded from partition_list or written to
+     *  the store by this node (root claim, shard seed); partition_id is
+     *  meaningful only then (0 is a valid id: root).  Ownership changes
+     *  of a pm_backed entry are persisted with mds_cluster_partition_cas
+     *  before the in-memory copy moves; entries added locally
+     *  (subtree_map_add, splits) stay memory-only. */
+    uint32_t            partition_id;
+    bool                pm_backed;
 };
 
 /* -----------------------------------------------------------------------
@@ -638,24 +647,60 @@ enum mds_status subtree_map_transfer_owner_if_migrating(
 
 
 /**
- * @brief Failover-specific subtree takeover (supports etcd mode).
+ * @brief Move ownership of one subtree, store first.
  *
- * Unlike subtree_map_take_over(), this function works in etcd mode
- * by enumerating entries owned by old_owner and CAS-updating each
- * one individually via etcd_set_owner_by_path().  It also bypasses
- * the owner_role_ok() check because the promoting standby is not
- * yet ACTIVE_SERVING at the time of takeover.
+ * For a pm_backed entry the catalogue row is rewritten with
+ * mds_cluster_partition_cas(partition_id, expected_owner -> new_owner)
+ * BEFORE the in-memory entry changes; the entry moves only when the
+ * store accepted the write, so memory never claims an ownership the
+ * partition map does not record (a later refresh would otherwise
+ * revert it).  A memory-only entry, or @p cat == NULL, or a store
+ * without the CAS slot (MDS_ERR_NOSUPPORT, logged once as a WARN)
+ * moves in memory alone, exactly as before the CAS existed.
+ * Bypasses owner_role_ok(): the promoting standby is not yet
+ * ACTIVE_SERVING.
  *
- * In local mode, delegates to the existing subtree_map_take_over()
- * with role checks disabled.
+ * @param map             Map handle.
+ * @param cat             Catalogue with the partition_cas slot, or NULL.
+ * @param path            Exact subtree path.
+ * @param expected_owner  Owner the entry (and row) must currently have.
+ * @param new_owner       Owner to record.
+ * @return MDS_OK when the entry moved; MDS_ERR_NOTFOUND when no entry
+ *         (or, for a pm_backed entry, no row) exists; MDS_ERR_STALE
+ *         when the row or entry is no longer owned by @p expected_owner
+ *         (nothing changed); MDS_ERR_INVAL on NULL map/path; or the
+ *         catalogue's status when the CAS failed for another reason
+ *         (nothing changed in memory).
+ */
+enum mds_status subtree_map_failover_transfer(struct subtree_map *map,
+                                              struct mds_catalogue *cat,
+                                              const char *path,
+                                              uint32_t expected_owner,
+                                              uint32_t new_owner);
+
+/**
+ * @brief Failover-specific subtree takeover.
+ *
+ * Enumerates the entries owned by @p old_owner and moves each with
+ * subtree_map_failover_transfer(): the partition-map row is CAS'd to
+ * @p new_owner first, then the in-memory entry follows.  An entry whose
+ * CAS answers MDS_ERR_STALE or MDS_ERR_NOTFOUND (another node took the
+ * partition, or the row is gone) is skipped and logged, never moved in
+ * memory.  Bypasses the owner_role_ok() check because the promoting
+ * standby is not yet ACTIVE_SERVING at the time of takeover.
  *
  * @param map        Map handle.
+ * @param cat        Catalogue with the partition_cas slot, or NULL for
+ *                   a memory-only takeover (local mode, tests).
  * @param old_owner  MDS ID of the failed primary.
  * @param new_owner  MDS ID of the promoting standby.
  * @param count_out  Receives number of subtrees taken over.
- * @return MDS_OK on success, MDS_ERR_IO on etcd CAS failure.
+ * @return MDS_OK (even if count_out == 0, including when every entry
+ *         was refused by the store); MDS_ERR_IO when the store could
+ *         not be reached for any entry and none was taken.
  */
 enum mds_status subtree_map_failover_take_over(struct subtree_map *map,
+                                               struct mds_catalogue *cat,
                                                uint32_t old_owner,
                                                uint32_t new_owner,
                                                uint32_t *count_out);

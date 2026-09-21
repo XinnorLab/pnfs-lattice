@@ -1312,6 +1312,31 @@ static void test_cluster_registry_contract(void)
     ASSERT_EQ(mds_cluster_partition_put(cat, 2, 2, MDS_PARTITION_STATE_ACTIVE, NULL, false),
               MDS_ERR_INVAL);
 
+    /* Owner CAS (the failover takeover): the write lands only while the
+     * row still records the expected owner; a wrong expectation or an
+     * absent row changes nothing. */
+    ASSERT_EQ(mds_cluster_partition_cas(cat, 1, 7, 3, MDS_PARTITION_STATE_ACTIVE),
+              MDS_ERR_STALE);
+    ASSERT_EQ(mds_cluster_partition_cas(cat, 9, 2, 3, MDS_PARTITION_STATE_ACTIVE),
+              MDS_ERR_NOTFOUND);
+    memset(&pl, 0, sizeof(pl));
+    ASSERT_EQ(mds_cluster_partition_list(cat, part_list_cb, &pl), MDS_OK);
+    ASSERT_EQ(pl.hits, 2U);
+    ASSERT_EQ(pl.rows[1].owner, 2U);
+    ASSERT_EQ(mds_cluster_partition_cas(cat, 1, 2, 3, MDS_PARTITION_STATE_ACTIVE), MDS_OK);
+    memset(&pl, 0, sizeof(pl));
+    ASSERT_EQ(mds_cluster_partition_list(cat, part_list_cb, &pl), MDS_OK);
+    ASSERT_EQ(pl.rows[1].id, 1U);
+    ASSERT_EQ(pl.rows[1].owner, 3U);
+    ASSERT_EQ(pl.rows[1].state, MDS_PARTITION_STATE_ACTIVE);
+    ASSERT_EQ(strcmp(pl.rows[1].path, "/data"), 0);
+    /* A replay of the same CAS is refused: the row no longer records
+     * the expected owner. */
+    ASSERT_EQ(mds_cluster_partition_cas(cat, 1, 2, 3, MDS_PARTITION_STATE_ACTIVE),
+              MDS_ERR_STALE);
+    ASSERT_EQ(mds_cluster_partition_cas(NULL, 1, 2, 3, MDS_PARTITION_STATE_ACTIVE),
+              MDS_ERR_INVAL);
+
     /* Populated slots never make an in-process store a cluster store. */
     ASSERT_EQ(mds_cluster_supported(cat), false);
     mds_catalogue_close(cat);

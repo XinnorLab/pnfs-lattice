@@ -22,6 +22,14 @@
  *              rename over an empty directory deletes the victim's
  *              inode row, drops its ".." link from the destination
  *              parent and rebinds the name to the source inode.
+ *   ns_remove_known_gc
+ *              the caller's child snapshot is re-validated inside the
+ *              mutating operation: a name that now resolves to another
+ *              inode (the snapshot's inode still alive under a second
+ *              name) and a snapshot whose link count no longer predicts
+ *              the final-link answer are both refused with STALE and
+ *              nothing changes -- the wrong inode is never deleted, no
+ *              GC row lands, the parent is untouched.
  *   recovery   rows record the owning MDS; recovery_list(owner)
  *              returns that owner's rows plus unassigned (owner 0)
  *              rows and never another owner's; 0 lists every row.
@@ -435,6 +443,139 @@ static void test_rename_over_empty_dir_cross_directory(void)
 }
 
 /* -----------------------------------------------------------------------
+ * ns_remove_known_gc snapshot guards
+ * ----------------------------------------------------------------------- */
+
+static void gc_entry_init(struct mds_ds_map_entry *e)
+{
+    memset(e, 0, sizeof(*e));
+    e->ds_id = 1;
+    e->nfs_fh_len = 4;
+    e->nfs_fh[0] = 0xAB;
+}
+
+/* "g" named c1, which was then linked as "h" and unlinked as "g", and
+ * "g" was re-created as c2.  A remove that still carries the c1
+ * snapshot must not delete c2's name, must not delete c1 (alive under
+ * "h") and must not queue c1's DS objects for collection. */
+static void test_remove_known_gc_stale_snapshot_alive_elsewhere(void)
+{
+    struct fixture fx;
+    struct mds_inode c1;
+    struct mds_inode c2;
+    struct mds_inode seen;
+    struct mds_ds_map_entry gc;
+    uint32_t gc_before = 0;
+    uint32_t gc_after = 0;
+    bool folded = true;
+
+    ASSERT_TRUE(fixture_open(&fx));
+    ASSERT_EQ(mds_cat_ns_create(fx.cat, NULL, fx.d.fileid, "g", MDS_FTYPE_REG, 0644,
+                                0, 0, NULL, &c1), MDS_OK);
+    ASSERT_EQ(mds_cat_ns_link(fx.cat, NULL, fx.d.fileid, "h", c1.fileid), MDS_OK);
+    ASSERT_EQ(mds_cat_ns_remove(fx.cat, NULL, fx.d.fileid, "g"), MDS_OK);
+    ASSERT_EQ(mds_cat_ns_create(fx.cat, NULL, fx.d.fileid, "g", MDS_FTYPE_REG, 0644,
+                                0, 0, NULL, &c2), MDS_OK);
+    ASSERT_TRUE(c1.fileid != c2.fileid);
+    ASSERT_EQ(mds_cat_ns_getattr(fx.cat, fx.d.fileid, &fx.d), MDS_OK);
+    ASSERT_EQ(mds_cat_gc_count(fx.cat, &gc_before), MDS_OK);
+
+    gc_entry_init(&gc);
+    ASSERT_EQ(mds_cat_ns_remove_known_gc(fx.cat, NULL, fx.d.fileid, "g", &c1, 1, &gc, 1,
+                                         MDS_GC_SWEEP_GEOM(1, 1), &folded),
+              MDS_ERR_STALE);
+    ASSERT_EQ(folded, false);
+    /* "g" still names c2, c1 is still alive under "h" with one link. */
+    ASSERT_EQ(mds_cat_ns_lookup(fx.cat, fx.d.fileid, "g", &seen), MDS_OK);
+    ASSERT_EQ(seen.fileid, c2.fileid);
+    ASSERT_EQ(mds_cat_ns_lookup(fx.cat, fx.d.fileid, "h", &seen), MDS_OK);
+    ASSERT_EQ(seen.fileid, c1.fileid);
+    ASSERT_EQ(mds_cat_ns_getattr(fx.cat, c1.fileid, &seen), MDS_OK);
+    ASSERT_EQ(seen.nlink, 1U);
+    ASSERT_EQ(mds_cat_ns_getattr(fx.cat, c2.fileid, &seen), MDS_OK);
+    ASSERT_EQ(mds_cat_gc_count(fx.cat, &gc_after), MDS_OK);
+    ASSERT_EQ(gc_after, gc_before);
+    ASSERT_EQ(mds_cat_ns_getattr(fx.cat, fx.d.fileid, &seen), MDS_OK);
+    ASSERT_EQ(seen.change, fx.d.change);
+    ASSERT_EQ(dir_count(fx.cat, fx.d.fileid), 3U);
+
+    /* The current snapshot removes exactly c2 and queues its row. */
+    ASSERT_EQ(mds_cat_ns_remove_known_gc(fx.cat, NULL, fx.d.fileid, "g", &c2, 1, &gc, 1,
+                                         MDS_GC_SWEEP_GEOM(1, 1), &folded), MDS_OK);
+    ASSERT_EQ(folded, true);
+    ASSERT_EQ(mds_cat_ns_getattr(fx.cat, c2.fileid, &seen), MDS_ERR_NOTFOUND);
+    ASSERT_EQ(mds_cat_ns_getattr(fx.cat, c1.fileid, &seen), MDS_OK);
+    ASSERT_EQ(mds_cat_gc_count(fx.cat, &gc_after), MDS_OK);
+    ASSERT_EQ(gc_after, gc_before + 1);
+    fixture_close(&fx);
+}
+
+/* The name still resolves to the snapshot's inode but its link count
+ * moved: a LINK since the snapshot (snapshot says final, live nlink 2)
+ * and a REMOVE of the other name since the snapshot (snapshot says
+ * non-final, live nlink 1) are both refused with STALE and nothing
+ * changes.  A fresh snapshot then removes the inode. */
+static void test_remove_known_gc_stale_link_count_is_refused(void)
+{
+    struct fixture fx;
+    struct mds_inode c1;
+    struct mds_inode snap2;
+    struct mds_inode seen;
+    struct mds_ds_map_entry gc;
+    uint32_t gc_before = 0;
+    uint32_t gc_after = 0;
+    bool folded = true;
+
+    ASSERT_TRUE(fixture_open(&fx));
+    ASSERT_EQ(mds_cat_ns_create(fx.cat, NULL, fx.d.fileid, "g", MDS_FTYPE_REG, 0644,
+                                0, 0, NULL, &c1), MDS_OK);
+    ASSERT_EQ(c1.nlink, 1U);
+    /* c1 snapshot says "final"; a link lands. */
+    ASSERT_EQ(mds_cat_ns_link(fx.cat, NULL, fx.d.fileid, "h", c1.fileid), MDS_OK);
+    ASSERT_EQ(mds_cat_ns_getattr(fx.cat, fx.d.fileid, &fx.d), MDS_OK);
+    ASSERT_EQ(mds_cat_gc_count(fx.cat, &gc_before), MDS_OK);
+    gc_entry_init(&gc);
+    ASSERT_EQ(mds_cat_ns_remove_known_gc(fx.cat, NULL, fx.d.fileid, "g", &c1, 1, &gc, 1,
+                                         MDS_GC_SWEEP_GEOM(1, 1), &folded),
+              MDS_ERR_STALE);
+    ASSERT_EQ(folded, false);
+    ASSERT_EQ(mds_cat_ns_lookup(fx.cat, fx.d.fileid, "g", &seen), MDS_OK);
+    ASSERT_EQ(seen.fileid, c1.fileid);
+    ASSERT_EQ(seen.nlink, 2U);
+    ASSERT_EQ(mds_cat_gc_count(fx.cat, &gc_after), MDS_OK);
+    ASSERT_EQ(gc_after, gc_before);
+    ASSERT_EQ(mds_cat_ns_getattr(fx.cat, fx.d.fileid, &seen), MDS_OK);
+    ASSERT_EQ(seen.change, fx.d.change);
+
+    /* Fresh snapshot says "non-final" (nlink 2); the other name goes. */
+    ASSERT_EQ(mds_cat_ns_getattr(fx.cat, c1.fileid, &snap2), MDS_OK);
+    ASSERT_EQ(snap2.nlink, 2U);
+    ASSERT_EQ(mds_cat_ns_remove(fx.cat, NULL, fx.d.fileid, "h"), MDS_OK);
+    ASSERT_EQ(mds_cat_ns_getattr(fx.cat, fx.d.fileid, &fx.d), MDS_OK);
+    ASSERT_EQ(mds_cat_ns_remove_known_gc(fx.cat, NULL, fx.d.fileid, "g", &snap2, 1, &gc, 1,
+                                         MDS_GC_SWEEP_GEOM(1, 1), &folded),
+              MDS_ERR_STALE);
+    ASSERT_EQ(folded, false);
+    ASSERT_EQ(mds_cat_ns_lookup(fx.cat, fx.d.fileid, "g", &seen), MDS_OK);
+    ASSERT_EQ(seen.fileid, c1.fileid);
+    ASSERT_EQ(seen.nlink, 1U);
+    ASSERT_EQ(mds_cat_gc_count(fx.cat, &gc_after), MDS_OK);
+    ASSERT_EQ(gc_after, gc_before);
+    ASSERT_EQ(mds_cat_ns_getattr(fx.cat, fx.d.fileid, &seen), MDS_OK);
+    ASSERT_EQ(seen.change, fx.d.change);
+
+    /* A snapshot that matches the store removes the last link. */
+    ASSERT_EQ(mds_cat_ns_getattr(fx.cat, c1.fileid, &snap2), MDS_OK);
+    ASSERT_EQ(mds_cat_ns_remove_known_gc(fx.cat, NULL, fx.d.fileid, "g", &snap2, 1, &gc, 1,
+                                         MDS_GC_SWEEP_GEOM(1, 1), &folded), MDS_OK);
+    ASSERT_EQ(folded, true);
+    ASSERT_EQ(mds_cat_ns_getattr(fx.cat, c1.fileid, &seen), MDS_ERR_NOTFOUND);
+    ASSERT_EQ(mds_cat_gc_count(fx.cat, &gc_after), MDS_OK);
+    ASSERT_EQ(gc_after, gc_before + 1);
+    fixture_close(&fx);
+}
+
+/* -----------------------------------------------------------------------
  * Recovery ownership
  * ----------------------------------------------------------------------- */
 
@@ -551,6 +692,8 @@ int main(void)
     RUN_TEST(test_rename_over_non_empty_dir_refused_without_change);
     RUN_TEST(test_rename_over_empty_dir_deletes_victim);
     RUN_TEST(test_rename_over_empty_dir_cross_directory);
+    RUN_TEST(test_remove_known_gc_stale_snapshot_alive_elsewhere);
+    RUN_TEST(test_remove_known_gc_stale_link_count_is_refused);
     RUN_TEST(test_recovery_rows_record_their_owner);
     RUN_TEST(test_recovery_unassigned_rows_visible_to_any_owner);
 

@@ -1313,14 +1313,15 @@ static enum mds_status mem_ns_rename(struct mds_catalogue *cat,
 /*
  * Unlink core shared by ns_remove and ns_remove_known_gc (caller holds
  * the lock).  Validates the dirent (and, when @guard is given, that it
- * still resolves to guard->fileid -- MDS_ERR_STALE otherwise), decides
- * directory emptiness and the final-link question, reserves the GC rows
- * the fused caller asked for, and only then mutates: dirent gone, the
- * child loses a link or is deleted with its inline data, xattrs and
- * stripe map, the GC rows land, the parent is touched.  A directory
- * has exactly one name, so removing it deletes it and drops the
- * parent's ".." link.  *final_out reports whether the child inode was
- * deleted.
+ * still resolves to guard->fileid and that guard->nlink still predicts
+ * the final-link answer -- MDS_ERR_STALE otherwise, exactly as the
+ * RonDB shim's data-node guards decide), decides directory emptiness
+ * and the final-link question, reserves the GC rows the fused caller
+ * asked for, and only then mutates: dirent gone, the child loses a
+ * link or is deleted with its inline data, xattrs and stripe map, the
+ * GC rows land, the parent is touched.  A directory has exactly one
+ * name, so removing it deletes it and drops the parent's ".." link.
+ * *final_out reports whether the child inode was deleted.
  */
 
 /* Mutation half for the child inode at @cidx (checks passed): the
@@ -1386,6 +1387,13 @@ static enum mds_status memdb_unlink_locked(struct memdb *m, uint64_t parent,
             final = true;
         } else {
             final = (c->nlink <= 1U);
+            /* The caller derived its GC / quota bookkeeping from the
+             * snapshot's link count; a LINK or another REMOVE since then
+             * makes that plan wrong for this inode.  Refuse instead of
+             * silently doing the other shape. */
+            if (guard != NULL && (guard->nlink <= 1U) != final) {
+                return MDS_ERR_STALE;
+            }
         }
     }
     if (final && gc_entry_count > 0 && memdb_gc_free_count(m) < gc_entry_count) {
@@ -4881,6 +4889,31 @@ static enum mds_status mem_partition_put(struct mds_catalogue *cat,
     return MDS_OK;
 }
 
+/* Owner CAS: compare and write under the one instance lock, so two
+ * takeovers racing for the same row see exactly one winner. */
+static enum mds_status mem_partition_cas(struct mds_catalogue *cat,
+    uint32_t partition_id, uint32_t expected_owner, uint32_t new_owner,
+    uint8_t new_state)
+{
+    struct memdb *m = memdb_of(cat);
+    int idx;
+
+    memdb_lock(m);
+    idx = memdb_partition_find(m, partition_id);
+    if (idx < 0) {
+        memdb_unlock(m);
+        return MDS_ERR_NOTFOUND;
+    }
+    if (m->partitions[idx].owner_mds_id != expected_owner) {
+        memdb_unlock(m);
+        return MDS_ERR_STALE;
+    }
+    m->partitions[idx].owner_mds_id = new_owner;
+    m->partitions[idx].state = new_state;
+    memdb_unlock(m);
+    return MDS_OK;
+}
+
 /* -----------------------------------------------------------------------
  * Lifecycle
  * ----------------------------------------------------------------------- */
@@ -5147,6 +5180,7 @@ static const struct mds_cluster_ops memdb_cluster_ops = {
     .node_scan_stale = mem_node_scan_stale,
     .partition_list  = mem_partition_list,
     .partition_put   = mem_partition_put,
+    .partition_cas   = mem_partition_cas,
 };
 
 /* -----------------------------------------------------------------------

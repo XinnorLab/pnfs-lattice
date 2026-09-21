@@ -119,6 +119,9 @@ if(ENABLE_FDB)
     target_sources(pnfs_mds_core PRIVATE
         ${PROJECT_SOURCE_DIR}/src/catalogue/catalogue_fdb.c
         ${PROJECT_SOURCE_DIR}/src/catalogue/catalogue_fdb_ns.c
+        ${PROJECT_SOURCE_DIR}/src/catalogue/catalogue_fdb_ext.c
+        ${PROJECT_SOURCE_DIR}/src/catalogue/catalogue_fdb_coord.c
+        ${PROJECT_SOURCE_DIR}/src/catalogue/catalogue_fdb_cluster.c
         ${PROJECT_SOURCE_DIR}/src/catalogue/fdb_codec.c
         ${PROJECT_SOURCE_DIR}/src/catalogue/fdb_txn.c
     )

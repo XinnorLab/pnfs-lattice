@@ -1092,12 +1092,15 @@ phase_deps() {
 
     # pnfs-mds builds from source on THIS host; make sure the toolchain and
     # build-time headers are present (fresh machines lack libntirpc-dev /
-    # libkrb5-dev and the build fails half-way in).
+    # libkrb5-dev and the build fails half-way in).  Same retrying
+    # ensure_packages helper as the remote hosts: a cloud image's apt
+    # lists are stale, and a bare apt-get install then 404s on every
+    # package that was rebuilt since the image was made.
     log "  [build-host] ensure build packages (cmake, libntirpc-dev, libkrb5-dev, ...)"
-    run_local sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        --no-install-recommends \
-        build-essential cmake pkg-config \
-        libntirpc-dev libkrb5-dev libssl-dev
+    run_local sudo -n bash -se <<EOF
+$(render_ensure_packages)
+ensure_packages build-essential cmake pkg-config libntirpc-dev libkrb5-dev libssl-dev
+EOF
 
     for host in "${LAB_DS_HOSTS[@]}"; do
         log "  [${host}] ensure nfs-kernel-server, nfs-common"

@@ -347,10 +347,20 @@ int rondb_shim_ns_create_wide(
  *  directory has exactly one name).  The caller accounts for the
  *  victim's ".." link in the parent nlink deltas.
  *
+ *  src_child_fid / dst_child_fid and the victim's nlink (dst_child_buf,
+ *  delete_dst_child) are the caller's SNAPSHOT; the source dirent, the
+ *  destination dirent and the victim inode are re-validated against it
+ *  at the data node inside the transaction (interpreted guards; a
+ *  no-victim destination is an insert).  A failed guard aborts the
+ *  whole transaction with nothing mutated.
+ *
  *  Returns 0 on success, 3 when a directory victim is not empty
- *  (MDS_ERR_NOTEMPTY), -2 when the transaction must be re-resolved and
- *  retried (transient NDB error, or the victim vanished since the
- *  caller read it), -1 on error. */
+ *  (MDS_ERR_NOTEMPTY), 4 when the snapshot no longer matches the store
+ *  (source or destination name repointed or gone, victim link count
+ *  moved, or a destination appeared under a no-victim plan) -- the
+ *  caller re-resolves and retries, -2 when the transaction must be
+ *  re-resolved and retried (transient NDB error, or a directory victim
+ *  that vanished since the caller read it), -1 on error. */
 int rondb_shim_rename(void *handle,
                      uint64_t src_parent, const char *src_name,
                      uint64_t dst_parent, const char *dst_name,
@@ -374,9 +384,20 @@ int rondb_shim_rename(void *handle,
  *  mutated.  An empty directory is deleted outright (delete_child is
  *  ignored: a directory has exactly one name).
  *
- *  Returns 0 on success (including the idempotent already-removed case),
- *  3 when a directory target is not empty (MDS_ERR_NOTEMPTY), -2 when
- *  transient NDB contention survived every retry, -1 on error. */
+ *  child_fileid and delete_child describe the caller's SNAPSHOT of the
+ *  child; both are re-validated at the data node inside the transaction
+ *  (interpreted guards, no extra round trip): the dirent is deleted only
+ *  while it still names child_fileid, the inode is deleted only while
+ *  nlink == 1 and decremented only while nlink != 1.  A failed guard
+ *  aborts the whole transaction with nothing mutated.
+ *
+ *  Returns 0 on success (including the idempotent already-removed case:
+ *  the dirent is already gone), 3 when a directory target is not empty
+ *  (MDS_ERR_NOTEMPTY), 4 when the name no longer resolves to
+ *  child_fileid or the inode it names is gone (stale snapshot ->
+ *  MDS_ERR_STALE), 5 when the live nlink contradicts delete_child (the
+ *  caller re-reads and decides again), -2 when transient NDB contention
+ *  survived every retry, -1 on error. */
 int rondb_shim_ns_remove(void *handle,
                          uint64_t parent_fileid, const char *name,
                          uint64_t child_fileid,
@@ -409,8 +430,9 @@ struct rondb_gc_row {
  *  the transaction is a no-op success and no rows are inserted --
  *  the earlier winning remove already queued them.
  *
- *  Returns 0 on success, 3 when a directory target is not empty (see
- *  rondb_shim_ns_remove), -1 on error, -2 transient-exhausted. */
+ *  Returns 0 on success, 3 when a directory target is not empty, 4 / 5
+ *  for the snapshot guards (see rondb_shim_ns_remove), -1 on error, -2
+ *  transient-exhausted. */
 int rondb_shim_ns_remove_gc(void *handle,
                             uint64_t parent_fileid, const char *name,
                             uint64_t child_fileid,
@@ -992,18 +1014,14 @@ int rondb_shim_partition_map_put(void *handle, uint32_t partition_id,
                                 uint32_t owner_mds_id, uint8_t state,
                                 const char *subtree_path, int insert_only);
 
-/** CAS: update owner_mds_id only if current owner matches expected. */
+/** CAS: update owner_mds_id only if current owner matches expected.
+ *  Returns 0 on success, 1 when the row is absent, 2 when the current
+ *  owner differs (nothing written), -1 on error.  Reached through the
+ *  partition_cas cluster slot (mds_cluster_partition_cas), like list
+ *  and put; the failover takeover is its consumer. */
 int rondb_shim_partition_map_cas(void *handle, uint32_t partition_id,
                                 uint32_t expected_owner,
                                 uint32_t new_owner, uint8_t new_state);
-
-/** C wrapper for the partition_map CAS.  list / put are cluster slots
- *  (mds_cluster_partition_list / mds_cluster_partition_put); the CAS has
- *  no vtable slot yet because nothing outside the RonDB wrapper calls
- *  it -- it is added when a consumer exists. */
-enum mds_status catalogue_rondb_partition_map_cas(
-    struct mds_catalogue *cat, uint32_t partition_id,
-    uint32_t expected_owner, uint32_t new_owner, uint8_t new_state);
 
 /* -----------------------------------------------------------------------
  * Node registry list shim
