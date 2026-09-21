@@ -8,9 +8,11 @@
  * partner-alive abort, subtree takeover, grace entry, client
  * recovery tracking, reclaim accept/reject, no-demote invariant,
  * replication health gate, self-fencing guard, failover_take_over,
- * partner-loss filtering, idempotent promotion, and recovery-row
+ * partner-loss filtering, idempotent promotion, recovery-row
  * ownership (the rows the partner wrote are the ones a promotion
- * loads; another owner's rows are not).
+ * loads; another owner's rows are not), and the takeover race: two
+ * standbys promoting against one dead primary on one store, where the
+ * loser of the partition CAS must stay STANDBY.
  *
  * The recovery rows are seeded through a catalogue handle opened with
  * the PARTNER's identity (catalogue_memdb_open_cfg, cfg.self.id), so
@@ -1067,6 +1069,130 @@ static void test_promote_persists_partition_ownership(void)
 }
 
 /* -------------------------------------------------------------------
+ * Takeover outcomes over the partition map
+ * ------------------------------------------------------------------- */
+
+/* 19. Over a catalogue-backed map every partner partition is CAS'd
+ *     and counted: taken == the number the partner owned, and the
+ *     store records self as the owner of each.  A replay finds the
+ *     partner owns nothing and is MDS_OK with taken == 0: nothing to
+ *     take is not a lost race. */
+static void test_take_over_counts_every_partner_partition(void)
+{
+    struct mds_catalogue *db = NULL;
+    struct subtree_map *map = NULL;
+    struct subtree_entry *owned = NULL;
+    uint32_t owned_n = 0;
+    uint32_t taken = 99;
+
+    db = open_partner_catalogue();
+    ASSERT_NE(db, NULL);
+    ASSERT_EQ(mds_cluster_partition_put(db, 7, PARTNER_ID,
+                                        MDS_PARTITION_STATE_ACTIVE,
+                                        "/data", false), MDS_OK);
+    ASSERT_EQ(mds_cluster_partition_put(db, 8, PARTNER_ID,
+                                        MDS_PARTITION_STATE_ACTIVE,
+                                        "/home", false), MDS_OK);
+    ASSERT_EQ(subtree_map_init_from_catalogue(db, SELF_ID, "standby.local",
+                                              &map), MDS_OK);
+    ASSERT_EQ(subtree_map_get_node_subtrees(map, PARTNER_ID, &owned,
+                                            &owned_n), MDS_OK);
+    free(owned);
+    ASSERT_EQ(owned_n, 2U);
+
+    ASSERT_EQ(subtree_map_failover_take_over(map, db, PARTNER_ID, SELF_ID,
+                                             &taken), MDS_OK);
+    ASSERT_EQ(taken, owned_n);
+    ASSERT_EQ(pm_owner_of(db, 7), (uint32_t)SELF_ID);
+    ASSERT_EQ(pm_owner_of(db, 8), (uint32_t)SELF_ID);
+    ASSERT_TRUE(!subtree_map_node_owns_subtrees(map, PARTNER_ID));
+
+    /* Replay: the partner owns nothing here any more. */
+    taken = 99;
+    ASSERT_EQ(subtree_map_failover_take_over(map, db, PARTNER_ID, SELF_ID,
+                                             &taken), MDS_OK);
+    ASSERT_EQ(taken, 0U);
+
+    subtree_map_destroy(map);
+    mds_catalogue_close(db);
+}
+
+/* 20. Two standbys race for the same dead primary on one store.  The
+ *     first CAS wins and that node becomes PRIMARY.  The second node,
+ *     whose map still says the partner owns /data, loses every CAS:
+ *     its promote must report MDS_ERR_STALE and leave it STANDBY --
+ *     never PRIMARY over partitions the store gave to someone else --
+ *     while the store keeps the first winner as owner.  The loser's
+ *     memory is left as loaded (the store refused, so nothing moved)
+ *     and its next refresh brings it in line with the store. */
+static void test_promote_race_loser_stays_standby(void)
+{
+    struct mds_catalogue *db = NULL;
+    struct subtree_map *map_a = NULL;
+    struct subtree_map *map_b = NULL;
+    struct failover_ctx *ctx_a = NULL;
+    struct failover_ctx *ctx_b = NULL;
+    struct subtree_entry e;
+
+    grace_init();
+
+    db = open_partner_catalogue();
+    ASSERT_NE(db, NULL);
+    seed_recovery_records(db);
+    ASSERT_EQ(mds_cluster_partition_put(db, 7, PARTNER_ID,
+                                        MDS_PARTITION_STATE_ACTIVE,
+                                        "/data", false), MDS_OK);
+
+    /* Both standbys load the same map: the partner owns /data. */
+    ASSERT_EQ(subtree_map_init_from_catalogue(db, SELF_ID, "standby-a.local",
+                                              &map_a), MDS_OK);
+    ASSERT_EQ(subtree_map_init_from_catalogue(db, OTHER_ID, "standby-b.local",
+                                              &map_b), MDS_OK);
+    ASSERT_EQ(subtree_map_lookup_exact(map_b, "/data", &e), MDS_OK);
+    ASSERT_EQ(e.owner_mds_id, (uint32_t)PARTNER_ID);
+
+    struct failover_cfg cfg_a = {
+        .self_id          = SELF_ID,
+        .partner_id       = PARTNER_ID,
+        .map              = map_a,
+        .cat              = db,
+        .grace_period_sec = 90,
+        .detect_cb        = detect_dead,
+        .detect_arg       = NULL,
+        .membership       = NULL,
+        .hm               = NULL,
+    };
+    struct failover_cfg cfg_b = cfg_a;
+
+    cfg_b.self_id = OTHER_ID;
+    cfg_b.map = map_b;
+    ASSERT_EQ(failover_init(&cfg_a, &ctx_a), MDS_OK);
+    ASSERT_EQ(failover_init(&cfg_b, &ctx_b), MDS_OK);
+
+    /* A's CAS lands first. */
+    ASSERT_EQ(failover_promote(ctx_a), MDS_OK);
+    ASSERT_EQ(failover_get_role(ctx_a), FAILOVER_PRIMARY);
+    ASSERT_EQ(pm_owner_of(db, 7), (uint32_t)SELF_ID);
+
+    /* B's CAS is refused: it lost the race and must stay standby. */
+    ASSERT_EQ(failover_promote(ctx_b), MDS_ERR_STALE);
+    ASSERT_EQ(failover_get_role(ctx_b), FAILOVER_STANDBY);
+    ASSERT_EQ(pm_owner_of(db, 7), (uint32_t)SELF_ID);
+    ASSERT_EQ(subtree_map_lookup_exact(map_b, "/data", &e), MDS_OK);
+    ASSERT_EQ(e.owner_mds_id, (uint32_t)PARTNER_ID);
+    ASSERT_EQ(subtree_map_refresh_from_catalogue(map_b, db), MDS_OK);
+    ASSERT_EQ(subtree_map_lookup_exact(map_b, "/data", &e), MDS_OK);
+    ASSERT_EQ(e.owner_mds_id, (uint32_t)SELF_ID);
+
+    grace_exit();
+    failover_destroy(ctx_a);
+    failover_destroy(ctx_b);
+    subtree_map_destroy(map_a);
+    subtree_map_destroy(map_b);
+    mds_catalogue_close(db);
+}
+
+/* -------------------------------------------------------------------
  * main
  * ------------------------------------------------------------------- */
 
@@ -1097,6 +1223,10 @@ int main(void)
 
     /* Partition-map persistence of the takeover */
     RUN_TEST(test_promote_persists_partition_ownership);
+
+    /* Takeover outcomes over the partition map */
+    RUN_TEST(test_take_over_counts_every_partner_partition);
+    RUN_TEST(test_promote_race_loser_stays_standby);
 
     fprintf(stdout, "\n  %d/%d tests passed.\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

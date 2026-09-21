@@ -8,7 +8,9 @@
  *   1. Set internal role -> PROMOTING
  *   2. Self-fencing guard + replication health gate
  *   3. detect_cb confirmation (if non-NULL)
- *   4. Transfer subtree ownership via failover_take_over
+ *   4. Transfer subtree ownership via failover_take_over; a takeover
+ *      that wins no partition (another standby's CAS landed first)
+ *      returns the node to STANDBY so its watchdog keeps observing
  *   5. Load the partner's client recovery records from the
  *      coordination backend and re-own them (best-effort)
  *   6. Enter grace period
@@ -176,6 +178,28 @@ static void rollback_taken_paths(struct failover_ctx *ctx)
         }
     }
     clear_taken_state(ctx);
+}
+
+/** Phase 4b took no partition, so there is nothing to roll back: drop
+ *  the snapshot and return to STANDBY.  MDS_ERR_STALE means the store
+ *  gave the partner's partitions to another node -- that node is the
+ *  new primary and this one must keep watching, not publish
+ *  ACTIVE_SERVING over nothing -- and is passed through so the caller
+ *  can tell a lost race from a store failure.  Every other status is
+ *  reported as MDS_ERR_IO, as before. */
+static enum mds_status promote_takeover_failed(struct failover_ctx *ctx,
+                                               enum mds_status st)
+{
+    if (st == MDS_ERR_STALE) {
+        MDS_LOG_INFO(LOG_COMP_CLUSTER,
+                "failover: another node took over the partitions of "
+                "MDS %u; staying standby", (unsigned)ctx->partner_id);
+    } else {
+        st = MDS_ERR_IO;
+    }
+    clear_taken_state(ctx);
+    ctx->role = FAILOVER_STANDBY;
+    return st;
 }
 
 struct failover_recovery_list_ctx {
@@ -360,14 +384,14 @@ enum mds_status failover_promote(struct failover_ctx *ctx)
      * the partner to self in the catalogue before the in-memory map
      * follows, so the takeover survives the next partition-map
      * refresh and a second standby racing for the same partner loses
-     * the CAS instead of also believing it owns the subtrees. */
+     * the CAS instead of also believing it owns the subtrees.  A
+     * takeover that lost every CAS (MDS_ERR_STALE) never reaches
+     * PRIMARY: the loser stays standby. */
     st = subtree_map_failover_take_over(ctx->map, ctx->cat,
                                         ctx->partner_id, ctx->self_id,
                                         &taken);
     if (st != MDS_OK) {
-        clear_taken_state(ctx);
-        ctx->role = FAILOVER_STANDBY;
-        return MDS_ERR_IO;
+        return promote_takeover_failed(ctx, st);
     }
 
     /* Phase 5: Load the partner's recovering clientids via the

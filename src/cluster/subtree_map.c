@@ -1209,9 +1209,11 @@ enum mds_status subtree_map_take_over(struct subtree_map *map,
  * clients to it.  The CAS on (partition_id, expected = old_owner) is
  * also what keeps two standbys racing for the same primary from both
  * winning: exactly one CAS lands, the other sees STALE and leaves its
- * memory alone.  The catalogue call runs outside the rwlock (lock
- * contract at the top of this file); the entry is re-validated under
- * the write lock before it moves.
+ * memory alone -- and, when it won nothing at all, reports
+ * MDS_ERR_STALE so the promotion is abandoned instead of publishing a
+ * primary that owns no partition.  The catalogue call runs outside the
+ * rwlock (lock contract at the top of this file); the entry is
+ * re-validated under the write lock before it moves.
  * ----------------------------------------------------------------------- */
 
 /* Flip the in-memory entry @path from @expected_owner to @new_owner
@@ -1333,12 +1335,27 @@ enum mds_status subtree_map_failover_take_over(struct subtree_map *map,
     free(owned);
 
     *count_out = taken;
+    if (taken > 0) {
+        return MDS_OK;
+    }
+    /* The partner owned nothing in this map: there was nothing to take
+     * and nothing another node could have won ahead of us, so this is
+     * not a lost race.  MDS_OK keeps a standby whose partner never held
+     * a partition promotable; what a takeover of zero partitions means
+     * is the caller's decision. */
+    if (owned_n == 0) {
+        return MDS_OK;
+    }
     /* Nothing taken because the store could not be reached: the
      * promotion must not proceed on a map the store never accepted. */
-    if (taken == 0 && store_failed > 0) {
+    if (store_failed > 0) {
         return MDS_ERR_IO;
     }
-    return MDS_OK;
+    /* Every CAS was refused: the store no longer records the partner as
+     * the owner of any of them, so another node already took them (or
+     * the rows are gone).  Reporting MDS_OK here let the loser of the
+     * race publish itself as primary with nothing to serve. */
+    return MDS_ERR_STALE;
 }
 
 /* -----------------------------------------------------------------------

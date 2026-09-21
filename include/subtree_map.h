@@ -689,15 +689,32 @@ enum mds_status subtree_map_failover_transfer(struct subtree_map *map,
  * memory.  Bypasses the owner_role_ok() check because the promoting
  * standby is not yet ACTIVE_SERVING at the time of takeover.
  *
+ * Three outcomes when the partner owned at least one entry:
+ *   MDS_OK         at least one partition moved (count_out > 0); the
+ *                  ones the store refused stay the partner's in memory.
+ *   MDS_ERR_STALE  the store refused every CAS (STALE / NOTFOUND): it
+ *                  gave the partner's partitions to another node, or
+ *                  the rows are gone.  Nothing moved; the caller lost
+ *                  the takeover race and must not become primary.
+ *   MDS_ERR_IO     nothing moved and at least one CAS could not be
+ *                  decided because the store was unreachable.
+ * When the partner owned nothing in the map the call is MDS_OK with
+ * count_out == 0: there was nothing to take and nothing to lose to
+ * another node.
+ *
  * @param map        Map handle.
  * @param cat        Catalogue with the partition_cas slot, or NULL for
  *                   a memory-only takeover (local mode, tests).
  * @param old_owner  MDS ID of the failed primary.
  * @param new_owner  MDS ID of the promoting standby.
- * @param count_out  Receives number of subtrees taken over.
- * @return MDS_OK (even if count_out == 0, including when every entry
- *         was refused by the store); MDS_ERR_IO when the store could
- *         not be reached for any entry and none was taken.
+ * @param count_out  Receives number of subtrees taken over (0 on any
+ *                   error).
+ * @return MDS_OK, MDS_ERR_STALE or MDS_ERR_IO as above; MDS_ERR_INVAL
+ *         on a NULL map or count_out; MDS_ERR_NOMEM when the partner's
+ *         entries could not be snapshotted (nothing moved).
+ *
+ * Ownership: nothing is retained.  Thread safety: safe; the map lock is
+ * taken per entry and never held across the catalogue call.
  */
 enum mds_status subtree_map_failover_take_over(struct subtree_map *map,
                                                struct mds_catalogue *cat,
