@@ -55,16 +55,21 @@
  *                            parent counters consistent
  *   lifecycle                4 threads x 50 open/close cycles over two
  *                            prefixes, then mds_catalogue_process_shutdown:
- *                            the network thread is joined (one task left)
+ *                            the network thread is joined (the task count
+ *                            is back to what it was before the first open)
  *
  * Process model.  The fdb_c network options must be set before the
  * process's client network starts, and the harness process has it
  * running from its first open.  Sub-tests that need buggify or a fresh
- * incarnation therefore re-execute this binary (/proc/self/exe with a
- * "--child-<mode>" argument).  The child's environment is assembled
- * BEFORE fork (the parent is multi-threaded; the child only calls
- * execve): CATALOGUE_TEST_KEY_PREFIX is stripped so a child never
- * clears the parent's keyspace, and the buggify children get
+ * incarnation therefore re-execute this binary with a "--child-<mode>"
+ * argument.  The binary is found through argv[0] when that is a path
+ * (ctest and the shell hand one over) and through /proc/self/exe
+ * otherwise; the former keeps the children real under valgrind, where
+ * /proc/self/exe is the memcheck tool, not this test.  The child's
+ * environment is assembled BEFORE fork (the parent is multi-threaded;
+ * the child only calls execve): CATALOGUE_TEST_KEY_PREFIX is stripped so
+ * a child never clears the parent's keyspace, and the buggify children
+ * get
  *
  *   FDB_NETWORK_OPTION_CLIENT_BUGGIFY_ENABLE=                  (option 80)
  *   FDB_NETWORK_OPTION_CLIENT_BUGGIFY_SECTION_ACTIVATED_PROBABILITY=100
@@ -543,6 +548,18 @@ static char **child_envp(char *const *extra, int nextra)
 
 static char g_child_argv0[] = "conformance_fault";
 
+/* Path this binary was started through (main's argv[0]); the child
+ * exec target when it contains a '/'.  A bare name came from a PATH
+ * search, which execve does not repeat: /proc/self/exe is used then. */
+static const char *g_self_path = "/proc/self/exe";
+
+static void self_path_set(const char *argv0)
+{
+    if (argv0 != NULL && strchr(argv0, '/') != NULL) {
+        g_self_path = argv0;
+    }
+}
+
 /*
  * Run "<self> --child-<mode> args..." with @p extra environment entries
  * and wait for it.  Returns the child's exit status (0..255), or -1 when
@@ -583,7 +600,7 @@ static int run_child(const char *mode, char *const *args, int nargs, char *const
         return -1;
     }
     if (pid == 0) {
-        (void)execve("/proc/self/exe", argv, envp);
+        (void)execve(g_self_path, argv, envp);
         _exit(127);
     }
     atomic_store(&g_child_pid, pid);
@@ -3084,8 +3101,10 @@ static int count_tasks(void)
     if (d == NULL) {
         return -1;
     }
-    /* Only called once every other thread of the process has been
-     * joined, so the non-reentrant readdir is the only reader. */
+    /* Only called while no other thread of this process reads a
+     * directory (the test threads are joined; the client network
+     * thread never does), so the non-reentrant readdir has no
+     * concurrent user. */
     /* NOLINTNEXTLINE(concurrency-mt-unsafe) */
     while ((de = readdir(d)) != NULL) {
         if (de->d_name[0] != '.') {
@@ -3096,6 +3115,61 @@ static int count_tasks(void)
     return n;
 }
 
+/* Two reads this far apart must agree before a task count is trusted:
+ * a joined thread's /proc entry can outlive pthread_join by the tail of
+ * its kernel exit path.  Bounded by TASKS_SETTLE_ROUNDS. */
+#define TASKS_SETTLE_STEP_MS 10U
+#define TASKS_SETTLE_ROUNDS  100
+
+static int count_tasks_settled(void)
+{
+    int prev = count_tasks();
+    int round;
+
+    for (round = 0; round < TASKS_SETTLE_ROUNDS; round++) {
+        int now;
+
+        sleep_ms(TASKS_SETTLE_STEP_MS);
+        now = count_tasks();
+        if (now == prev) {
+            return now;
+        }
+        prev = now;
+    }
+    return prev;
+}
+
+static void *noop_thread_main(void *arg)
+{
+    (void)arg;
+    return NULL;
+}
+
+/*
+ * Task count the lifecycle check compares against.  It is taken before
+ * the first catalogue open, so it does not include the client network
+ * thread -- but a sanitizer runtime spawns its own long-lived helper
+ * thread lazily (TSan: on the first pthread_create of the process), and
+ * a baseline read before any thread existed would attribute that
+ * helper to the client.  One no-op thread, created and joined here,
+ * makes the runtime pay that cost first.
+ */
+static int lifecycle_task_baseline(void)
+{
+    pthread_t t;
+
+    if (pthread_create(&t, NULL, noop_thread_main, NULL) == 0) {
+        (void)pthread_join(t, NULL);
+    }
+    return count_tasks_settled();
+}
+
+/*
+ * The task count is judged against the process's own baseline, not
+ * against an absolute 1: "one task left" is only right for a plain
+ * build (see lifecycle_task_baseline).  The client network adds exactly
+ * one thread while it runs and mds_catalogue_process_shutdown joins it.
+ */
 static int child_lifecycle(void)
 {
     struct lc_thread threads[LC_THREADS];
@@ -3106,9 +3180,11 @@ static int child_lifecycle(void)
     int i;
     int failures = 0;
     int started = 0;
+    int tasks_baseline;
     int tasks_before;
     int tasks_after;
 
+    tasks_baseline = lifecycle_task_baseline();
     (void)snprintf(p1, sizeof(p1), "fl1-%ld", (long)getpid());
     (void)snprintf(p2, sizeof(p2), "fl2-%ld", (long)getpid());
     for (i = 0; i < 2; i++) {
@@ -3119,7 +3195,7 @@ static int child_lifecycle(void)
         }
         mds_catalogue_close(cat);
     }
-    tasks_before = count_tasks();
+    tasks_before = count_tasks_settled();
     memset(threads, 0, sizeof(threads));
     for (i = 0; i < LC_THREADS; i++) {
         threads[i].prefix[0] = p1;
@@ -3151,11 +3227,15 @@ static int child_lifecycle(void)
         mds_catalogue_close(cat);
     }
     mds_catalogue_process_shutdown();
-    tasks_after = count_tasks();
+    tasks_after = count_tasks_settled();
     (void)printf("    lifecycle: %d threads x %d cycles over 2 prefixes, %d failures; tasks "
-                 "before shutdown %d, after %d\n", started, LC_CYCLES, failures, tasks_before,
-                 tasks_after);
-    if (tasks_after != 1) {
+                 "before the first open %d, before shutdown %d, after %d\n", started, LC_CYCLES,
+                 failures, tasks_baseline, tasks_before, tasks_after);
+    if (tasks_before != tasks_baseline + 1) {
+        (void)printf("    lifecycle: expected exactly one client network thread while open\n");
+        return 1;
+    }
+    if (tasks_after != tasks_baseline) {
         (void)printf("    lifecycle: the client network thread is still alive\n");
         return 1;
     }
@@ -3301,6 +3381,7 @@ int main(int argc, char **argv)
     unsigned skipped = 0;
     size_t i;
 
+    self_path_set(argc > 0 ? argv[0] : NULL);
     if (argc > 1 && strncmp(argv[1], "--child-", 8) == 0) {
         return child_main(argv[1] + 8, argc - 2, argv + 2);
     }
