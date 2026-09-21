@@ -26,24 +26,29 @@
  *
  * rondb column: rondb_authority_ops / rondb_coordination_ops in
  * src/catalogue/catalogue_rondb.c (both authority tables populate the
- * same slot set), all eight cluster slots once rondb_cluster_ops is
- * registered, bootstrap and backend_handle present.
+ * same slot set), all eight cluster slots of rondb_cluster_ops,
+ * bootstrap and backend_handle present.
  *
  * The optional changefeed slots (image_feed_start / image_feed_stop)
- * are expected on RonDB only: memdb has no changefeed, so image mode is
- * unavailable there by design.
+ * are expected on RonDB only: memdb and fdb have no changefeed, so
+ * image mode is unavailable there by design.
  *
- * fdb column: the Phase 5 foundation (src/catalogue/catalogue_fdb*.c)
- * -- every namespace authority slot the RonDB table has except the
- * fused ns_create_with_layout, plus close / probe / bootstrap, plus the
+ * fdb column: the Phase 5 backend (src/catalogue/catalogue_fdb*.c) --
+ * every namespace authority slot the RonDB table has except the fused
+ * ns_create_with_layout, plus close / probe / bootstrap, plus the
  * extended authority slots of catalogue_fdb_ext.c (inline, xattr,
  * stripe map, DS registry and provisioning, quota, GC, remove_pending,
- * shard, ext_dirent, link_anchor -- the memdb set).  prealloc_pool_*
- * and backend_client_stats stay absent like on memdb; every
- * coordination slot and every cluster slot are absent until their
- * follow-up units land and flip the rows; ns_readdir_plus stays absent
- * by design (the cookie cursor ns_readdir_plus_from is the fused path,
- * as on memdb).
+ * shard, ext_dirent, link_anchor -- the memdb set); every coordination
+ * slot including layoutget_fused, lock_test and lock_scan_owner
+ * (catalogue_fdb_coord.c) and all eight cluster slots
+ * (catalogue_fdb_cluster.c).  backend_client_stats is present (the
+ * transaction runner's counters -- network waits, attempts, commits,
+ * retries -- in the RonDB shim's shape, so the round-trip accounting is
+ * measured the same way on both stores).  prealloc_pool_* stay absent
+ * like on memdb, the changefeed slots like on memdb (no changefeed),
+ * backend_handle because there is no native handle to expose;
+ * ns_readdir_plus stays absent by design (the cookie cursor
+ * ns_readdir_plus_from is the fused path, as on memdb).
  */
 
 #ifndef CATALOGUE_CONFORMANCE_SLOT_MATRIX_EXPECTED_H
@@ -124,7 +129,7 @@
     X(ext_dirent_del,                  true,  false, true)             \
     X(link_anchor_put,                 true,  false, true)             \
     X(link_anchor_del,                 true,  false, true)             \
-    X(backend_client_stats,            false, true,  false)
+    X(backend_client_stats,            false, true,  true)
 
 /* --- struct mds_coordination_ops ------------------------------------- */
 #define CONFORMANCE_COORD_SLOTS(X)                                 \

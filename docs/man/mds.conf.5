@@ -158,17 +158,56 @@ address.
 .TP
 .B catalogue_backend
 .I enum
-.RI ( rondb )
+.RI ( rondb " | " memdb " | " fdb )
 (default
-.BR rondb ).
-Only
 .B rondb
-is supported on current builds.
+when the binary was built with RonDB support; otherwise the key is
+mandatory).
+A name that is known but not compiled into the binary is refused at
+startup with the list of available backends.
+.B rondb
+is the production distributed store;
+.B memdb
+is the in-memory reference backend (non-durable, single node, bounded
+capacity: never a multi-MDS cluster);
+.B fdb
+is the FoundationDB backend (ENABLE_FDB builds), configured through the
+.B fdb_*
+keys below.
 .TP
 .B catalogue_backend_conf
 .IR path .
 Backend-specific config file, e.g.
-.IR /etc/pnfs-mds/rondb.conf .
+.IR /etc/pnfs-mds/rondb.conf
+(rondb only).
+.TP
+.B fdb_cluster_file
+.IR path .
+FoundationDB cluster file; empty selects the
+.B FDB_CLUSTER_FILE
+environment variable, then
+.IR /etc/foundationdb/fdb.cluster .
+.TP
+.B fdb_key_prefix
+.IR string " (at most 31 bytes)."
+Prepended to every key so several independent catalogues can share one
+cluster; empty uses the whole key space.
+.TP
+.B fdb_op_deadline_ms
+.I integer
+.RI ( 1..600000 ,
+default
+.BR 8000 ).
+Total budget of one catalogue operation across every transaction
+attempt and commit-outcome resolution.
+.TP
+.B fdb_txn_timeout_ms
+.I integer
+.RI ( 1..4900 ,
+default
+.BR 4000 ).
+Timeout of one transaction attempt; must stay under FoundationDB's
+5 s transaction window.
 .TP
 .B catalog_image_mode
 .I enum

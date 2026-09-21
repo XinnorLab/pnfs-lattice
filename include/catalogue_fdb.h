@@ -6,17 +6,21 @@
  *
  * Built into pnfs_mds_core when ENABLE_FDB is ON (HAVE_FDB=1).  The
  * backend is a set of translation units under src/catalogue/:
- *   catalogue_fdb.c     lifecycle: client network, open/close/probe/
- *                       bootstrap, process shutdown, vtable assembly
- *   catalogue_fdb_ns.c  namespace authority slots
- *   catalogue_fdb_ext.c extended authority slots (inline, xattr, stripe
- *                       map, DS registry, quota, GC, delete manifest,
- *                       shard / ext_dirent / link_anchor)
- *   fdb_keys.h          key space registry
- *   fdb_codec.[ch]      value formats
- *   fdb_txn.[ch]        transaction runner and commit-outcome protocol
- * Follow-up units register further slots through the *_register hooks
- * declared at the bottom of this header.
+ *   catalogue_fdb.c         lifecycle: client network, open/close/probe/
+ *                           bootstrap, process shutdown, vtable assembly
+ *   catalogue_fdb_ns.c      namespace authority slots
+ *   catalogue_fdb_ext.c     extended authority slots (inline, xattr,
+ *                           stripe map, DS registry, quota, GC, delete
+ *                           manifest, shard / ext_dirent / link_anchor)
+ *   catalogue_fdb_coord.c   coordination slots (layout state, open /
+ *                           lock / delegation write-through, client,
+ *                           session, DRC slots, recovery, 2PC journal)
+ *   catalogue_fdb_cluster.c cluster slots (node registry, partition map)
+ *   fdb_keys.h              key space registry
+ *   fdb_codec.[ch]          value formats
+ *   fdb_txn.[ch]            transaction runner and commit-outcome protocol
+ * The authority slots are filled through the *_register hooks declared
+ * below; the coordination and cluster tables are exported constants.
  *
  * Process lifecycle.  The fdb_c client runs ONE network thread per
  * process and fdb_stop_network() is terminal.  The first open() starts
@@ -110,8 +114,8 @@ enum mds_status catalogue_fdb_keyspace_clear(const struct mds_catalogue *cat);
 
 /**
  * Fill the namespace slots of @p ops (catalogue_fdb_ns.c).  Called once
- * by catalogue_fdb.c while assembling the authority table; follow-up
- * units add their own *_register functions alongside.
+ * by catalogue_fdb.c while assembling the authority table, before
+ * catalogue_fdb_ext_register().
  */
 void catalogue_fdb_ns_register(struct mds_authority_ops *ops);
 
@@ -131,8 +135,9 @@ int catalogue_fdb_inode_write(struct FDB_transaction *tr, const struct fdb_key_p
  * inline data, xattrs, stripe maps, DS registry and provisioning,
  * quota, GC queue, delete manifest, shard routing, cross-shard dirents,
  * link anchors).  Called once by catalogue_fdb.c after
- * catalogue_fdb_ns_register(); the prealloc pool and
- * backend_client_stats slots are left untouched (NULL).
+ * catalogue_fdb_ns_register(); the prealloc pool slots are left
+ * untouched (NULL) and backend_client_stats is filled by
+ * catalogue_fdb.c from the transaction runner's counters.
  */
 void catalogue_fdb_ext_register(struct mds_authority_ops *ops);
 
@@ -154,7 +159,8 @@ extern const struct mds_cluster_ops fdb_cluster_ops;
  * PARTITION_MAP row, MDS_ERR_NOTFOUND when absent, MDS_ERR_STALE when
  * its owner is not @p expected_owner (nothing written), else set the
  * owner and state (the subtree path is kept).  Registered as
- * mds_cluster_ops.partition_cas by the cluster-slot integration.
+ * mds_cluster_ops.partition_cas in fdb_cluster_ops
+ * (catalogue_fdb_cluster.c); reached through mds_cluster_partition_cas.
  *
  * @return MDS_OK; MDS_ERR_NOTFOUND; MDS_ERR_STALE; MDS_ERR_INVAL for a
  *         non-fdb handle; the transaction runner's status otherwise.

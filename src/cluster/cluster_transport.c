@@ -159,6 +159,11 @@ static enum mds_status decode_wire_status(uint8_t wire_byte)
 #define CT_MAX_PEERS 128  /* Must be >= MDS_MAX_NODES for full-mesh clusters */
 
 struct cluster_server {
+    /* Written by cluster_transport_server_start before server_thread
+     * exists and by cluster_transport_server_stop after it has been
+     * joined; server_thread only reads it.  The stop path signals the
+     * thread through `running` and shutdown(), never through the fd
+     * value. */
     int                listen_fd;
     uint16_t           port;
     struct mds_catalogue *cat;
@@ -2059,16 +2064,22 @@ void cluster_transport_server_stop(struct cluster_server *srv)
 
     atomic_store(&srv->running, false);
     /*
-     * Shut down the listen socket so poll() returns immediately,
-     * then close and join.  shutdown() is more reliable than bare
-     * close() for unblocking poll/accept under valgrind.
+     * Shut down the listen socket so a poll()/accept() in progress
+     * returns immediately (shutdown() is more reliable than bare
+     * close() for unblocking them under valgrind), join the thread,
+     * and only then close the socket and clear the field: the thread
+     * reads listen_fd on every iteration, so the writer must be alone.
+     * Even without the wake-up the join is bounded by the thread's
+     * 200 ms poll timeout and its re-check of `running`.
      */
     if (srv->listen_fd >= 0) {
         shutdown(srv->listen_fd, SHUT_RDWR);
+    }
+    pthread_join(srv->thread, NULL);
+    if (srv->listen_fd >= 0) {
         close(srv->listen_fd);
         srv->listen_fd = -1;
     }
-    pthread_join(srv->thread, NULL);
 
     /*
      * Force-unwind any connection threads blocked in recv() by

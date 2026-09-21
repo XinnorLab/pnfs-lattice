@@ -1328,6 +1328,63 @@ static void test_real_fence_premise(void)
     fdb_transaction_destroy(a2);
 }
 
+/* -----------------------------------------------------------------------
+ * Client-side counters against the real cluster: the fdb authority
+ * table populates backend_client_stats from the runner (attempts,
+ * commits, retries) and the process-wide network-wait counter.  A
+ * read-only body with one point read blocks at least once (the read
+ * cannot be ready before the storage server answered) and commits
+ * nothing; a mutating body adds exactly one commit and at least one
+ * more wait (the commit).  Counted only through the real table: the
+ * mock-driven tests above must leave the wait counter untouched.
+ * ----------------------------------------------------------------------- */
+
+static void test_real_client_stats(void)
+{
+    struct fdb_backend *b = g_real_cat->backend_private;
+    struct mds_cat_backend_client_stats s0;
+    struct mds_cat_backend_client_stats s1;
+    struct mds_cat_backend_client_stats s2;
+    struct real_ctx c;
+    uint64_t waits_before_mock;
+    struct fdb_backend mock_b;
+    struct body_ctx mock_c = { 0, 0, MDS_OK };
+
+    ASSERT_TRUE(b != NULL);
+    ASSERT_EQ(mds_cat_backend_client_stats(NULL, &s0), MDS_ERR_INVAL);
+    ASSERT_EQ(mds_cat_backend_client_stats(g_real_cat, NULL), MDS_ERR_INVAL);
+    ASSERT_EQ(mds_cat_backend_client_stats(g_real_cat, &s0), MDS_OK);
+    ASSERT_EQ(s0.client_objects, 1);
+    ASSERT_EQ(s0.exec_waits, fdb_txn_net_waits());
+
+    memset(&c, 0, sizeof(c));
+    c.b = b;
+    fdb_key_init(&c.key, &b->prefix, FDB_KT_META);
+    fdb_key_u8(&c.key, 0x7E); /* a scratch META sub-key */
+    ASSERT_EQ(fdb_run_txn(b, FDB_TXN_READONLY, "stats_get", real_get_body, &c), MDS_OK);
+    ASSERT_EQ(mds_cat_backend_client_stats(g_real_cat, &s1), MDS_OK);
+    ASSERT_EQ(s1.txn_started - s0.txn_started, 1);
+    ASSERT_EQ(s1.txn_committed, s0.txn_committed);
+    ASSERT_EQ(s1.txn_closed - s0.txn_closed, 1);
+    ASSERT_TRUE(s1.exec_waits - s0.exec_waits >= 1);
+
+    c.value = 0x5A5A;
+    ASSERT_EQ(fdb_run_txn(b, FDB_TXN_MUTATING, "stats_set", real_set_body, &c), MDS_OK);
+    ASSERT_EQ(mds_cat_backend_client_stats(g_real_cat, &s2), MDS_OK);
+    ASSERT_EQ(s2.txn_started - s1.txn_started, 1);
+    ASSERT_EQ(s2.txn_committed - s1.txn_committed, 1);
+    ASSERT_EQ(s2.txn_closed, s1.txn_closed);
+    ASSERT_TRUE(s2.exec_waits - s1.exec_waits >= 1);
+    ASSERT_TRUE(s2.txn_aborted >= s1.txn_aborted);
+
+    /* A mock-driven run has no network: the wait counter stays put. */
+    waits_before_mock = fdb_txn_net_waits();
+    mock_reset();
+    backend_init(&mock_b);
+    ASSERT_EQ(fdb_run_txn(&mock_b, FDB_TXN_MUTATING, "t", body_fn, &mock_c), MDS_OK);
+    ASSERT_EQ(fdb_txn_net_waits(), waits_before_mock);
+}
+
 /* ----------------------------------------------------------------------- */
 
 static int real_open(void)
@@ -1390,6 +1447,7 @@ int main(void)
     RUN_TEST(test_read_version_pinned);
     RUN_TEST(test_real_cluster);
     RUN_TEST(test_real_fence_premise);
+    RUN_TEST(test_real_client_stats);
 
     (void)catalogue_fdb_keyspace_clear(g_real_cat);
     mds_catalogue_close(g_real_cat);

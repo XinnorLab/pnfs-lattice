@@ -24,8 +24,14 @@
  *   link_vs_final_unlink   never a dirent to a deleted inode
  *   rename_coherence       one readdir page / one lookup sees exactly one
  *                          of the two names of a same-directory rename
+ *   rename_notdir_parent   a source or destination "directory" that is a
+ *                          regular file answers NOTDIR (never NOENT for
+ *                          the name it cannot hold), nothing changes; a
+ *                          parent that does not exist is NOTFOUND
  *   remove_gc_fold_stale   ns_remove_known_gc re-validates in its own
- *                          transaction: stale child -> STALE, no change
+ *                          transaction: stale child (name rebound, or
+ *                          the snapshot's link shape contradicted by a
+ *                          LINK / REMOVE since) -> STALE, no change
  *   layout_union_recall    union grants keep one row covering all ranges
  *   replay_idempotency     a replayed create/link/remove is EXISTS /
  *                          EXISTS / NOTFOUND and counters advance once
@@ -617,7 +623,9 @@ static void link_vs_final_unlink(struct ctx *c)
 struct rename_ctx {
     struct ctx *c;
     uint64_t fid;
-    volatile int running;
+    /* Written by the worker at exit, polled by the observer: a volatile
+     * flag is not a synchronisation primitive (TSan reports it). */
+    _Atomic int running;
     enum mds_status st;
 };
 
@@ -762,6 +770,78 @@ static void rename_coherence(struct ctx *c)
 }
 
 /* -----------------------------------------------------------------------
+ * rename_notdir_parent
+ * ----------------------------------------------------------------------- */
+
+/* RFC 8881 18.26.4: RENAME with a saved or current filehandle that is
+ * not a directory is NFS4ERR_NOTDIR.  A regular file has no dirents, so
+ * a backend that resolves the source name before it checks the parent's
+ * type answers NOENT instead (pynfs RNM2* / RNM3*); the type decision
+ * has to come first.  An absent parent stays NOTFOUND. */
+static void rename_notdir_parent(struct ctx *c)
+{
+    struct mds_inode nd, mv, seen, parent_before, parent_after;
+    enum mds_status st;
+
+    memset(&nd, 0, sizeof(nd));
+    memset(&mv, 0, sizeof(mv));
+    if (mds_cat_ns_create(c->cat, NULL, c->dir, "nd", MDS_FTYPE_REG, 0644,
+                          0, 0, NULL, &nd) != MDS_OK ||
+        mds_cat_ns_create(c->cat, NULL, c->dir, "mv", MDS_FTYPE_REG, 0644,
+                          0, 0, NULL, &mv) != MDS_OK ||
+        mds_cat_ns_getattr(c->cat, c->dir, &parent_before) != MDS_OK) {
+        ctx_fail(c, "setup (two files) failed");
+        return;
+    }
+    /* Source parent is a file (the name it cannot hold is asked for). */
+    st = mds_cat_ns_rename(c->cat, NULL, nd.fileid, "x", c->dir, "y");
+    if (st != MDS_ERR_NOTDIR) {
+        ctx_fail(c, "source parent a file: expected NOTDIR, got %s",
+                 status_name(st));
+    }
+    /* Destination parent is a file (the source name does exist). */
+    st = mds_cat_ns_rename(c->cat, NULL, c->dir, "mv", nd.fileid, "y");
+    if (st != MDS_ERR_NOTDIR) {
+        ctx_fail(c, "destination parent a file: expected NOTDIR, got %s",
+                 status_name(st));
+    }
+    /* Both parents files. */
+    st = mds_cat_ns_rename(c->cat, NULL, nd.fileid, "x", mv.fileid, "y");
+    if (st != MDS_ERR_NOTDIR) {
+        ctx_fail(c, "both parents files: expected NOTDIR, got %s",
+                 status_name(st));
+    }
+    /* A parent that does not exist at all is NOTFOUND, not NOTDIR. */
+    st = mds_cat_ns_rename(c->cat, NULL, (uint64_t)1 << 62, "x", c->dir, "y");
+    if (st != MDS_ERR_NOTFOUND) {
+        ctx_fail(c, "absent source parent: expected NOTFOUND, got %s",
+                 status_name(st));
+    }
+    st = mds_cat_ns_rename(c->cat, NULL, c->dir, "mv", (uint64_t)1 << 62, "y");
+    if (st != MDS_ERR_NOTFOUND) {
+        ctx_fail(c, "absent destination parent: expected NOTFOUND, got %s",
+                 status_name(st));
+    }
+    /* Nothing moved, nothing appeared, the directory's counters stand. */
+    if (mds_cat_ns_lookup(c->cat, c->dir, "mv", &seen) != MDS_OK ||
+        seen.fileid != mv.fileid) {
+        ctx_fail(c, "'mv' no longer resolves to its inode");
+    }
+    if (mds_cat_ns_lookup(c->cat, c->dir, "y", &seen) != MDS_ERR_NOTFOUND) {
+        ctx_fail(c, "'y' appeared in the directory");
+    }
+    if (mds_cat_ns_getattr(c->cat, nd.fileid, &seen) != MDS_OK ||
+        seen.type != MDS_FTYPE_REG || seen.nlink != 1) {
+        ctx_fail(c, "the file used as a parent changed");
+    }
+    if (mds_cat_ns_getattr(c->cat, c->dir, &parent_after) != MDS_OK ||
+        parent_after.change != parent_before.change ||
+        parent_after.nlink != parent_before.nlink) {
+        ctx_fail(c, "directory counters changed on refused renames");
+    }
+}
+
+/* -----------------------------------------------------------------------
  * remove_gc_fold_stale
  * ----------------------------------------------------------------------- */
 
@@ -848,6 +928,97 @@ static void remove_gc_fold_stale(struct ctx *c)
     if (mds_cat_gc_count(c->cat, &gc_after) != MDS_OK ||
         gc_after != gc_before + 1) {
         ctx_fail(c, "current child: GC queue %u -> %u (want +1)", gc_before,
+                 gc_after);
+    }
+    gc_before = gc_after;
+
+    /* Link shape moved under a snapshot that still names the right
+     * inode.  The caller derives "final unlink" -- and with it the GC
+     * rows it hands in -- from the snapshot's nlink, so a LINK that
+     * landed since (snapshot final, live nlink 2) must be refused: an
+     * OK here would have the caller collect a live file's DS objects.
+     * The reverse (snapshot non-final, the other name removed since,
+     * live nlink 1) must be refused as well: the caller would leak the
+     * last link's objects.  Nothing changes on either refusal; a fresh
+     * snapshot then folds exactly one GC row. */
+    memset(&c1, 0, sizeof(c1));
+    if (mds_cat_ns_create(c->cat, NULL, c->dir, "lk", MDS_FTYPE_REG, 0644,
+                          0, 0, NULL, &c1) != MDS_OK ||
+        mds_cat_ns_link(c->cat, NULL, c->dir, "lk2", c1.fileid) != MDS_OK) {
+        ctx_fail(c, "link-shape setup (create + link) failed");
+        return;
+    }
+    folded = true;
+    st = mds_cat_ns_remove_known_gc(c->cat, NULL, c->dir, "lk", &c1, 1,
+                                    &gc_entry, 1, MDS_GC_SWEEP_GEOM(1, 1),
+                                    &folded);
+    if (st != MDS_ERR_STALE) {
+        ctx_fail(c, "final snapshot, live second link: expected STALE, got %s",
+                 status_name(st));
+    }
+    if (folded) {
+        ctx_fail(c, "final snapshot, live second link: gc_folded reported true");
+    }
+    if (mds_cat_ns_getattr(c->cat, c1.fileid, &seen) != MDS_OK ||
+        seen.nlink != 2) {
+        ctx_fail(c, "final snapshot, live second link: inode changed "
+                 "(nlink %u, want 2)", (unsigned)seen.nlink);
+    }
+    if (mds_cat_ns_lookup(c->cat, c->dir, "lk", &seen) != MDS_OK ||
+        seen.fileid != c1.fileid) {
+        ctx_fail(c, "final snapshot, live second link: dirent changed");
+    }
+    if (mds_cat_gc_count(c->cat, &gc_after) != MDS_OK ||
+        gc_after != gc_before) {
+        ctx_fail(c, "final snapshot, live second link: GC queue changed "
+                 "(%u -> %u)", gc_before, gc_after);
+    }
+    /* Reverse: a non-final snapshot (nlink 2) after the other name went. */
+    if (mds_cat_ns_getattr(c->cat, c1.fileid, &c2) != MDS_OK ||
+        mds_cat_ns_remove(c->cat, NULL, c->dir, "lk2") != MDS_OK) {
+        ctx_fail(c, "link-shape setup (snapshot + remove lk2) failed");
+        return;
+    }
+    folded = true;
+    st = mds_cat_ns_remove_known_gc(c->cat, NULL, c->dir, "lk", &c2, 1,
+                                    &gc_entry, 1, MDS_GC_SWEEP_GEOM(1, 1),
+                                    &folded);
+    if (st != MDS_ERR_STALE) {
+        ctx_fail(c, "non-final snapshot, last link: expected STALE, got %s",
+                 status_name(st));
+    }
+    if (folded) {
+        ctx_fail(c, "non-final snapshot, last link: gc_folded reported true");
+    }
+    if (mds_cat_ns_getattr(c->cat, c1.fileid, &seen) != MDS_OK ||
+        seen.nlink != 1) {
+        ctx_fail(c, "non-final snapshot, last link: inode changed "
+                 "(nlink %u, want 1)", (unsigned)seen.nlink);
+    }
+    if (mds_cat_gc_count(c->cat, &gc_after) != MDS_OK ||
+        gc_after != gc_before) {
+        ctx_fail(c, "non-final snapshot, last link: GC queue changed "
+                 "(%u -> %u)", gc_before, gc_after);
+    }
+    /* A fresh snapshot is the final link: exactly one GC row folds. */
+    if (mds_cat_ns_getattr(c->cat, c1.fileid, &c2) != MDS_OK) {
+        ctx_fail(c, "fresh snapshot failed");
+        return;
+    }
+    folded = false;
+    st = mds_cat_ns_remove_known_gc(c->cat, NULL, c->dir, "lk", &c2, 1,
+                                    &gc_entry, 1, MDS_GC_SWEEP_GEOM(1, 1),
+                                    &folded);
+    if (st != MDS_OK || !folded) {
+        ctx_fail(c, "fresh snapshot: expected OK + folded, got %s folded=%d",
+                 status_name(st), (int)folded);
+    }
+    if (mds_cat_ns_getattr(c->cat, c1.fileid, &seen) != MDS_ERR_NOTFOUND) {
+        ctx_fail(c, "fresh snapshot: inode still there after final unlink");
+    }
+    if (mds_cat_gc_count(c->cat, &gc_after) != MDS_OK ||
+        gc_after != gc_before + 1) {
+        ctx_fail(c, "fresh snapshot: GC queue %u -> %u (want +1)", gc_before,
                  gc_after);
     }
 }
@@ -1527,6 +1698,7 @@ static const struct subtest subtests[] = {
     { "create_vs_rmdir",       create_vs_rmdir,       true  },
     { "link_vs_final_unlink",  link_vs_final_unlink,  true  },
     { "rename_coherence",      rename_coherence,      true  },
+    { "rename_notdir_parent",  rename_notdir_parent,  true  },
     { "remove_gc_fold_stale",  remove_gc_fold_stale,  true  },
     { "layout_union_recall",   layout_union_recall,   true  },
     { "replay_idempotency",    replay_idempotency,    true  },

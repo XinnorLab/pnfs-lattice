@@ -11,7 +11,13 @@
  *   memdb   (default)  the in-process reference backend
  *   rondb              RonDB via mds_catalogue_open(); the RonDB
  *                      config file comes from RONDB_CONF
- *   fdb                FoundationDB (not built in gate 1)
+ *   fdb                FoundationDB via mds_catalogue_open() when the
+ *                      binary was built with ENABLE_FDB; the cluster
+ *                      file comes from FDB_CLUSTER_FILE (default
+ *                      /etc/foundationdb/fdb.cluster) and every open of
+ *                      the process shares one isolated key prefix
+ *                      (CATALOGUE_TEST_KEY_PREFIX, or one generated per
+ *                      process) that conformance_shutdown() wipes
  *
  * A backend that is unavailable in the running binary or environment
  * is a SKIP, never a pass or a fail: the harness prints the reason and

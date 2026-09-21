@@ -167,7 +167,7 @@ Each op returns an `enum nfs4_status`; the encoder (`xdr_codec.c`) turns the
 result union into a wire reply.
 ## 6. Catalogue (metadata backend)
 Lattice abstracts its metadata store behind a small C ABI in
-`include/mds_catalogue.h`.  Two backends ship in tree:
+`include/mds_catalogue.h`.  Three backends ship in tree:
 - **RonDB / NDB** (production) — `src/catalogue/catalogue_rondb_shim.cpp`
   wraps the NDB C++ API behind a narrow C surface.  The shim opens NDB
   cluster connections, manages a per-thread `Ndb` object, and exposes a
@@ -176,7 +176,16 @@ Lattice abstracts its metadata store behind a small C ABI in
   backend: bounded tables, non-durable, single node.  The unit tests use it so
   the suite has no external dependency, and `catalogue_backend = memdb` runs
   the daemon on it without RonDB.
-Both backends implement the same vtable (`include/catalogue_internal.h`).
+- **FoundationDB** (`ENABLE_FDB`) — `src/catalogue/catalogue_fdb*.c` over the
+  fdb_c client: one FoundationDB transaction per catalogue call
+  (`fdb_txn.[ch]`), a single-byte-typed key space (`fdb_keys.h`), and a
+  commit-outcome witness protocol that resolves `commit_unknown_result` /
+  timed-out commits instead of replaying them (`MDS_ERR_INDOUBT` when it
+  cannot).  Multi-process capable like RonDB; selected with
+  `catalogue_backend = fdb` plus the `fdb_*` keys.
+All backends implement the same vtables (`include/catalogue_internal.h`);
+the conformance suite under `tests/catalogue_conformance/` runs the same
+contract tests against each of them (`CATALOGUE_TEST_BACKEND=memdb|rondb|fdb`).
 Tables (logical, not literal NDB DDL):
 | Table | Purpose |
 |---|---|

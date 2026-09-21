@@ -2037,6 +2037,7 @@ static void witness_restart(struct ctx *c)
     uint64_t epoch = fdb_txn_witness_epoch();
     int rc;
 
+    memset(&w, 0, sizeof(w));
     (void)snprintf(prefix, sizeof(prefix), "fr-%ld", (long)getpid());
     if (!prefix_from_string(&fp, prefix)) {
         ctx_fail(c, "prefix build failed");
@@ -2085,6 +2086,9 @@ static void keyspace_clear_witness(struct ctx *c)
     struct mds_inode out;
     char prefix[32];
 
+    /* The census is reported even when the create short-circuits the
+     * scan that would fill it. */
+    memset(&w, 0, sizeof(w));
     (void)snprintf(prefix, sizeof(prefix), "fk-%ld", (long)getpid());
     if (!prefix_from_string(&fp, prefix)) {
         ctx_fail(c, "prefix build failed");

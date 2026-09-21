@@ -617,16 +617,19 @@ set_tests_properties(test_indoubt_mapping PROPERTIES LABELS "unit")
 # End of indoubt track block.
 
 # -------------------------------------------------------------------
-# RonDB lab instruments (not ctests): built only with the RonDB backend
-# and run by hand against a live cluster (RONDB_CONF names the daemon's
-# rondb.conf).  lab_cluster_drive drives the public mds_cluster_* /
-# mds_coord_recovery_* / mds_cat_ns_* dispatchers; lab_nr_hb_set writes
-# one registry row's last_heartbeat_ns through the NDB API for the
-# mixed clock-domain (rolling upgrade) experiment; lab_dirent_raw shows
-# the raw stored key bytes of one directory's dirent rows and reads
-# each back by primary key (dangling / phantom dirent diagnosis).
+# Lab instruments (not ctests), run by hand against a live cluster.
+# lab_cluster_drive drives the public mds_cluster_* /
+# mds_coord_recovery_* / mds_cat_ns_* dispatchers on whichever live
+# store the tree has (RonDB via RONDB_CONF, FoundationDB via
+# FDB_CLUSTER_FILE + FDB_KEY_PREFIX; --backend selects), so it is built
+# whenever one of them is compiled in.  The NDB-API instruments stay
+# RonDB-only: lab_nr_hb_set writes one registry row's last_heartbeat_ns
+# through the NDB API for the mixed clock-domain (rolling upgrade)
+# experiment; lab_dirent_raw shows the raw stored key bytes of one
+# directory's dirent rows and reads each back by primary key (dangling
+# / phantom dirent diagnosis).
 # -------------------------------------------------------------------
-if(ENABLE_RONDB)
+if(ENABLE_RONDB OR ENABLE_FDB)
     add_executable(lab_cluster_drive integration/lab_cluster_drive.c)
     target_include_directories(lab_cluster_drive PRIVATE
         ${PROJECT_SOURCE_DIR}/include
@@ -644,7 +647,9 @@ if(ENABLE_RONDB)
         rondb_schema
         pthread
     )
+endif()
 
+if(ENABLE_RONDB)
     add_executable(lab_nr_hb_set integration/lab_nr_hb_set.cpp)
     target_include_directories(lab_nr_hb_set PRIVATE ${RONDB_INCLUDE_DIR})
     target_compile_features(lab_nr_hb_set PRIVATE cxx_std_11)

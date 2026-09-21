@@ -168,7 +168,8 @@ struct fdb_txn_calls {
 const struct fdb_txn_calls *fdb_txn_calls_real(void);
 
 /* -----------------------------------------------------------------------
- * Statistics (relaxed atomics; read by backend_client_stats later)
+ * Statistics (relaxed atomics; exposed through the backend_client_stats
+ * slot of the fdb authority table, catalogue_fdb.c)
  * ----------------------------------------------------------------------- */
 
 struct fdb_txn_stats {
@@ -349,5 +350,30 @@ bool fdb_txn_witness_key(const struct fdb_backend *b, struct fdb_key *k, uint64_
 
 /** Monotonic nanoseconds (CLOCK_MONOTONIC). */
 uint64_t fdb_txn_now_ns(void);
+
+/* -----------------------------------------------------------------------
+ * Network-wait accounting (process-wide, monitoring only)
+ * ----------------------------------------------------------------------- */
+
+/**
+ * Cumulative count of network waits since process start.
+ *
+ * One "wait" is one blocking point on a future that was NOT yet ready
+ * when the calling thread blocked on it (fdb_future_is_ready() false
+ * immediately before fdb_future_block_until_ready()).  A wave of reads
+ * started in parallel and waited on in sequence therefore counts once
+ * when the later futures have arrived by the time the first completes
+ * -- the count is the number of dependent round-trip waves the caller
+ * actually paid, the FoundationDB analogue of the NDB API's exec_waits.
+ * The client folds a transaction's GRV into its first read (or, for a
+ * blind write, into the commit), so the GRV hop is never a wait of its
+ * own; a commit is one wait; an outcome probe or fence is one wait per
+ * round.  Counted at every blocking point of the runner and of the
+ * body helpers above when the real fdb_c table is in use; a mock table
+ * (tests) is not counted.  Process-wide because the process has one
+ * client network; relaxed atomic; never on the hot path beyond one
+ * fdb_future_is_ready() per wait.
+ */
+uint64_t fdb_txn_net_waits(void);
 
 #endif /* FDB_TXN_H */

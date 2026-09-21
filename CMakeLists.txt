@@ -231,7 +231,9 @@ include_directories(
 # ---------------------------------------------------------------------------
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
-# LMDB removed -- RonDB is the only supported backend.
+# LMDB removed.  Catalogue backends are build options: ENABLE_RONDB,
+# ENABLE_MEMDB_BACKEND and ENABLE_FDB (see below); the daemon selects
+# one at startup through `catalogue_backend` in mds.conf.
 
 # pthreads
 set(THREADS_PREFER_PTHREAD_FLAG ON)

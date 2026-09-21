@@ -1168,6 +1168,17 @@ static int remove_resolve(FDBTransaction *tr, const struct remove_ctx *c,
         pl->final = true;
     } else if (pl->child_found) {
         pl->final = (pl->child.nlink <= 1U);
+        /* The caller derived its plan -- GC rows, quota delta, layout
+         * recall -- from the snapshot's link count.  A LINK or another
+         * REMOVE that landed since makes that plan wrong for this inode
+         * (a "final" snapshot with a live second link would have the
+         * caller queue a live file's DS objects for collection).
+         * Refuse instead of silently doing the other shape; the caller
+         * re-resolves (mds_catalogue.h, ns_remove_known contract). */
+        if (c->guard != NULL && (c->guard->nlink <= 1U) != pl->final) {
+            *st_out = MDS_ERR_STALE;
+            return FDB_BODY_DONE;
+        }
     }
     return FDB_BODY_COMMIT;
 }
@@ -1400,12 +1411,18 @@ static int rename_wave1(FDBTransaction *tr, const struct rename_ctx *c, struct r
     if (err != 0) {
         return (int)err;
     }
-    if (!src_found || !dp_found) {
-        *st_out = MDS_ERR_NOTFOUND;
+    /* A parent that exists but is not a directory is NOTDIR (RFC 8881
+     * 18.26.4: the saved or current filehandle is not a directory);
+     * only a missing parent or a missing source name is NOTFOUND.  A
+     * non-directory has no dirents, so the type has to be decided
+     * before the absent source name is, or the answer would be NOENT. */
+    if ((pl->sp_found && !fdb_inode_is_dir(&sp_ino)) ||
+        (dp_found && !fdb_inode_is_dir(&dp_ino))) {
+        *st_out = MDS_ERR_NOTDIR;
         return FDB_BODY_DONE;
     }
-    if (!fdb_inode_is_dir(&dp_ino)) {
-        *st_out = MDS_ERR_NOTDIR;
+    if (!src_found || !dp_found) {
+        *st_out = MDS_ERR_NOTFOUND;
         return FDB_BODY_DONE;
     }
     return FDB_BODY_COMMIT;

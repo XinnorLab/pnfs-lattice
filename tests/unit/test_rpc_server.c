@@ -184,12 +184,16 @@ static void teardown_test(struct test_ctx *ctx)
 {
     rpc_server_stop(ctx->srv);
     pthread_join(ctx->thread, NULL);
-    rpc_server_destroy(ctx->srv);
-    /* The pool must be destroyed only after the server (which uses it)
-     * is fully stopped + destroyed. */
+    /* Same order as the daemon (src/mds/main.c cleanup): the pool is
+     * joined BEFORE the server is destroyed.  Workers hold raw pointers
+     * to the server and its connections until their completion tail
+     * has run; nothing submits to the pool once the epoll loop has
+     * exited. */
     if (ctx->tp != NULL) {
         threadpool_destroy(ctx->tp);
+        ctx->tp = NULL;
     }
+    rpc_server_destroy(ctx->srv);
     open_state_table_destroy(ctx->ot);
     session_table_destroy(ctx->st);
     mds_catalogue_close(ctx->cat);
@@ -524,6 +528,112 @@ static void test_close_during_pipeline(void)
     teardown_test(&ctx);
 }
 
+/*
+ * Disconnect-after-last-request stress: the worker completion tail
+ * against the epoll thread's close.
+ *
+ * A client sends its last request and closes the socket right after
+ * the reply (even rounds) or without waiting for it (odd rounds), so
+ * the epoll thread sees HUP while the worker that served the request
+ * is in its completion tail -- cap-unit release, EPOLLIN/EPOLLOUT
+ * re-arm on the fd, slot-unit release (rpc_work_fn).  Before the
+ * two-unit reference count that tail dereferenced a connection the
+ * epoll thread could already have finalized and recycled (send_lock
+ * destroyed and re-initialised under the worker, fd closed or reused
+ * before its re-arm).  Several client threads, many rounds, cap 1 so
+ * every request also crosses the cap disarm / re-arm path; the run
+ * must be clean under TSan and every slot must be recycled (a fresh
+ * connection is still served at the end).
+ */
+#define DISC_THREADS           4
+#define DISC_ROUNDS_PER_THREAD 150
+
+struct disc_client {
+    const struct test_ctx *ctx;
+    int                    failures;
+};
+
+static void *disc_client_main(void *arg)
+{
+    struct disc_client *dc = arg;
+    uint8_t req[256];
+    uint8_t reply[4096];
+
+    for (int round = 0; round < DISC_ROUNDS_PER_THREAD; round++) {
+        uint32_t reply_len = 0;
+        uint32_t req_len;
+        int fd = connect_to_server(dc->ctx);
+
+        if (fd < 0) {
+            dc->failures++;
+            continue;
+        }
+        req_len = build_null_call(req, sizeof(req), 0x6000U + (uint32_t)round);
+        if ((round & 1) == 0) {
+            /* Reply consumed, then close: HUP reaches the epoll thread
+             * while the worker that sent the reply runs its tail. */
+            if (send_and_recv(fd, req, req_len, reply, sizeof(reply),
+                              &reply_len) != 0 || reply_len < 4) {
+                dc->failures++;
+            }
+        } else if (send_record_only(fd, req, req_len) != 0) {
+            /* Close without reading: the worker may still be processing
+             * when HUP arrives -> deferred finalize via the close stack. */
+            dc->failures++;
+        }
+        close(fd);
+    }
+    return NULL;
+}
+
+static void test_disconnect_after_last_request(void)
+{
+    struct test_ctx ctx;
+    struct disc_client clients[DISC_THREADS];
+    pthread_t tids[DISC_THREADS];
+    int started = 0;
+    int failures = 0;
+
+    setup_test_pooled(&ctx, 1);
+    if (ctx.cat == NULL) {
+        fprintf(stdout, "SKIP (no RonDB)\n");
+        tests_passed++;
+        return;
+    }
+
+    for (int i = 0; i < DISC_THREADS; i++) {
+        clients[i].ctx = &ctx;
+        clients[i].failures = 0;
+        if (pthread_create(&tids[i], NULL, disc_client_main, &clients[i]) != 0) {
+            break;
+        }
+        started++;
+    }
+    for (int i = 0; i < started; i++) {
+        pthread_join(tids[i], NULL);
+        failures += clients[i].failures;
+    }
+    ASSERT_EQ(started, DISC_THREADS);
+    ASSERT_EQ(failures, 0);
+
+    /* Every closed connection was finalized and its slot recycled: a
+     * fresh connection is accepted and answered. */
+    {
+        uint8_t req[256];
+        uint8_t reply[4096];
+        uint32_t reply_len = 0;
+        int fd = connect_to_server(&ctx);
+        uint32_t req_len = build_null_call(req, sizeof(req), 0x6fff);
+
+        ASSERT_TRUE(fd >= 0);
+        ASSERT_EQ(send_and_recv(fd, req, req_len, reply, sizeof(reply),
+                                &reply_len), 0);
+        ASSERT_TRUE(reply_len >= 4);
+        close(fd);
+    }
+    teardown_test(&ctx);
+}
+
 /* -----------------------------------------------------------------------
  * Wave 5 T5.3 -- RFC 8881 S2.10.6.1.3 NFS4ERR_REP_TOO_BIG_TO_CACHE.
  *
@@ -751,6 +861,7 @@ int main(void)
     RUN_TEST(test_multiple_connections);
     RUN_TEST(test_pipelined_requests);
     RUN_TEST(test_close_during_pipeline);
+    RUN_TEST(test_disconnect_after_last_request);
     RUN_TEST(test_rep_too_big_to_cache);
 
     fprintf(stdout, "\n  %d/%d tests passed\n",

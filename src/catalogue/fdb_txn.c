@@ -71,6 +71,27 @@ const struct fdb_txn_calls *fdb_txn_calls_real(void)
 }
 
 /* -----------------------------------------------------------------------
+ * Network-wait accounting (fdb_txn.h)
+ * ----------------------------------------------------------------------- */
+
+static _Atomic uint64_t g_net_waits;
+
+uint64_t fdb_txn_net_waits(void)
+{
+    return atomic_load_explicit(&g_net_waits, memory_order_relaxed);
+}
+
+/* Block on @p f through the real client, counting the wait when the
+ * future had not arrived yet (a ready future costs no round trip). */
+static fdb_error_t real_block(FDBFuture *f)
+{
+    if (!fdb_future_is_ready(f)) {
+        atomic_fetch_add_explicit(&g_net_waits, 1U, memory_order_relaxed);
+    }
+    return fdb_future_block_until_ready(f);
+}
+
+/* -----------------------------------------------------------------------
  * Body helpers (real fdb_c)
  * ----------------------------------------------------------------------- */
 
@@ -81,7 +102,7 @@ fdb_error_t fdb_txn_wait(FDBFuture *f)
     if (f == NULL) {
         return FDB_ERR_PLATFORM_ERROR;
     }
-    err = fdb_future_block_until_ready(f);
+    err = real_block(f);
     if (err != 0) {
         return err;
     }
@@ -331,6 +352,16 @@ static void stat_inc(_Atomic uint64_t *ctr)
     atomic_fetch_add_explicit(ctr, 1U, memory_order_relaxed);
 }
 
+/* The runner's own blocking points: counted like a body wait when the
+ * real table is in use; a mock table has no futures on the wire. */
+static fdb_error_t rs_block(const struct run_state *rs, FDBFuture *f)
+{
+    if (rs->c == &g_real_calls) {
+        return real_block(f);
+    }
+    return rs->c->future_block_until_ready(f);
+}
+
 static uint64_t remaining_ms(const struct run_state *rs)
 {
     uint64_t now = rs->c->now_ns();
@@ -376,7 +407,7 @@ static fdb_error_t back_off(const struct run_state *rs, FDBTransaction *tr, fdb_
     if (f == NULL) {
         return err;
     }
-    rerr = rs->c->future_block_until_ready(f);
+    rerr = rs_block(rs, f);
     if (rerr == 0) {
         rerr = rs->c->future_get_error(f);
     }
@@ -394,7 +425,7 @@ static fdb_error_t commit_wait(const struct run_state *rs, FDBTransaction *tr)
     if (cf == NULL) {
         return FDB_ERR_PLATFORM_ERROR;
     }
-    err = rs->c->future_block_until_ready(cf);
+    err = rs_block(rs, cf);
     if (err == 0) {
         err = rs->c->future_get_error(cf);
     }
@@ -428,7 +459,7 @@ static fdb_error_t witness_probe(const struct run_state *rs, FDBTransaction *tr2
     if (f == NULL) {
         return FDB_ERR_PLATFORM_ERROR;
     }
-    err = rs->c->future_block_until_ready(f);
+    err = rs_block(rs, f);
     if (err == 0) {
         err = rs->c->future_get_error(f);
     }
@@ -600,7 +631,7 @@ static fdb_error_t pin_read_version(const struct run_state *rs, FDBTransaction *
     if (f == NULL) {
         return FDB_ERR_PLATFORM_ERROR;
     }
-    err = rs->c->future_block_until_ready(f);
+    err = rs_block(rs, f);
     if (err == 0) {
         err = rs->c->future_get_error(f);
     }

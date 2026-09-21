@@ -411,10 +411,61 @@ static const struct mds_catalogue_ops fdb_lifecycle_ops = {
 };
 
 /* -----------------------------------------------------------------------
+ * Client-side counters (mds_cat_backend_client_stats)
+ *
+ * The runner's counters (fdb_txn.h) in the backend-neutral shape the
+ * RonDB shim fills from the NDB API, so a workload phase can be costed
+ * the same way on both backends (sample before and after, divide the
+ * delta by the operation count):
+ *   exec_waits     network waits -- blocking points on a future that had
+ *                  not arrived (fdb_txn_net_waits: a parallel read wave
+ *                  counts once, the GRV is folded into the first read,
+ *                  a commit is one wait); process-wide, like the client
+ *                  network thread it measures
+ *   txn_started    body executions (attempts), read-only ones included
+ *   txn_committed  commits reported committed (witness-resolved landings
+ *                  included)
+ *   txn_aborted    definitive aborts that were re-run (retries)
+ *   txn_closed     attempts that did not commit (read-only bodies,
+ *                  FDB_BODY_DONE outcomes, aborts)
+ *   client_objects 1 (one database handle)
+ * The remaining fields have no FoundationDB counterpart and stay 0.
+ * ----------------------------------------------------------------------- */
+
+static uint64_t stat_read(const _Atomic uint64_t *ctr)
+{
+    return atomic_load_explicit(ctr, memory_order_relaxed);
+}
+
+static enum mds_status fdb_backend_client_stats(struct mds_catalogue *cat,
+                                                struct mds_cat_backend_client_stats *out)
+{
+    struct fdb_backend *b = fdb_of(cat);
+    uint64_t attempts;
+    uint64_t commits;
+
+    if (b == NULL || out == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    attempts = stat_read(&b->stats.attempts);
+    commits = stat_read(&b->stats.commits);
+    memset(out, 0, sizeof(*out));
+    out->exec_waits = fdb_txn_net_waits();
+    out->txn_started = attempts;
+    out->txn_committed = commits;
+    out->txn_aborted = stat_read(&b->stats.retries);
+    out->txn_closed = (attempts > commits) ? attempts - commits : 0;
+    out->client_objects = 1;
+    return MDS_OK;
+}
+
+/* -----------------------------------------------------------------------
  * Vtables.  The authority table is assembled once per process from the
  * slot units' registration hooks (under g_net_lock, before any handle
- * is published) and then only ever read.  Coordination and cluster
- * tables are added by their follow-up units the same way.
+ * is published) and then only ever read.  The coordination and cluster
+ * tables are constant objects exported by catalogue_fdb_coord.c and
+ * catalogue_fdb_cluster.c (fdb_coordination_ops, fdb_cluster_ops) and
+ * are installed by catalogue_fdb_open().
  * ----------------------------------------------------------------------- */
 
 static struct mds_authority_ops g_auth_ops;
@@ -427,6 +478,7 @@ static void tables_assemble(void)
         memset(&g_auth_ops, 0, sizeof(g_auth_ops));
         catalogue_fdb_ns_register(&g_auth_ops);
         catalogue_fdb_ext_register(&g_auth_ops);
+        g_auth_ops.backend_client_stats = fdb_backend_client_stats;
         g_tables_ready = true;
     }
     (void)pthread_mutex_unlock(&g_net_lock);

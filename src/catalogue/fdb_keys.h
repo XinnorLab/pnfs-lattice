@@ -53,39 +53,41 @@
  *   XATTR           + be64 fileid + name             -> raw value bytes
  *   INLINE          + be64 fileid                    -> raw data bytes
  *   GC              + be64 gc_seq                    -> fdb_gc codec
- *   REMOVE_PENDING  + be64 remove_seq                -> codec (follow-up)
- *   LAYOUT_STATE    + stateid_other[12]              -> codec (follow-up)
+ *   REMOVE_PENDING  + be64 remove_seq                -> fdb_remove_pending codec
+ *   LAYOUT_STATE    + stateid_other[12]              -> fdb_layout codec
  *   LAYOUT_BY_FILE  + be64 fileid + stateid_other[12]        -> empty
  *   LAYOUT_BY_CLIENT+ be64 clientid + stateid_other[12]      -> empty
  *   DS_LAYOUT_IDX   + be32 ds_id + be64 clientid + be64 fileid
  *                   + stateid_other[12]                      -> empty
- *   OPEN            + stateid_other[12]              -> codec (follow-up)
+ *   OPEN            + stateid_other[12]              -> fdb_open codec
  *   OPEN_BY_FILE    + be64 fileid + stateid_other[12]        -> empty
  *   OPEN_BY_CLIENT  + be64 clientid + stateid_other[12]      -> empty
- *   LOCK            + be64 fileid + be64 lock_id     -> codec (follow-up)
+ *   LOCK            + be64 fileid + be64 lock_id     -> fdb_lock codec
  *   LOCK_BY_OWNER   + be64 clientid + be32 owner_len + owner bytes
  *                   + be64 fileid + be64 lock_id             -> empty
- *   DELEG           + stateid_other[12]              -> codec (follow-up)
+ *   DELEG           + stateid_other[12]              -> fdb_deleg codec
  *   DELEG_BY_FILE   + be64 fileid + stateid_other[12]        -> empty
  *   DELEG_BY_CLIENT + be64 clientid + stateid_other[12]      -> empty
- *   CLIENT          + be64 clientid                  -> codec (follow-up)
- *   SESSION         + session_id[16]                 -> codec (follow-up)
+ *   CLIENT          + be64 clientid                  -> fdb_client codec
+ *   SESSION         + session_id[16]                 -> fdb_session codec
  *   SESSION_BY_CLIENT + be64 clientid + session_id[16]       -> empty
- *   SLOT            + session_id[16] + be32 slot_id  -> codec (follow-up)
- *   RECOVERY        + be64 clientid                  -> codec (follow-up)
+ *   SLOT            + session_id[16] + be32 slot_id  -> fdb_slot codec
+ *   RECOVERY        + be64 clientid                  -> fdb_recovery codec
  *   RECOVERY_BY_OWNER + be32 owner_mds_id + be64 clientid    -> empty
- *   JOURNAL         + be64 txn_id + u8 role          -> codec (follow-up)
- *   DS              + be32 ds_id                     -> codec (follow-up)
- *   DS_PROVISION    + be32 ds_id                     -> codec (follow-up)
- *   QUOTA_RULE      + u8 scope_type + be64 scope_id  -> codec (follow-up)
- *   QUOTA_USAGE     + u8 usage_type + be64 scope_id  -> codec (follow-up)
+ *   JOURNAL         + be64 txn_id + u8 role          -> fdb_journal codec
+ *   DS              + be32 ds_id                     -> fdb_ds_info codec
+ *   DS_PROVISION    + be32 ds_id                     -> fdb_ds_provision codec
+ *   QUOTA_RULE      + u8 scope_type + be64 scope_id  -> fdb_quota_rule codec
+ *   QUOTA_USAGE     + u8 usage_type + be64 scope_id  -> fdb_quota_usage codec
  *   SHARD_FILEID    + be64 fileid                    -> LE u32 shard_id
- *   EXT_DIRENT      + be64 parent + name             -> codec (follow-up)
- *   LINK_ANCHOR     + be64 anchor_id                 -> codec (follow-up)
- *   PREALLOC        + be64 fileid                    -> codec (follow-up)
- *   PREALLOC_BY_OWNER + be32 owner_mds_id + be64 fileid      -> empty
- *   NODE_REGISTRY   + be32 mds_id                    -> codec (follow-up)
- *   PARTITION_MAP   + be32 partition_id              -> codec (follow-up)
+ *   EXT_DIRENT      + be64 parent + name             -> fdb_ext_dirent codec
+ *   LINK_ANCHOR     + be64 anchor_id                 -> fdb_link_anchor codec
+ *   PREALLOC        + be64 fileid                    -> reserved, never written:
+ *   PREALLOC_BY_OWNER + be32 owner_mds_id + be64 fileid   the prealloc_pool_*
+ *     slots are NULL on this backend (catalogue_fdb_ext.c), so the DS
+ *     prealloc engine runs in memory only, as on memdb.
+ *   NODE_REGISTRY   + be32 mds_id                    -> fdb_node codec
+ *   PARTITION_MAP   + be32 partition_id              -> fdb_partition codec
  *   WITNESS         + be32 mds_id + be64 epoch + be32 slot   -> LE u64 seq
  *     commit-outcome witness (fdb_txn.h); epoch is the process-wide
  *     incarnation stamp, slot the worker's witness slot.
@@ -336,9 +338,10 @@ static inline void fdb_key_range_single(struct fdb_key_range *r, const struct fd
 }
 
 /* -----------------------------------------------------------------------
- * Typed builders for the tables the core and namespace slots use.  The
- * follow-up slot files build their keys with the generic appenders in
- * the layouts documented above.
+ * Typed builders for the tables the core, namespace and extended slots
+ * use.  The coordination and cluster slots (catalogue_fdb_coord.c,
+ * catalogue_fdb_cluster.c) build their keys with the generic appenders
+ * in the layouts documented above.
  * ----------------------------------------------------------------------- */
 
 static inline void fdb_key_meta(struct fdb_key *k, const struct fdb_key_prefix *p,

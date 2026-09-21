@@ -11,6 +11,7 @@
  * store without colliding.
  */
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +22,8 @@
 #include "harness.h"
 #ifdef HAVE_FDB
 #include "catalogue_fdb.h"
+#include "catalogue_internal.h"
+#include "fdb_txn.h"
 #endif
 
 /* Bounded table of scratch directories created by this process so the
@@ -144,11 +147,143 @@ static enum mds_status open_rondb(struct mds_catalogue **out)
  * the client network (mds_catalogue_process_shutdown; terminal for the
  * process).  An atexit() hook runs the same teardown for a main that
  * exits without the explicit call.
+ *
+ * The teardown clears in two steps.  catalogue_fdb_keyspace_clear runs
+ * through the transaction runner and therefore must leave the WITNESS
+ * table alone (fdb_txn.h, body rule) -- and writes its own witness row
+ * -- so on its own it leaves exactly the run's WITNESS rows behind.
+ * fdb_sweep_prefix() then wipes the whole prefix, WITNESS included,
+ * with a bare fdb_c transaction outside the runner and reads the range
+ * back.  That is safe only because every handle of this process is
+ * closed by then (no attempt is in flight whose outcome those rows
+ * could still resolve) and the prefix is private to this process.
  */
 static pthread_mutex_t g_fdb_lock = PTHREAD_MUTEX_INITIALIZER;
 static char            g_fdb_prefix[32];
 static bool            g_fdb_prepared;
 static bool            g_fdb_torn_down;
+
+/** Attempts of the bare sweep's clear and of its read-back, each on a
+ *  fresh transaction with a linear backoff between them. */
+#define FDB_SWEEP_ROUNDS 8
+/** Backoff step between attempts, ms (round n sleeps n * step). */
+#define FDB_SWEEP_BACKOFF_MS 50U
+/** Per-attempt timeout of the bare sweep and its read-back, ms. */
+#define FDB_SWEEP_TIMEOUT_MS 4000U
+/** Rows the read-back fetches at most; more than that reports "+". */
+#define FDB_SWEEP_READBACK_LIMIT 16
+
+static void sweep_sleep_ms(unsigned ms)
+{
+    struct timespec ts;
+
+    ts.tv_sec = (time_t)(ms / 1000U);
+    ts.tv_nsec = (long)(ms % 1000U) * 1000000L;
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+        /* resume the remainder */
+    }
+}
+
+/* Errors after which a fresh attempt is safe: everything the client
+ * itself calls retryable, plus 1025 / 1031, whose commit MAY still be
+ * in flight -- harmless here because a range clear is idempotent (an
+ * attempt landing late clears an already empty range).  The client's
+ * fault injection reports 1031 for a commit it issues late, so the
+ * buggify children hit this. */
+static bool sweep_retryable(fdb_error_t err)
+{
+    return fdb_error_predicate(FDB_ERROR_PREDICATE_RETRYABLE, err) != 0 ||
+           err == FDB_ERR_TRANSACTION_CANCELLED || err == FDB_ERR_TRANSACTION_TIMED_OUT;
+}
+
+/* One attempt on a fresh transaction: commit a clear of @p r, or
+ * (@p readback) count the rows of @p r with a snapshot read.  The
+ * transaction is never reused: after 1025 / 1031 a commit may still
+ * own it (fdb_txn.h). */
+static fdb_error_t sweep_attempt(FDBDatabase *db, const struct fdb_key_range *r, bool readback,
+                                 int *remaining, bool *more)
+{
+    FDBTransaction *tr = NULL;
+    FDBFuture *f = NULL;
+    const FDBKeyValue *kvs = NULL;
+    fdb_error_t err = fdb_database_create_transaction(db, &tr);
+
+    if (err != 0 || tr == NULL) {
+        return err != 0 ? err : FDB_ERR_PLATFORM_ERROR;
+    }
+    err = fdb_txn_set_timeout(tr, FDB_SWEEP_TIMEOUT_MS);
+    if (err == 0) {
+        if (readback) {
+            f = fdb_txn_get_range_start(tr, r, FDB_SWEEP_READBACK_LIMIT, true, false);
+            err = fdb_txn_get_range_wait(f, &kvs, remaining, more);
+        } else {
+            fdb_txn_clear_range(tr, r);
+            f = fdb_transaction_commit(tr);
+            err = fdb_txn_wait(f);
+        }
+        if (f != NULL) {
+            fdb_future_destroy(f);
+        }
+    }
+    fdb_transaction_destroy(tr);
+    return err;
+}
+
+static fdb_error_t sweep_with_retry(FDBDatabase *db, const struct fdb_key_range *r,
+                                    bool readback, int *remaining, bool *more)
+{
+    fdb_error_t err = 0;
+    int round;
+
+    for (round = 0; round < FDB_SWEEP_ROUNDS; round++) {
+        err = sweep_attempt(db, r, readback, remaining, more);
+        if (err == 0 || !sweep_retryable(err)) {
+            break;
+        }
+        sweep_sleep_ms(FDB_SWEEP_BACKOFF_MS * (unsigned)(round + 1));
+    }
+    return err;
+}
+
+/*
+ * Range-clear [prefix, strinc(prefix)) with bare fdb_c transactions
+ * and read the range back with a fresh snapshot read (its read version
+ * is causally after a committed clear).  The read-back runs even when
+ * every clear attempt reported an error: a clear reported as 1031 may
+ * have landed, and the row count is what the caller reports.  Refuses
+ * an empty prefix (that would erase the whole database).
+ *
+ * @param b          Backend of a still-open handle (its database).
+ * @param remaining  Receives the row count the read-back saw (-1 when
+ *                   the read-back itself failed).
+ * @param more       Receives whether the read-back hit its limit.
+ * @return 0, or the fdb_error_t of the clear (first) or the read-back.
+ */
+static fdb_error_t fdb_sweep_prefix(const struct fdb_backend *b, int *remaining, bool *more)
+{
+    struct fdb_key base;
+    struct fdb_key_range r;
+    fdb_error_t err;
+    fdb_error_t rerr;
+
+    *remaining = -1;
+    *more = false;
+    if (b->prefix.len == 0) {
+        return FDB_ERR_PLATFORM_ERROR;
+    }
+    base.len = b->prefix.len;
+    base.overflow = false;
+    memcpy(base.buf, b->prefix.bytes, b->prefix.len);
+    if (!fdb_key_range_prefix(&r, &base)) {
+        return FDB_ERR_PLATFORM_ERROR;
+    }
+    err = sweep_with_retry(b->db, &r, false, remaining, more);
+    rerr = sweep_with_retry(b->db, &r, true, remaining, more);
+    if (rerr != 0) {
+        *remaining = -1;
+    }
+    return err != 0 ? err : rerr;
+}
 
 static void fdb_fill_cfg(struct mds_config *cfg)
 {
@@ -166,11 +301,16 @@ static void fdb_fill_cfg(struct mds_config *cfg)
 }
 
 /* Once per process, after the last test handle is closed: wipe the
- * run's rows with a fresh handle, then stop the client network. */
+ * run's rows with a fresh handle (catalogue rows through the runner,
+ * then the whole prefix with the bare sweep), report what the read-back
+ * still sees, then stop the client network. */
 static void fdb_teardown_once(void)
 {
     struct mds_config *cfg;
     struct mds_catalogue *cat = NULL;
+    int remaining = -1;
+    bool more = false;
+    fdb_error_t err;
 
     pthread_mutex_lock(&g_fdb_lock);
     if (!g_fdb_prepared || g_fdb_torn_down) {
@@ -185,6 +325,18 @@ static void fdb_teardown_once(void)
         fdb_fill_cfg(cfg);
         if (mds_catalogue_open(cfg, &cat) == MDS_OK) {
             (void)catalogue_fdb_keyspace_clear(cat);
+            err = fdb_sweep_prefix(cat->backend_private, &remaining, &more);
+            if (remaining == 0) {
+                (void)printf("conformance: fdb prefix '%s' swept, 0 rows remain\n",
+                             g_fdb_prefix);
+            } else if (remaining < 0) {
+                (void)fprintf(stderr, "conformance: fdb prefix '%s' sweep failed: %d %s\n",
+                              g_fdb_prefix, (int)err, fdb_get_error(err));
+            } else {
+                (void)fprintf(stderr, "conformance: fdb prefix '%s' still holds %d%s row(s) "
+                              "after the sweep (clear: %d %s)\n", g_fdb_prefix, remaining,
+                              more ? "+" : "", (int)err, fdb_get_error(err));
+            }
             mds_catalogue_close(cat);
         }
         free(cfg);

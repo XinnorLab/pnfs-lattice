@@ -42,6 +42,10 @@ target_include_directories(conformance_harness PRIVATE
     ${PROJECT_SOURCE_DIR}/tests
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+# The fdb teardown sweeps the run prefix with bare fdb_c calls.
+if(ENABLE_FDB)
+    target_include_directories(conformance_harness SYSTEM PRIVATE ${FDB_INCLUDE_DIR})
+endif()
 
 set(CONFORMANCE_LINK_LIBS
     pnfs_mds_core

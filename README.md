@@ -120,10 +120,14 @@ Schema tables: `inodes`, `dirents`, `stripe_map`, `layout_state`,
 ### Pluggable Catalogue Layer
 
 Backend selection is determined at startup by `catalogue_backend` in the
-daemon config.  The catalogue vtable (`catalogue_dispatch.c`) routes all
-namespace operations to the active backend.  Adding a new backend requires
-implementing the `mds_cat_authority_ops` function table and a factory entry
-in `catalogue_factory.c`.
+daemon config (`rondb`, `memdb` or `fdb`).  The catalogue dispatcher
+(`catalogue_dispatch.c`) routes every namespace, coordination and cluster
+operation to the active backend and never names one.  Adding a new backend
+means implementing the slot tables of `include/catalogue_internal.h`
+(`mds_authority_ops`, `mds_coordination_ops`, `mds_cluster_ops`,
+`mds_catalogue_ops`), adding a registration entry in `catalogue_factory.c`,
+and running the conformance suite (`tests/catalogue_conformance/`) against
+it.
 
 ## Multi-MDS Concurrency
 
@@ -379,8 +383,9 @@ schema_name    = pnfs_mds
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `catalogue_backend` | `rondb` | Catalogue backend (only `rondb` is supported today) |
-| `catalogue_backend_conf` | — | Path to backend-specific config |
+| `catalogue_backend` | `rondb` | Catalogue backend: `rondb`, `memdb` (in-memory reference, single node) or `fdb` (FoundationDB, `ENABLE_FDB` builds) |
+| `catalogue_backend_conf` | — | Path to backend-specific config (rondb) |
+| `fdb_cluster_file` / `fdb_key_prefix` | — | FoundationDB cluster file and per-catalogue key prefix (fdb) |
 | `worker_threads` | auto | RPC worker count |
 | `lease_time_sec` | 90 | NFSv4 lease time |
 | `grace_period_sec` | 90 | Grace period duration |

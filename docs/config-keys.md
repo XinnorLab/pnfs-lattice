@@ -16,8 +16,12 @@ are logged as `WARN:` and the default is kept.
 - `cluster_ca_file` / `node_cert_file` / `node_key_file` — cluster TLS material.
 - `require_mtls` — bool; require peer mTLS.  Default: false.
 ## Catalogue
-- `catalogue_backend` — `rondb` (only option).  Default: rondb.
-- `catalogue_backend_conf` — backend-specific config path.
+- `catalogue_backend` — `rondb|memdb|fdb`.  Default: rondb when compiled in, otherwise mandatory; a known backend that is not compiled in is refused at startup.
+- `catalogue_backend_conf` — backend-specific config path (rondb).
+- `fdb_cluster_file` — FoundationDB cluster file (fdb).  Default: `FDB_CLUSTER_FILE`, then `/etc/foundationdb/fdb.cluster`.
+- `fdb_key_prefix` — key prefix of this catalogue inside the cluster, at most 31 bytes (fdb).  Default: empty.
+- `fdb_op_deadline_ms` — per-operation budget across attempts, 1..600000 (fdb).  Default: 8000.
+- `fdb_txn_timeout_ms` — per-attempt transaction timeout, 1..4900 (fdb).  Default: 4000.
 - `catalog_image_mode` — `off|shadow|compare|primary`.  Default: off.
 - `catalog_compare_reads` — enable image-vs-authority compare reads.  Default: false.
 - `catalog_replay_mode` — `off|log|journal`.  Default: off.

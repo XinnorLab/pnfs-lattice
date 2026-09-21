@@ -1160,17 +1160,23 @@ static enum mds_status memdb_rename_check_locked(const struct memdb *m,
     p->didx = -1;
     p->dcidx = -1;
 
+    /* A parent that exists but is not a directory is NOTDIR (RFC 8881
+     * 18.26.4), decided before the source name is looked up: a
+     * non-directory has no dirents, so the name is always missing under
+     * it and the answer would otherwise degrade to NOTFOUND.  Same
+     * order as the RonDB shim and the fdb backend. */
+    p->spidx = memdb_inode_find(m, src_parent);
+    p->dpidx = memdb_inode_find(m, dst_parent);
+    if ((p->spidx >= 0 && m->inodes[p->spidx].ino.type != MDS_FTYPE_DIR) ||
+        (p->dpidx >= 0 && m->inodes[p->dpidx].ino.type != MDS_FTYPE_DIR)) {
+        return MDS_ERR_NOTDIR;
+    }
     p->sidx = memdb_dirent_find(m, src_parent, src_name);
     if (p->sidx < 0) {
         return MDS_ERR_NOTFOUND;
     }
-    p->spidx = memdb_inode_find(m, src_parent);
-    p->dpidx = memdb_inode_find(m, dst_parent);
     if (p->dpidx < 0) {
         return MDS_ERR_NOTFOUND;
-    }
-    if (m->inodes[p->dpidx].ino.type != MDS_FTYPE_DIR) {
-        return MDS_ERR_NOTDIR;
     }
     p->src_fid = m->dirents[p->sidx].child_fileid;
     p->scidx = memdb_inode_find(m, p->src_fid);

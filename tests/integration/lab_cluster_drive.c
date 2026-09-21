@@ -5,8 +5,9 @@
  * lab_cluster_drive.c -- Lab driver for the cluster-service contract
  * and the namespace guards against a LIVE store.
  *
- * Not a ctest: it opens the RonDB catalogue named by RONDB_CONF (the
- * same file the daemon uses) and drives the public dispatchers
+ * Not a ctest: it opens the catalogue the daemons use -- RonDB named by
+ * RONDB_CONF, or FoundationDB named by FDB_CLUSTER_FILE + the
+ * deployment's FDB_KEY_PREFIX -- and drives the public dispatchers
  * (mds_cluster_*, mds_coord_recovery_*, mds_cat_ns_*) so the lab can
  * observe the store's answers next to running daemons -- dump the node
  * registry and partition map, heartbeat or deregister with a chosen
@@ -15,6 +16,14 @@
  *
  * Usage:
  *   RONDB_CONF=/etc/pnfs-mds/rondb.conf lab_cluster_drive [--mds-id N] CMD ...
+ *   FDB_CLUSTER_FILE=/etc/foundationdb/fdb.cluster FDB_KEY_PREFIX=lab \
+ *       lab_cluster_drive --backend fdb [--mds-id N] CMD ...
+ *
+ *   --backend rondb|fdb  store to open; default: $CATALOGUE_TEST_BACKEND,
+ *                        then rondb.  fdb needs FDB_KEY_PREFIX set (the
+ *                        daemons' fdb_key_prefix; may be empty) and reads
+ *                        FDB_CLUSTER_FILE (default /etc/foundationdb/
+ *                        fdb.cluster).
  *
  *   nodes                              dump mds_node_registry
  *   partitions                         dump mds_partition_map
@@ -34,18 +43,37 @@
  *   dirent-get PARENT_FILEID NAME      dirent row alone
  *   getattr FILEID                     inode row alone
  *   scrub                              dangling-dirent census: root and
- *                                      every conf-* / lab-ns-* scratch
- *                                      directory under it (two levels),
- *                                      each dirent's inode read back;
- *                                      run after every RonDB conformance
- *                                      run so a dirent left pointing at
- *                                      a deleted inode is caught with
- *                                      the run that produced it
+ *                                      every conf-* / lab-ns-* / lab-bench-*
+ *                                      scratch directory under it (two
+ *                                      levels), each dirent's inode read
+ *                                      back; run after every conformance
+ *                                      run against a live store so a
+ *                                      dirent left pointing at a deleted
+ *                                      inode is caught with the run that
+ *                                      produced it
+ *   walk                               full readdir + getattr consistency
+ *                                      walk: EVERY directory reachable
+ *                                      from the root (depth-bounded),
+ *                                      every dirent's inode read back;
+ *                                      the post-fault census
+ *   bench N                            round-trip accounting loop: N x
+ *                                      (create + getattr + lookup + remove)
+ *                                      of one file in a fresh lab-bench-*
+ *                                      directory; per operation class
+ *                                      mean / p50 / p99 latency and the
+ *                                      backend_client_stats deltas per
+ *                                      call (exec_waits = round-trip
+ *                                      waves, txn_started / committed)
+ *   stats                              print mds_cat_backend_client_stats
+ *   bootstrap                          mds_catalogue_bootstrap (idempotent:
+ *                                      schema stamp, counters, root inode)
+ *                                      so the driver can run before any
+ *                                      daemon has started on the store
  *
  * Every store answer is printed as its mds_status name.  Exit status:
  * 0 when the command ran (the printed status is the result), 2 when a
- * probe of ns-semantics failed or scrub found a dangling dirent, 1 on
- * usage or open errors.
+ * probe of ns-semantics failed or scrub / walk found a dangling dirent,
+ * 1 on usage or open errors.
  *
  * --mds-id sets the handle's own identity (default 99): recovery rows
  * written through this handle carry it as their owner, so it must not
@@ -69,14 +97,18 @@
 static int usage(void)
 {
     (void)fprintf(stderr,
-        "usage: RONDB_CONF=<rondb.conf> lab_cluster_drive [--mds-id N] CMD ...\n"
+        "usage: RONDB_CONF=<rondb.conf> lab_cluster_drive [--backend rondb] "
+        "[--mds-id N] CMD ...\n"
+        "       FDB_CLUSTER_FILE=<fdb.cluster> FDB_KEY_PREFIX=<prefix> "
+        "lab_cluster_drive --backend fdb [--mds-id N] CMD ...\n"
         "  nodes | partitions | register ID EPOCH HOST | heartbeat ID EPOCH |\n"
         "  deregister ID EPOCH | scan-stale STALE_MS |\n"
         "  partition-put PID OWNER STATE PATH INSERT_ONLY |\n"
         "  partition-cas PID EXPECTED NEW STATE | recovery-list OWNER |\n"
         "  journal-list | journal-del TXN_ID ROLE |\n"
         "  ns-semantics | readdir PARENT | lookup PARENT NAME |\n"
-        "  dirent-get PARENT NAME | getattr FILEID | scrub\n");
+        "  dirent-get PARENT NAME | getattr FILEID | scrub | walk |\n"
+        "  bench N | stats | bootstrap\n");
     return 1;
 }
 
@@ -133,38 +165,89 @@ static bool parse_u32(const char *s, uint32_t *out)
     return true;
 }
 
-static struct mds_catalogue *open_rondb(uint32_t mds_id)
+/* Fill the backend selection of @p cfg from the environment; false
+ * (with a diagnostic) when the backend is not built in or its
+ * environment is incomplete. */
+static bool fill_backend_cfg(struct mds_config *cfg, const char *backend)
 {
-    const char *conf = getenv("RONDB_CONF");
+    if (strcmp(backend, "rondb") == 0) {
+        const char *conf = getenv("RONDB_CONF");
+
+        if (!mds_catalogue_backend_available(MDS_BACKEND_RONDB)) {
+            (void)fprintf(stderr, "rondb backend not compiled in\n");
+            return false;
+        }
+        if (conf == NULL || conf[0] == '\0') {
+            (void)fprintf(stderr, "RONDB_CONF is not set\n");
+            return false;
+        }
+        cfg->catalogue_backend = MDS_BACKEND_RONDB;
+        (void)snprintf(cfg->catalogue_backend_conf,
+                       sizeof(cfg->catalogue_backend_conf), "%s", conf);
+        cfg->ndb_conn_pool_size = 1;
+        cfg->ndb_async_writes = false;
+        return true;
+    }
+    if (strcmp(backend, "fdb") == 0) {
+        const char *cluster = getenv("FDB_CLUSTER_FILE");
+        const char *prefix = getenv("FDB_KEY_PREFIX");
+
+        if (!mds_catalogue_backend_available(MDS_BACKEND_FDB)) {
+            (void)fprintf(stderr, "fdb backend not compiled in\n");
+            return false;
+        }
+        /* The prefix selects the deployment's keyspace; an unset
+         * variable would silently address the empty-prefix keyspace. */
+        if (prefix == NULL) {
+            (void)fprintf(stderr, "FDB_KEY_PREFIX is not set (the daemons' "
+                          "fdb_key_prefix; may be empty)\n");
+            return false;
+        }
+        if (strlen(prefix) >= sizeof(cfg->fdb_key_prefix)) {
+            (void)fprintf(stderr, "FDB_KEY_PREFIX longer than %zu bytes\n",
+                          sizeof(cfg->fdb_key_prefix) - 1);
+            return false;
+        }
+        cfg->catalogue_backend = MDS_BACKEND_FDB;
+        if (cluster != NULL && cluster[0] != '\0') {
+            (void)snprintf(cfg->fdb_cluster_file, sizeof(cfg->fdb_cluster_file),
+                           "%s", cluster);
+        }
+        (void)snprintf(cfg->fdb_key_prefix, sizeof(cfg->fdb_key_prefix), "%s",
+                       prefix);
+        return true;
+    }
+    (void)fprintf(stderr, "unknown backend '%s' (expected rondb|fdb)\n", backend);
+    return false;
+}
+
+static struct mds_catalogue *open_store(const char *backend, uint32_t mds_id)
+{
     struct mds_config *cfg;
     struct mds_catalogue *cat = NULL;
     enum mds_status st;
 
-    if (conf == NULL || conf[0] == '\0') {
-        (void)fprintf(stderr, "RONDB_CONF is not set\n");
-        return NULL;
-    }
     /* struct mds_config is large; never on the stack. */
     cfg = calloc(1, sizeof(*cfg));
     if (cfg == NULL) {
         return NULL;
     }
-    cfg->catalogue_backend = MDS_BACKEND_RONDB;
-    (void)snprintf(cfg->catalogue_backend_conf,
-                   sizeof(cfg->catalogue_backend_conf), "%s", conf);
+    if (!fill_backend_cfg(cfg, backend)) {
+        free(cfg);
+        return NULL;
+    }
     cfg->self.id = mds_id;
     (void)snprintf(cfg->self.hostname, sizeof(cfg->self.hostname),
                    "lab-drive");
     cfg->cluster_size = 1;
-    cfg->ndb_conn_pool_size = 1;
-    cfg->ndb_async_writes = false;
     cfg->catalog_image_mode = MDS_IMAGE_OFF;
     cfg->catalog_replay_mode = MDS_REPLAY_OFF;
 
     st = mds_catalogue_open(cfg, &cat);
     free(cfg);
     if (st != MDS_OK || cat == NULL) {
-        (void)fprintf(stderr, "mds_catalogue_open: %s\n", mds_status_str(st));
+        (void)fprintf(stderr, "mds_catalogue_open(%s): %s\n", backend,
+                      mds_status_str(st));
         return NULL;
     }
     return cat;
@@ -343,6 +426,32 @@ static void ns_semantics(struct mds_catalogue *cat, struct probe *p)
         (void)mds_cat_ns_remove(cat, NULL, scratch.fileid, "src_a");
     } else {
         probe_result(p, false, "rename over non-empty dir", "setup failed");
+    }
+
+    /* RENAME whose source or destination "directory" is a regular file:
+     * NOTDIR (RFC 8881 18.26.4, pynfs RNM2* / RNM3*), never NOENT for
+     * the name that a non-directory cannot hold; nothing changes. */
+    if (mk(cat, scratch.fileid, "notdir", MDS_FTYPE_REG, &f) &&
+        mk(cat, scratch.fileid, "mv_me", MDS_FTYPE_REG, &dirtarget)) {
+        enum mds_status st_sp = mds_cat_ns_rename(cat, NULL, f.fileid, "x",
+                                                  scratch.fileid, "y");
+        enum mds_status st_dp = mds_cat_ns_rename(cat, NULL, scratch.fileid,
+                                                  "mv_me", f.fileid, "y");
+        bool intact = mds_cat_ns_lookup(cat, scratch.fileid, "mv_me", &seen) ==
+                          MDS_OK && seen.fileid == dirtarget.fileid;
+
+        (void)snprintf(detail, sizeof(detail),
+                       "source parent a file -> %s; destination parent a "
+                       "file -> %s; source name intact=%d",
+                       mds_status_str(st_sp), mds_status_str(st_dp),
+                       (int)intact);
+        probe_result(p, st_sp == MDS_ERR_NOTDIR && st_dp == MDS_ERR_NOTDIR &&
+                     intact, "rename with a non-directory parent", detail);
+        (void)mds_cat_ns_remove(cat, NULL, scratch.fileid, "mv_me");
+        (void)mds_cat_ns_remove(cat, NULL, scratch.fileid, "notdir");
+    } else {
+        probe_result(p, false, "rename with a non-directory parent",
+                     "setup failed");
     }
 
     /* RENAME over an empty directory: OK, victim inode gone, name
@@ -672,11 +781,18 @@ static int scrub_collect_cb(const struct mds_cat_dirent *entry, void *arg)
 static bool scrub_is_scratch(const char *name)
 {
     return strncmp(name, "conf-", 5) == 0 ||
-           strncmp(name, "lab-ns-", 7) == 0;
+           strncmp(name, "lab-ns-", 7) == 0 ||
+           strncmp(name, "lab-bench-", 10) == 0;
 }
 
+/* Directories a `walk` visits at most (bounds the census on a store
+ * with a runaway namespace). */
+#define WALK_MAX_DIRS 100000U
+
+/* @p all: descend into every directory (walk); otherwise only into the
+ * scratch directories directly under the root (scrub). */
 static void scrub_dir(struct mds_catalogue *cat, uint64_t dir,
-                      const char *dir_name, int depth,
+                      const char *dir_name, int depth, bool all,
                       struct scrub_totals *t)
 {
     struct scrub_page *page = calloc(1, sizeof(*page));
@@ -685,6 +801,12 @@ static void scrub_dir(struct mds_catalogue *cat, uint64_t dir,
     uint32_t i;
 
     if (page == NULL) {
+        return;
+    }
+    if (t->dirs >= WALK_MAX_DIRS) {
+        (void)printf("  walk bound of %u directories reached; stopping\n",
+                     WALK_MAX_DIRS);
+        free(page);
         return;
     }
     st = mds_cat_ns_readdir(cat, dir, NULL, SCRUB_PAGE, NULL, scrub_collect_cb,
@@ -708,8 +830,8 @@ static void scrub_dir(struct mds_catalogue *cat, uint64_t dir,
             continue;
         }
         if (page->type[i] == (uint8_t)MDS_FTYPE_DIR && depth > 0 &&
-            (dir != MDS_FILEID_ROOT || scrub_is_scratch(page->name[i]))) {
-            scrub_dir(cat, page->fid[i], page->name[i], depth - 1, t);
+            (all || dir != MDS_FILEID_ROOT || scrub_is_scratch(page->name[i]))) {
+            scrub_dir(cat, page->fid[i], page->name[i], depth - 1, all, t);
         }
     }
     free(page);
@@ -719,11 +841,265 @@ static int run_scrub(struct mds_catalogue *cat)
 {
     struct scrub_totals t = { 0, 0, 0 };
 
-    (void)printf("scrub: root + conf-* / lab-ns-* scratch dirs (2 levels)\n");
-    scrub_dir(cat, MDS_FILEID_ROOT, "/", 2, &t);
+    (void)printf("scrub: root + conf-* / lab-ns-* / lab-bench-* scratch dirs "
+                 "(2 levels)\n");
+    scrub_dir(cat, MDS_FILEID_ROOT, "/", 2, false, &t);
     (void)printf("scrub: %" PRIu32 " dir(s), %" PRIu32 " dirent(s), %" PRIu32
                  " dangling\n", t.dirs, t.entries, t.dangling);
     return (t.dangling == 0) ? 0 : 2;
+}
+
+/* Every directory reachable from the root, 16 levels deep at most. */
+static int run_walk(struct mds_catalogue *cat)
+{
+    struct scrub_totals t = { 0, 0, 0 };
+
+    (void)printf("walk: every directory under the root (depth <= 16, "
+                 "readdir page %u per directory)\n", SCRUB_PAGE);
+    scrub_dir(cat, MDS_FILEID_ROOT, "/", 16, true, &t);
+    (void)printf("walk: %" PRIu32 " dir(s), %" PRIu32 " dirent(s), %" PRIu32
+                 " dangling\n", t.dirs, t.entries, t.dangling);
+    return (t.dangling == 0) ? 0 : 2;
+}
+
+/* -----------------------------------------------------------------------
+ * bench -- round-trip accounting at the catalogue level.
+ *
+ * One thread, one fresh directory, N iterations of create / getattr /
+ * lookup / remove on one file.  Every call is timed (CLOCK_MONOTONIC)
+ * and bracketed by mds_cat_backend_client_stats, so the per-class
+ * deltas are exact attributions, not a workload average: exec_waits
+ * is the number of backend round-trip waves the call blocked on (NDB
+ * execute waits; FoundationDB futures that had not arrived), and
+ * txn_started / txn_committed the transactions it ran and committed.
+ * Latency is what the dispatcher call took from this process, i.e. the
+ * catalogue cost without the NFS layer above it.
+ * ----------------------------------------------------------------------- */
+
+#define BENCH_MAX_N 1000000U
+
+enum bench_op {
+    BENCH_CREATE = 0,
+    BENCH_GETATTR,
+    BENCH_LOOKUP,
+    BENCH_REMOVE,
+    BENCH_OP_COUNT,
+};
+
+static const char *const bench_op_name[BENCH_OP_COUNT] = {
+    "create", "getattr", "lookup", "remove",
+};
+
+struct bench_class {
+    uint32_t *lat_us;      /**< One sample per successful call. */
+    uint32_t  n;
+    uint32_t  errors;
+    uint64_t  waits;
+    uint64_t  txn_started;
+    uint64_t  txn_committed;
+    uint64_t  txn_aborted;
+};
+
+static uint64_t mono_ns(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static int cmp_u32(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a;
+    uint32_t y = *(const uint32_t *)b;
+
+    return (x > y) - (x < y);
+}
+
+/* Record one call: latency (when it succeeded) and the counter deltas. */
+static void bench_record(struct bench_class *c, enum mds_status st,
+                         uint64_t t0, uint64_t t1,
+                         const struct mds_cat_backend_client_stats *s0,
+                         const struct mds_cat_backend_client_stats *s1)
+{
+    if (st != MDS_OK) {
+        c->errors++;
+    } else if (c->lat_us != NULL) {
+        uint64_t us = (t1 - t0) / 1000ULL;
+
+        c->lat_us[c->n++] = (us > UINT32_MAX) ? UINT32_MAX : (uint32_t)us;
+    }
+    c->waits += s1->exec_waits - s0->exec_waits;
+    c->txn_started += s1->txn_started - s0->txn_started;
+    c->txn_committed += s1->txn_committed - s0->txn_committed;
+    c->txn_aborted += s1->txn_aborted - s0->txn_aborted;
+}
+
+static void bench_report(const struct bench_class *cls, uint32_t n,
+                         bool have_stats)
+{
+    unsigned op;
+
+    (void)printf("%-8s %8s %8s %9s %9s %9s %9s", "op", "ok", "err", "mean_us",
+                 "p50_us", "p99_us", "max_us");
+    if (have_stats) {
+        (void)printf(" %10s %10s %10s %10s", "waits/op", "txn/op",
+                     "commit/op", "abort/op");
+    }
+    (void)printf("\n");
+    for (op = 0; op < BENCH_OP_COUNT; op++) {
+        const struct bench_class *c = &cls[op];
+        uint64_t sum = 0;
+        uint32_t i;
+        uint32_t p50 = 0;
+        uint32_t p99 = 0;
+        uint32_t max = 0;
+        double calls = (double)c->n + (double)c->errors;
+
+        for (i = 0; i < c->n; i++) {
+            sum += c->lat_us[i];
+        }
+        if (c->n > 0) {
+            qsort(c->lat_us, c->n, sizeof(c->lat_us[0]), cmp_u32);
+            p50 = c->lat_us[c->n / 2];
+            p99 = c->lat_us[(uint32_t)(((uint64_t)c->n * 99U) / 100U)];
+            max = c->lat_us[c->n - 1];
+        }
+        (void)printf("%-8s %8" PRIu32 " %8" PRIu32 " %9.1f %9" PRIu32 " %9" PRIu32 " %9"
+                     PRIu32,
+                     bench_op_name[op], c->n, c->errors,
+                     (c->n > 0) ? (double)sum / (double)c->n : 0.0, p50, p99, max);
+        if (have_stats && calls > 0) {
+            (void)printf(" %10.3f %10.3f %10.3f %10.3f",
+                         (double)c->waits / calls,
+                         (double)c->txn_started / calls,
+                         (double)c->txn_committed / calls,
+                         (double)c->txn_aborted / calls);
+        }
+        (void)printf("\n");
+    }
+    (void)printf("bench: %" PRIu32 " iteration(s), single thread, one directory\n",
+                 n);
+}
+
+static int run_bench(struct mds_catalogue *cat, uint32_t n)
+{
+    struct bench_class cls[BENCH_OP_COUNT];
+    struct mds_cat_backend_client_stats s0;
+    struct mds_cat_backend_client_stats s1;
+    struct mds_inode dir;
+    struct mds_inode child;
+    struct mds_inode seen;
+    char dir_name[64];
+    char name[32];
+    bool have_stats;
+    unsigned op;
+    uint32_t i;
+    enum mds_status st;
+    int rc = 0;
+
+    if (n == 0 || n > BENCH_MAX_N) {
+        (void)fprintf(stderr, "bench: N must be 1..%u\n", BENCH_MAX_N);
+        return 1;
+    }
+    memset(cls, 0, sizeof(cls));
+    for (op = 0; op < BENCH_OP_COUNT; op++) {
+        cls[op].lat_us = calloc(n, sizeof(uint32_t));
+        if (cls[op].lat_us == NULL) {
+            rc = 1;
+            goto out;
+        }
+    }
+    memset(&s0, 0, sizeof(s0));
+    memset(&s1, 0, sizeof(s1));
+    have_stats = (mds_cat_backend_client_stats(cat, &s0) == MDS_OK);
+    if (!have_stats) {
+        (void)printf("bench: backend has no client stats; latency only\n");
+    }
+
+    (void)snprintf(dir_name, sizeof(dir_name), "lab-bench-%ld", (long)time(NULL));
+    if (!mk(cat, MDS_FILEID_ROOT, dir_name, MDS_FTYPE_DIR, &dir)) {
+        (void)fprintf(stderr, "bench: cannot create %s under the root\n", dir_name);
+        rc = 1;
+        goto out;
+    }
+    (void)printf("bench: %s (fileid %" PRIu64 "), %" PRIu32 " iteration(s)\n",
+                 dir_name, dir.fileid, n);
+
+    for (i = 0; i < n; i++) {
+        uint64_t t0;
+        uint64_t t1;
+
+        (void)snprintf(name, sizeof(name), "f%06" PRIu32, i);
+
+        (void)mds_cat_backend_client_stats(cat, &s0);
+        t0 = mono_ns();
+        st = mds_cat_ns_create(cat, NULL, dir.fileid, name, MDS_FTYPE_REG, 0644,
+                               0, 0, NULL, &child);
+        t1 = mono_ns();
+        (void)mds_cat_backend_client_stats(cat, &s1);
+        bench_record(&cls[BENCH_CREATE], st, t0, t1, &s0, &s1);
+        if (st != MDS_OK) {
+            continue; /* nothing to read back or remove */
+        }
+
+        (void)mds_cat_backend_client_stats(cat, &s0);
+        t0 = mono_ns();
+        st = mds_cat_ns_getattr(cat, child.fileid, &seen);
+        t1 = mono_ns();
+        (void)mds_cat_backend_client_stats(cat, &s1);
+        bench_record(&cls[BENCH_GETATTR], st, t0, t1, &s0, &s1);
+
+        (void)mds_cat_backend_client_stats(cat, &s0);
+        t0 = mono_ns();
+        st = mds_cat_ns_lookup(cat, dir.fileid, name, &seen);
+        t1 = mono_ns();
+        (void)mds_cat_backend_client_stats(cat, &s1);
+        bench_record(&cls[BENCH_LOOKUP], st, t0, t1, &s0, &s1);
+
+        (void)mds_cat_backend_client_stats(cat, &s0);
+        t0 = mono_ns();
+        st = mds_cat_ns_remove(cat, NULL, dir.fileid, name);
+        t1 = mono_ns();
+        (void)mds_cat_backend_client_stats(cat, &s1);
+        bench_record(&cls[BENCH_REMOVE], st, t0, t1, &s0, &s1);
+    }
+
+    bench_report(cls, n, have_stats);
+    st = mds_cat_ns_remove(cat, NULL, MDS_FILEID_ROOT, dir_name);
+    (void)printf("bench: rmdir %s -> %s\n", dir_name, mds_status_str(st));
+    if (st != MDS_OK) {
+        rc = 2; /* a file the loop failed to remove keeps the directory */
+    }
+out:
+    for (op = 0; op < BENCH_OP_COUNT; op++) {
+        free(cls[op].lat_us);
+    }
+    return rc;
+}
+
+static int run_stats(struct mds_catalogue *cat)
+{
+    struct mds_cat_backend_client_stats s;
+    enum mds_status st = mds_cat_backend_client_stats(cat, &s);
+
+    (void)printf("backend_client_stats -> %s\n", mds_status_str(st));
+    if (st != MDS_OK) {
+        return 0;
+    }
+    (void)printf("exec_waits=%" PRIu64 " scan_waits=%" PRIu64 " meta_waits=%" PRIu64
+                 " wait_nanos=%" PRIu64 "\n", s.exec_waits, s.scan_waits,
+                 s.meta_waits, s.wait_nanos);
+    (void)printf("txn_started=%" PRIu64 " txn_committed=%" PRIu64 " txn_aborted=%"
+                 PRIu64 " txn_closed=%" PRIu64 "\n", s.txn_started, s.txn_committed,
+                 s.txn_aborted, s.txn_closed);
+    (void)printf("pk_ops=%" PRIu64 " uk_ops=%" PRIu64 " table_scans=%" PRIu64
+                 " range_scans=%" PRIu64 " read_rows=%" PRIu64 " client_objects=%"
+                 PRIu64 "\n", s.pk_ops, s.uk_ops, s.table_scans, s.range_scans,
+                 s.read_rows, s.client_objects);
+    return 0;
 }
 
 static int run_inspect(struct mds_catalogue *cat, int argc, char **argv)
@@ -802,6 +1178,26 @@ static int run(struct mds_catalogue *cat, int argc, char **argv)
     }
     if (strcmp(cmd, "scrub") == 0 && argc == 1) {
         return run_scrub(cat);
+    }
+    if (strcmp(cmd, "walk") == 0 && argc == 1) {
+        return run_walk(cat);
+    }
+    if (strcmp(cmd, "stats") == 0 && argc == 1) {
+        return run_stats(cat);
+    }
+    if (strcmp(cmd, "bootstrap") == 0 && argc == 1) {
+        st = mds_catalogue_bootstrap(cat);
+        (void)printf("bootstrap -> %s; probe -> %s\n", mds_status_str(st),
+                     mds_status_str(mds_catalogue_probe(cat)));
+        return 0;
+    }
+    if (strcmp(cmd, "bench") == 0 && argc == 2) {
+        uint32_t n;
+
+        if (!parse_u32(argv[1], &n)) {
+            return usage();
+        }
+        return run_bench(cat, n);
     }
 
     if (strcmp(cmd, "nodes") == 0) {
@@ -938,14 +1334,24 @@ static int run(struct mds_catalogue *cat, int argc, char **argv)
 int main(int argc, char **argv)
 {
     uint32_t mds_id = LAB_DEFAULT_MDS_ID;
+    const char *backend = getenv("CATALOGUE_TEST_BACKEND");
     struct mds_catalogue *cat;
     int rc;
 
+    if (backend == NULL || backend[0] == '\0') {
+        backend = "rondb";
+    }
     argv++;
     argc--;
-    if (argc >= 2 && strcmp(argv[0], "--mds-id") == 0) {
-        if (!parse_u32(argv[1], &mds_id) || mds_id == 0 ||
-            mds_id > MDS_MAX_NODES) {
+    while (argc >= 2 && argv[0][0] == '-') {
+        if (strcmp(argv[0], "--mds-id") == 0) {
+            if (!parse_u32(argv[1], &mds_id) || mds_id == 0 ||
+                mds_id > MDS_MAX_NODES) {
+                return usage();
+            }
+        } else if (strcmp(argv[0], "--backend") == 0) {
+            backend = argv[1];
+        } else {
             return usage();
         }
         argv += 2;
@@ -955,11 +1361,14 @@ int main(int argc, char **argv)
         return usage();
     }
 
-    cat = open_rondb(mds_id);
+    cat = open_store(backend, mds_id);
     if (cat == NULL) {
         return 1;
     }
     rc = run(cat, argc, argv);
     mds_catalogue_close(cat);
+    /* Process-wide backend state (the FoundationDB client network) is
+     * released after the last handle; a no-op on RonDB. */
+    mds_catalogue_process_shutdown();
     return rc;
 }

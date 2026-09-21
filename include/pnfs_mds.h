@@ -548,7 +548,7 @@ enum mds_catalogue_backend {
                                *   (src/catalogue/catalogue_memdb.c); selectable
                                *   via `catalogue_backend = memdb`.  Non-durable,
                                *   single node, bounded capacity. */
-    MDS_BACKEND_FDB     = 2,  /**< FoundationDB backend (reserved; not yet built). */
+    MDS_BACKEND_FDB     = 2,  /**< FoundationDB backend (ENABLE_FDB builds). */
     MDS_BACKEND_NONE    = 3,  /**< No catalogue: NULL handle sentinel, never
                                *   selectable. */
 };

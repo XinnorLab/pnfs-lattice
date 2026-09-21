@@ -61,8 +61,8 @@ static int test_failed  = 0;  /* Set by ASSERT_* so RUN_TEST records it. */
 
 /* ----------------------------------------------------------------------- */
 
-/* Every table present, every slot NULL: the shape of a backend whose
- * follow-up units have not landed yet. */
+/* Every table present, every slot NULL: the shape of a backend that
+ * implements no optional slot at all. */
 static struct mds_authority_ops    null_auth_ops;
 static struct mds_coordination_ops null_coord_ops;
 static struct mds_cluster_ops      null_cluster_ops;

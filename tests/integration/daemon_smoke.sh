@@ -3,14 +3,17 @@
 # SPDX-License-Identifier: MIT
 #
 # daemon_smoke.sh -- unprivileged end-to-end smoke of pnfs-mds on the
-# in-memory catalogue backend.
+# in-memory catalogue backend (default) or on FoundationDB.
 #
 # Usage: daemon_smoke.sh <build-dir>
+#        DAEMON_SMOKE_BACKEND=fdb [FDB_CLUSTER_FILE=...] daemon_smoke.sh <build-dir>
 #
-# Writes a temporary mds.conf selecting `catalogue_backend = memdb`,
-# an unprivileged NFS port and an unprivileged cluster-transport port,
-# starts <build-dir>/src/mds/pnfs-mds in the background, waits (bounded)
-# for the NFS port to accept connections and then probes it:
+# Writes a temporary mds.conf selecting `catalogue_backend = memdb` (or
+# `fdb` with the cluster file and a private, run-unique fdb_key_prefix
+# that is cleared again at exit), an unprivileged NFS port and an
+# unprivileged cluster-transport port, starts <build-dir>/src/mds/pnfs-mds
+# in the background, waits (bounded) for the NFS port to accept
+# connections and then probes it:
 #
 #   * with pynfs when PYNFS_DIR/nfs4.1/testserver.py runs (default:
 #     a pynfs checkout next to this repository) -- EXCHANGE_ID,
@@ -20,16 +23,19 @@
 #     TCP, AUTH_NONE) when pynfs is not available.
 #
 # Exit codes:
-#   0   daemon started on memdb and answered the probe
-#   77  skipped: running as root, no daemon binary, or the daemon
-#       refused `catalogue_backend = memdb` (binary without the memdb
-#       backend / factory) -- registered as SKIP_RETURN_CODE in ctest
+#   0   daemon started on the selected backend and answered the probe
+#   77  skipped: running as root, no daemon binary, the daemon refused
+#       the selected `catalogue_backend` (binary without that backend /
+#       factory), or DAEMON_SMOKE_BACKEND=fdb without a readable cluster
+#       file -- registered as SKIP_RETURN_CODE in ctest
 #   1   failure (daemon died for another reason, port never came up,
 #       probe failed); the daemon log tail is printed
 #
 # Side effects: creates and removes one temporary directory under
-# ${TMPDIR:-/tmp}; starts one pnfs-mds process and kills it on exit.
-# Never touches port 2049 or any other privileged port.
+# ${TMPDIR:-/tmp}; starts one pnfs-mds process and kills it on exit; on
+# fdb, writes under its private key prefix and clears that prefix at
+# exit (fdbcli clearrange, best effort).  Never touches port 2049 or
+# any other privileged port.
 
 set -euo pipefail
 
@@ -71,6 +77,46 @@ fi
 MDS_BIN="${BUILD_DIR}/src/mds/pnfs-mds"
 [[ -x "${MDS_BIN}" ]] || skip "daemon binary not found at ${MDS_BIN}"
 
+# --- backend selection (DAEMON_SMOKE_BACKEND=memdb|fdb) -------------------
+
+SMOKE_BACKEND="${DAEMON_SMOKE_BACKEND:-memdb}"
+SMOKE_FDB_PREFIX=""
+SMOKE_FDB_CLUSTER=""
+case "${SMOKE_BACKEND}" in
+    memdb) ;;
+    fdb)
+        SMOKE_FDB_CLUSTER="${FDB_CLUSTER_FILE:-/etc/foundationdb/fdb.cluster}"
+        [[ -r "${SMOKE_FDB_CLUSTER}" ]] || \
+            skip "DAEMON_SMOKE_BACKEND=fdb but no readable cluster file at ${SMOKE_FDB_CLUSTER}"
+        # Private keyspace for this run; ends in a fixed letter so the
+        # clearrange end key is the same prefix with that letter bumped.
+        SMOKE_FDB_PREFIX="smoke-$$-a"
+        ;;
+    *)
+        echo "unknown DAEMON_SMOKE_BACKEND '${SMOKE_BACKEND}' (memdb|fdb)" >&2
+        exit 2
+        ;;
+esac
+
+render_backend_config() {
+    if [[ "${SMOKE_BACKEND}" == "fdb" ]]; then
+        printf 'catalogue_backend = fdb\n'
+        printf 'fdb_cluster_file = %s\n' "${SMOKE_FDB_CLUSTER}"
+        printf 'fdb_key_prefix = %s\n' "${SMOKE_FDB_PREFIX}"
+    else
+        printf 'catalogue_backend = memdb\n'
+    fi
+}
+
+# Best effort: drop everything this run wrote under its prefix.
+smoke_fdb_cleanup() {
+    [[ "${SMOKE_BACKEND}" == "fdb" ]] || return 0
+    command -v fdbcli > /dev/null 2>&1 || return 0
+    timeout 30 fdbcli -C "${SMOKE_FDB_CLUSTER}" --timeout 20 \
+        --exec "writemode on; clearrange ${SMOKE_FDB_PREFIX} ${SMOKE_FDB_PREFIX%a}b" \
+        > /dev/null 2>&1 || true
+}
+
 # pynfs checkout: PYNFS_DIR, else a sibling of this repository.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYNFS_DIR="${PYNFS_DIR:-${REPO_ROOT}/../pynfs}"
@@ -99,6 +145,7 @@ cleanup() {
         kill -KILL "${DAEMON_PID}" 2>/dev/null || true
         wait "${DAEMON_PID}" 2>/dev/null || true
     fi
+    smoke_fdb_cleanup
     rm -rf "${WORK}"
 }
 trap cleanup EXIT
@@ -145,7 +192,7 @@ nfs_port = ${NFS_PORT}
 grpc_port = ${GRPC_PORT}
 cluster_bind_addr = 127.0.0.1
 cluster_size = 1
-catalogue_backend = memdb
+$(render_backend_config)
 worker_threads = 2
 ds_count = 0
 metrics_http_port = 0
@@ -154,7 +201,7 @@ log_file = ${DAEMON_LOG}
 log_level = info
 EOF
 
-echo "daemon_smoke: starting ${MDS_BIN} (nfs_port=${NFS_PORT} grpc_port=${GRPC_PORT})"
+echo "daemon_smoke: starting ${MDS_BIN} (backend=${SMOKE_BACKEND} nfs_port=${NFS_PORT} grpc_port=${GRPC_PORT})"
 "${MDS_BIN}" "${CONF}" > "${DAEMON_OUT}" 2>&1 &
 DAEMON_PID=$!
 
@@ -179,15 +226,15 @@ if [[ ${listening} -ne 1 ]]; then
         rc=0
         wait "${DAEMON_PID}" || rc=$?
         DAEMON_PID=""
-        # The one expected refusal: this binary cannot select memdb from
-        # mds.conf (config parser or factory without the memdb backend).
+        # The one expected refusal: this binary cannot select the backend
+        # from mds.conf (config parser or factory without that backend).
         # The log file may not exist yet, hence the tolerant pipeline.
         refusal="$(cat "${DAEMON_OUT}" "${DAEMON_LOG}" 2>/dev/null \
                    | grep "catalogue_backend" | head -n 3 || true)"
         if [[ -n "${refusal}" ]]; then
-            echo "daemon refused catalogue_backend = memdb (exit ${rc}):"
+            echo "daemon refused catalogue_backend = ${SMOKE_BACKEND} (exit ${rc}):"
             echo "${refusal}"
-            skip "memdb backend is not selectable in this build"
+            skip "${SMOKE_BACKEND} backend is not selectable in this build"
         fi
         fail "daemon exited with status ${rc} before listening"
     fi
@@ -296,5 +343,5 @@ if ! kill -0 "${DAEMON_PID}" 2>/dev/null; then
     fail "daemon died during the probe"
 fi
 
-echo "daemon_smoke: PASS (pnfs-mds on catalogue_backend=memdb answered on port ${NFS_PORT})"
+echo "daemon_smoke: PASS (pnfs-mds on catalogue_backend=${SMOKE_BACKEND} answered on port ${NFS_PORT})"
 exit 0
