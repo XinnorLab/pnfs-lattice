@@ -254,6 +254,26 @@ static int set_nonblock(int fd)
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+/*
+ * A failed bind()/listen() of the listening socket ends the daemon
+ * (main.c exits on rpc_server_create failure), so the operator must
+ * see which address and port were refused and why -- EADDRINUSE from
+ * another listener or a live connection on that port is the common
+ * case.  @err is the errno captured right after the failing call.
+ */
+static void log_listen_failure(const char *what, const char *bind_addr,
+                               uint16_t port, int err)
+{
+    char errbuf[64];
+    /* GNU strerror_r may return a static string and leave errbuf
+     * untouched: log the returned pointer. */
+    const char *msg = strerror_r(err, errbuf, sizeof(errbuf));
+
+    MDS_LOG_ERROR(LOG_COMP_NFS, "%s on %s:%u failed: %s", what,
+                  bind_addr != NULL ? bind_addr : "0.0.0.0",
+                  (unsigned)port, msg);
+}
+
 static void conn_init(struct rpc_conn *c)
 {
     memset(c, 0, sizeof(*c));
@@ -2159,9 +2179,13 @@ int rpc_server_create(const struct rpc_server_config *cfg,
     }
 
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        log_listen_failure("bind", cfg->bind_addr, ntohs(addr.sin_port),
+                           errno);
         goto fail;
 }
     if (listen(listen_fd, 128) < 0) {
+        log_listen_failure("listen", cfg->bind_addr, ntohs(addr.sin_port),
+                           errno);
         goto fail;
 }
 
@@ -2351,15 +2375,19 @@ static void handle_epoll_accept(struct rpc_server *srv)
         return;
 }
 
+    /* Make the fd non-blocking BEFORE taking a slot: the slot is popped
+     * from the free list and only conn_finalize_close returns it, so a
+     * slot taken here and abandoned on a failed fcntl would be lost for
+     * the life of the server. */
+    if (set_nonblock(cfd) != 0) {
+        close(cfd);
+        return;
+    }
+
     struct rpc_conn *c = find_free_conn(srv);
 
     if (c == NULL) {
         close(cfd); /* At capacity. */
-        return;
-    }
-
-    if (set_nonblock(cfd) != 0) {
-        close(cfd);
         return;
     }
 

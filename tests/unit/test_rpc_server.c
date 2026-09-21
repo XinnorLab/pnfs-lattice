@@ -11,6 +11,7 @@
  * Skips gracefully if no RonDB cluster is available.
  */
 
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -398,6 +399,100 @@ static void test_server_stop_clean(void)
 
     /* Just verify stop+destroy doesn't crash. */
     teardown_test(&ctx);
+}
+
+/** Open descriptors of this process (/proc/self/fd entries). */
+static int count_open_fds(void)
+{
+    DIR *d = opendir("/proc/self/fd");
+    struct dirent *de;
+    int n = 0;
+
+    VERIFY(d != NULL);
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] != '.') {
+            n++;
+        }
+    }
+    closedir(d);
+    return n;
+}
+
+/** True when the file at @path contains @needle (short files only). */
+static int file_contains(const char *path, const char *needle)
+{
+    char buf[4096];
+    size_t n;
+    FILE *f = fopen(path, "r");
+
+    if (f == NULL) {
+        return 0;
+    }
+    n = fread(buf, 1, sizeof(buf) - 1, f);
+    (void)fclose(f);
+    buf[n] = '\0';
+    return strstr(buf, needle) != NULL;
+}
+
+/*
+ * bind() failure path: a listener already owns the port (a plain
+ * socket without SO_REUSEPORT, so the server's SO_REUSEADDR /
+ * SO_REUSEPORT cannot share it).  rpc_server_create must fail, log the
+ * refusal with the address and port, and release everything it
+ * allocated: no descriptor stays open (the failed listen socket, the
+ * epoll fd and the stop pipe are the candidates) and, once the blocker
+ * is gone, the same port binds.
+ */
+static void test_create_on_occupied_port_fails_clean(void)
+{
+    struct rpc_server_config cfg;
+    struct rpc_server *srv = NULL;
+    struct sockaddr_in addr;
+    socklen_t alen = sizeof(addr);
+    int blocker = socket(AF_INET, SOCK_STREAM, 0);
+    int fds_before;
+    uint16_t port;
+    char log_path[128];
+    char expected[64];
+
+    VERIFY(blocker >= 0);
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = 0;
+    VERIFY(inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) == 1);
+    VERIFY(bind(blocker, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    VERIFY(listen(blocker, 1) == 0);
+    VERIFY(getsockname(blocker, (struct sockaddr *)&addr, &alen) == 0);
+    port = ntohs(addr.sin_port);
+    VERIFY(port != 0);
+
+    /* Capture the server's diagnostics: the logger is otherwise
+     * uninitialised in this suite and drops every record. */
+    (void)snprintf(log_path, sizeof(log_path), "/tmp/pnfs-rpc-bind-%d.log",
+                   (int)getpid());
+    (void)unlink(log_path);
+    mds_log_init(log_path);
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.bind_addr = "127.0.0.1";
+    cfg.port = port;
+
+    fds_before = count_open_fds();
+    ASSERT_EQ(rpc_server_create(&cfg, &srv), -1);
+    ASSERT_TRUE(srv == NULL);
+    ASSERT_EQ(count_open_fds(), fds_before);
+
+    mds_log_shutdown();
+    (void)snprintf(expected, sizeof(expected), "bind on 127.0.0.1:%u failed",
+                   (unsigned)port);
+    ASSERT_TRUE(file_contains(log_path, expected));
+    (void)unlink(log_path);
+
+    close(blocker);
+    ASSERT_EQ(rpc_server_create(&cfg, &srv), 0);
+    ASSERT_TRUE(srv != NULL);
+    ASSERT_EQ(rpc_server_port(srv), port);
+    rpc_server_destroy(srv);
 }
 
 static void test_multiple_connections(void)
@@ -858,6 +953,7 @@ int main(void)
 
     RUN_TEST(test_null_procedure);
     RUN_TEST(test_server_stop_clean);
+    RUN_TEST(test_create_on_occupied_port_fails_clean);
     RUN_TEST(test_multiple_connections);
     RUN_TEST(test_pipelined_requests);
     RUN_TEST(test_close_during_pipeline);
