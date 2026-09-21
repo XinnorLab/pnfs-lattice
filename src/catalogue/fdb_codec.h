@@ -429,10 +429,14 @@ bool fdb_link_anchor_decode(const uint8_t *buf, size_t len, struct fdb_link_anch
                                MDS_COORD_JOURNAL_PAYLOAD_MAX)
 
 /** NODE_REGISTRY value: u8 version | u64 boot_epoch | u16 nfs_port |
- *  u16 grpc_port | u8 state | u64 last_heartbeat_ns | u8 sw_len |
- *  u8 sw_version[sw_len] | u16 host_len | u8 hostname[host_len]. */
-#define FDB_NODE_VERSION      1U
-#define FDB_NODE_ENC_FIXED    25U
+ *  u16 grpc_port | u8 state | u64 last_heartbeat_ns | u64 witness_epoch |
+ *  u8 sw_len | u8 sw_version[sw_len] | u16 host_len | u8 hostname[host_len].
+ *  witness_epoch is the WITNESS key epoch (fdb_txn.h) of the process
+ *  that registered the row; the open-time witness sweep of that mds_id
+ *  clears only rows strictly below it.  Version 1 (keyspaces stamped
+ *  with schema 1) had no witness_epoch and is rejected. */
+#define FDB_NODE_VERSION      2U
+#define FDB_NODE_ENC_FIXED    33U
 #define FDB_NODE_SW_MAX       63U
 #define FDB_NODE_HOST_MAX     255U
 #define FDB_NODE_ENC_MAX      (FDB_NODE_ENC_FIXED + FDB_NODE_SW_MAX + FDB_NODE_HOST_MAX)
@@ -557,6 +561,7 @@ bool fdb_journal_decode(const uint8_t *buf, size_t len, uint64_t txn_id, uint8_t
 struct fdb_node_val {
     uint64_t boot_epoch;
     uint64_t last_heartbeat_ns;
+    uint64_t witness_epoch;                /**< Registrant's witness epoch; 0 = unknown. */
     uint16_t nfs_port;
     uint16_t grpc_port;
     uint8_t  state;                        /**< 0 active, 1 standby, 2 draining. */

@@ -14,9 +14,16 @@
  *
  * Rows (fdb_keys.h; values in fdb_codec.h):
  *   NODE_REGISTRY + be32 mds_id   -> fdb_node codec (boot_epoch, ports,
- *                                    state, last_heartbeat_ns, sw_version,
- *                                    hostname)
+ *                                    state, last_heartbeat_ns,
+ *                                    witness_epoch, sw_version, hostname)
  *   PARTITION_MAP + be32 id       -> fdb_partition codec (owner, state, path)
+ *
+ * witness_epoch is the registering process's WITNESS key epoch
+ * (fdb_txn.h): the open-time sweep of this mds_id's witness rows
+ * (catalogue_fdb.c, witness_clear_body) clears only rows strictly below
+ * it, so a daemon that takes over a still-running mds_id never erases
+ * the live process's in-flight commit witnesses.  node_register writes
+ * it; node_heartbeat re-encodes the decoded row, so it travels along.
  *
  * Timestamps are the writer's CLOCK_REALTIME nanoseconds (mds_cluster.h
  * clock-domain rule).  Enumerations materialise a bounded page in a
@@ -26,7 +33,8 @@
  * Transaction shapes (R = point read, RR = range read, W = set/clear;
  * every mutating transaction adds the runner's witness set + READ
  * conflict range and commits once):
- *   node_register     R row; absent or lower epoch: W row / else EXISTS
+ *   node_register     R row; absent or lower epoch: W row (this process's
+ *                     witness_epoch included) / else EXISTS
  *   node_heartbeat    R row; NOTFOUND / STALE / W row with the new stamp
  *   node_deregister   R row; absent: OK / STALE / W clear
  *   node_list         per page: RR NODE_REGISTRY (MDS_MAX_NODES rows)
@@ -188,7 +196,8 @@ static int node_register_body(FDBTransaction *tr, void *arg, enum mds_status *st
 
 /* Update only when the row exists AND its epoch matches: NOTFOUND when
  * absent, STALE on a mismatch (an old incarnation never overwrites its
- * replacement); only the timestamp changes. */
+ * replacement); only the timestamp changes -- the decoded row is
+ * written back, so its witness_epoch is preserved. */
 static int node_heartbeat_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
 {
     struct node_ctx *c = arg;
@@ -265,6 +274,7 @@ static enum mds_status fdb_node_register(struct mds_catalogue *cat, uint32_t mds
     c->mds_id = mds_id;
     c->boot_epoch = boot_epoch;
     c->want.boot_epoch = boot_epoch;
+    c->want.witness_epoch = c->b->witness_epoch;
     c->want.nfs_port = nfs_port;
     c->want.grpc_port = grpc_port;
     c->want.state = FDB_NODE_STATE_ACTIVE;

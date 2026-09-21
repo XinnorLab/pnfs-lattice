@@ -91,10 +91,20 @@
  * registry's boot_epoch: it is known before the first mutation, so it
  * never changes under an attempt in flight (a clear racing with an
  * unresolved attempt would erase a live witness and cause a double
- * apply), and every handle of one process shares it.  At open the
- * backend range-clears WITNESS + mds_id + [0, epoch): dead incarnations'
- * keys.  fdb_backend_set_boot_epoch() records the registry epoch for
- * rows that carry an owner epoch; it does not touch witness keys.
+ * apply), and every handle of one process shares it.  node_register
+ * stamps it into the incarnation's NODE_REGISTRY row (fdb_node_val
+ * .witness_epoch).  At open the backend range-clears WITNESS + mds_id +
+ * [0, min(W, epoch)), W being the epoch the registry row of this
+ * mds_id carries: the keys of incarnations superseded before the
+ * registered one.  The registered incarnation's keys sit at exactly W
+ * and survive -- a daemon taking over a still-running mds_id must not
+ * blind that process's in-flight outcome probes, which would re-run
+ * landed bodies -- until the id's next restart finds the row gone
+ * (clean deregister) or carrying a newer W.  A row without an epoch
+ * (0) sweeps nothing; no row sweeps [0, epoch) (catalogue_fdb.c,
+ * witness_clear_body).  fdb_backend_set_boot_epoch() records the
+ * registry epoch for rows that carry an owner epoch; it does not touch
+ * witness keys.
  *
  * Injection.  The fdb_c calls the runner itself makes go through
  * struct fdb_txn_calls (b->calls); tests script commit outcomes and

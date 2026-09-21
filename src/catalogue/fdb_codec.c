@@ -1619,6 +1619,7 @@ bool fdb_node_encode(const struct fdb_node_val *v, uint8_t *buf, size_t cap, siz
     w_u16(&w, v->grpc_port);
     w_u8(&w, v->state);
     w_u64(&w, v->last_heartbeat_ns);
+    w_u64(&w, v->witness_epoch);
     w_u8(&w, (uint8_t)sw_n);
     w_bytes(&w, v->sw_version, sw_n);
     w_u16(&w, (uint16_t)host_n);
@@ -1649,6 +1650,7 @@ bool fdb_node_decode(const uint8_t *buf, size_t len, struct fdb_node_val *out)
     v.grpc_port = r_u16(&r);
     v.state = r_u8(&r);
     v.last_heartbeat_ns = r_u64(&r);
+    v.witness_epoch = r_u64(&r);
     sw_n = r_u8(&r);
     if (r.fail || sw_n > FDB_NODE_SW_MAX) {
         return false;

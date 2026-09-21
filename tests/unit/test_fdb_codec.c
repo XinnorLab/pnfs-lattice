@@ -482,6 +482,69 @@ static void test_gc_codec(void)
 }
 
 /* -----------------------------------------------------------------------
+ * Node registry row
+ * ----------------------------------------------------------------------- */
+
+/* The row carries the registering process's witness epoch, the bound
+ * of the open-time witness sweep (catalogue_fdb.c), after the heartbeat
+ * stamp; a row of the previous layout (version 1, no such field) is
+ * rejected by its version byte, never read with shifted fields. */
+static void test_node_codec(void)
+{
+    struct fdb_node_val in;
+    struct fdb_node_val out;
+    uint8_t buf[FDB_NODE_ENC_MAX + 1];
+    size_t len = 0;
+
+    memset(&in, 0, sizeof(in));
+    in.boot_epoch = 0x1122334455667788ULL;
+    in.last_heartbeat_ns = 0x99AABBCCDDEEFF00ULL;
+    in.witness_epoch = 0x0102030405060708ULL;
+    in.nfs_port = 2049;
+    in.grpc_port = 9401;
+    in.state = 2;
+    (void)snprintf(in.sw_version, sizeof(in.sw_version), "1.2.3");
+    (void)snprintf(in.hostname, sizeof(in.hostname), "mds-a");
+    ASSERT_TRUE(fdb_node_encode(&in, buf, sizeof(buf), &len));
+    ASSERT_EQ(len, FDB_NODE_ENC_FIXED + 5 + 5);
+    ASSERT_EQ(buf[0], FDB_NODE_VERSION);
+    /* version, boot_epoch, two ports, state, heartbeat: offset 22. */
+    ASSERT_EQ(fdb_le64_get(buf + 22), in.witness_epoch);
+    memset(&out, 0xAA, sizeof(out));
+    ASSERT_TRUE(fdb_node_decode(buf, len, &out));
+    ASSERT_EQ(out.boot_epoch, in.boot_epoch);
+    ASSERT_EQ(out.last_heartbeat_ns, in.last_heartbeat_ns);
+    ASSERT_EQ(out.witness_epoch, in.witness_epoch);
+    ASSERT_EQ(out.nfs_port, 2049);
+    ASSERT_EQ(out.grpc_port, 9401);
+    ASSERT_EQ(out.state, 2);
+    ASSERT_TRUE(strcmp(out.sw_version, "1.2.3") == 0);
+    ASSERT_TRUE(strcmp(out.hostname, "mds-a") == 0);
+
+    /* An unknown epoch (0) round-trips as such. */
+    in.witness_epoch = 0;
+    ASSERT_TRUE(fdb_node_encode(&in, buf, sizeof(buf), &len));
+    ASSERT_TRUE(fdb_node_decode(buf, len, &out));
+    ASSERT_EQ(out.witness_epoch, 0);
+
+    /* Truncated by one, padded by one, shorter than the fixed part. */
+    ASSERT_TRUE(!fdb_node_decode(buf, len - 1, &out));
+    buf[len] = 0;
+    ASSERT_TRUE(!fdb_node_decode(buf, len + 1, &out));
+    ASSERT_TRUE(!fdb_node_decode(buf, FDB_NODE_ENC_FIXED - 1, &out));
+    /* The previous layout's version byte. */
+    buf[0] = 1;
+    ASSERT_TRUE(!fdb_node_decode(buf, len, &out));
+    buf[0] = (uint8_t)FDB_NODE_VERSION;
+    ASSERT_TRUE(fdb_node_decode(buf, len, &out));
+
+    /* Encoder bounds: a buffer one byte short, an empty hostname. */
+    ASSERT_TRUE(!fdb_node_encode(&in, buf, len - 1, &len));
+    in.hostname[0] = '\0';
+    ASSERT_TRUE(!fdb_node_encode(&in, buf, sizeof(buf), &len));
+}
+
+/* -----------------------------------------------------------------------
  * Keys
  * ----------------------------------------------------------------------- */
 
@@ -668,6 +731,7 @@ int main(void)
     RUN_TEST(test_dirent_seq_codec);
     RUN_TEST(test_stripe_codec);
     RUN_TEST(test_gc_codec);
+    RUN_TEST(test_node_codec);
     RUN_TEST(test_key_layout);
     RUN_TEST(test_key_name_bounds);
     RUN_TEST(test_key_ordering);

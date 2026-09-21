@@ -100,8 +100,9 @@ enum mds_status fdb_backend_set_boot_epoch(const struct mds_catalogue *cat,
  * table (test and admin helper).  The live incarnation's witness and
  * fence-anchor rows must survive any clear that runs through the
  * transaction runner (fdb_txn.h, body rule); dead incarnations' rows
- * are swept by the next open of their mds_id.  Refuses an empty
- * prefix: that would erase the whole database.
+ * are swept by a later open of their mds_id (catalogue_fdb.c,
+ * witness_clear_body).  Refuses an empty prefix: that would erase the
+ * whole database.
  *
  * @return MDS_OK; MDS_ERR_INVAL for a NULL / non-fdb handle or an empty
  *         prefix; the transaction runner's status otherwise.

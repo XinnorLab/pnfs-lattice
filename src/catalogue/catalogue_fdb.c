@@ -12,7 +12,10 @@
  * (fdb_txn.h).
  *
  * Open:      network start (first open) -> fdb_create_database ->
- *            clear WITNESS + mds_id + [0, epoch) (one mutating txn) ->
+ *            sweep dead incarnations' witness rows (one mutating txn:
+ *            snapshot-read the NODE_REGISTRY row of mds_id, clear
+ *            WITNESS + mds_id + [0, min(row.witness_epoch, own epoch));
+ *            nothing when the row carries no epoch) ->
  *            read the schema stamp (one read-only txn).
  * Probe:     one read-only txn: stamp present and equal to
  *            FDB_CAT_SCHEMA_VERSION.
@@ -90,7 +93,8 @@ static void net_atexit(void)
  *
  * The stamp is CLOCK_REALTIME at this point.  Ordering across
  * incarnations of one mds_id (the open-time range clear of
- * WITNESS + mds_id + [0, stamp)) relies on the wall clock not being
+ * WITNESS + mds_id below the registered incarnation's stamp, capped by
+ * this one; witness_clear_body) relies on the wall clock not being
  * stepped back below the previous incarnation's stamp -- the same
  * caveat as the registry boot_epoch.  If it is stepped back, the older
  * incarnation's witness keys sort above the new stamp: they are never
@@ -284,23 +288,95 @@ static int bootstrap_body(FDBTransaction *tr, void *arg, enum mds_status *st_out
     return FDB_BODY_COMMIT;
 }
 
-/* Clear WITNESS + mds_id + [0, epoch): every witness key of an earlier
- * incarnation of this MDS id under this prefix.  The live epoch's keys
- * sit at exactly `epoch` and are outside the half-open range. */
+/*
+ * Upper bound of the open-time witness sweep: the witness epoch W the
+ * NODE_REGISTRY row of this mds_id carries, capped by this process's
+ * own epoch.  *bound is 0 when nothing may be swept.
+ *
+ * The read is a SNAPSHOT read (no conflict range): the epoch in the row
+ * is immutable for an incarnation (node_register writes it, heartbeats
+ * rewrite the decoded row), so a heartbeat landing concurrently must
+ * not abort the open.  The value is decoded strictly; a row this build
+ * cannot decode fails the open rather than being guessed at.
+ */
+static fdb_error_t witness_sweep_bound(FDBTransaction *tr, const struct fdb_backend *b,
+                                       uint64_t *bound)
+{
+    struct fdb_node_val row;
+    struct fdb_key k;
+    uint8_t buf[FDB_NODE_ENC_MAX];
+    size_t len = 0;
+    bool found = false;
+    fdb_error_t err;
+
+    *bound = b->witness_epoch;
+    fdb_key_init(&k, &b->prefix, FDB_KT_NODE_REGISTRY);
+    fdb_key_be32(&k, b->mds_id);
+    err = fdb_txn_get(tr, &k, true, buf, sizeof(buf), &len, &found);
+    if (err != 0) {
+        return err;
+    }
+    if (!found) {
+        return 0;
+    }
+    if (!fdb_node_decode(buf, len, &row)) {
+        return FDB_ERR_PLATFORM_ERROR;
+    }
+    if (row.witness_epoch < *bound) {
+        *bound = row.witness_epoch;
+    }
+    return 0;
+}
+
+/*
+ * Sweep the witness rows of dead incarnations of this MDS id: clear
+ * WITNESS + mds_id + [0, bound) with bound = min(W, own epoch), W being
+ * the witness epoch the registry row of mds_id carries.
+ *
+ * Why the bound is exact.  The registered incarnation's rows sit at
+ * exactly W, outside the half-open range, and survive until the id's
+ * next restart, when the row is either gone (clean deregister) or
+ * carries a newer W.  Every row below W belongs to an incarnation that
+ * was superseded before the registered one registered (node_register
+ * replaces a row only with a higher boot_epoch), i.e. one that has
+ * exited or is fencing itself on its STALE heartbeat (main.c); the one
+ * exposure left is a superseded process still inside that heartbeat
+ * interval when a THIRD incarnation of the id opens.  A row without an
+ * epoch (0: written by a process whose stamp is unknown) sweeps
+ * nothing.  No row sweeps [0, own epoch): nothing under this id is
+ * registered, and a process that has opened but not yet registered
+ * runs only the idempotent bootstrap before it registers, so an
+ * unresolved outcome it re-runs applies nothing twice.
+ *
+ * An unconditional clear of [0, own epoch) is wrong: a daemon taking
+ * over a still-running mds_id erased the live process's rows during
+ * the window between this open and that process's self-fence, its
+ * in-flight commit_unknown_result probes then read "absent", re-ran
+ * landed bodies and applied ADD counters twice.
+ */
 static int witness_clear_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
 {
     struct fdb_backend *b = arg;
     struct fdb_key_range r;
+    uint64_t bound = 0;
+    fdb_error_t err;
 
+    err = witness_sweep_bound(tr, b, &bound);
+    if (err != 0) {
+        return (int)err;
+    }
+    *st_out = MDS_OK;
+    if (bound == 0) {
+        return FDB_BODY_DONE;
+    }
     fdb_key_witness_mds_prefix(&r.begin, &b->prefix, b->mds_id);
     fdb_key_be64(&r.begin, 0);
     fdb_key_witness_mds_prefix(&r.end, &b->prefix, b->mds_id);
-    fdb_key_be64(&r.end, b->witness_epoch);
+    fdb_key_be64(&r.end, bound);
     if (!fdb_key_ok(&r.begin) || !fdb_key_ok(&r.end)) {
         return FDB_ERR_PLATFORM_ERROR;
     }
     fdb_txn_clear_range(tr, &r);
-    *st_out = MDS_OK;
     return FDB_BODY_COMMIT;
 }
 
@@ -313,7 +389,7 @@ static int witness_clear_body(FDBTransaction *tr, void *arg, enum mds_status *st
  * late landing of it would wipe whatever was written after it -- and
  * clearing other threads' live witness rows blinds their in-flight
  * resolution (fdb_txn.h, body rule).  Dead incarnations' witness rows
- * are swept by the next open of their mds_id. */
+ * are swept by a later open of their mds_id (witness_clear_body). */
 static int keyspace_clear_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
 {
     struct fdb_backend *b = arg;
@@ -530,10 +606,10 @@ static enum mds_status backend_new(const struct mds_config *cfg, struct fdb_back
 }
 
 /* Open the database handle, stamp the backend and clear dead
- * incarnations' witness keys (bounded: one incarnation's slots at most
- * linger between two opens).  The clear doubles as the reachability
- * check: an unreachable cluster fails the open instead of the first
- * catalogue call. */
+ * incarnations' witness keys (bounded: the registered incarnation's
+ * slots and this one's are all that linger between two opens).  The
+ * sweep doubles as the reachability check: an unreachable cluster
+ * fails the open instead of the first catalogue call. */
 static enum mds_status open_connect(struct fdb_backend *b, const char *cluster_file)
 {
     enum mds_status st;

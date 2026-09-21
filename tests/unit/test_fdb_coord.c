@@ -30,6 +30,9 @@
  *   locks              LOCKT conventions, owner scan, reap
  *   cluster            the Phase 1b registry / partition contract,
  *                      partition_cas, the capability predicates
+ *   witness_sweep      the open-time witness sweep of an mds_id clears
+ *                      only rows below the epoch its registry row
+ *                      carries; register stamps it, heartbeat keeps it
  *   codecs             a few malformed-value rejections
  */
 
@@ -100,6 +103,10 @@ static int test_failed;
 static struct mds_catalogue *g_cat;
 static struct mds_catalogue *g_cat0;
 static char g_prefix[32];
+
+/* A further handle of the same keyspace under @p self_id (NULL when the
+ * cluster is unreachable); defined with main() below. */
+static struct mds_catalogue *open_handle(uint32_t self_id);
 
 static struct nfs4_stateid mk_sid(uint32_t seqid, uint8_t fill)
 {
@@ -1233,6 +1240,192 @@ static void test_cluster_contract(void)
               MDS_ERR_INVAL);
 }
 
+/* --- witness sweep bound ------------------------------------------------------- */
+
+/* Raw single-key bodies over the handle's prefix: the sweep test writes
+ * registry and witness rows of OTHER mds_ids by hand. */
+struct raw_ctx {
+    struct fdb_key key;
+    uint8_t        val[FDB_NODE_ENC_MAX];
+    size_t         len;
+    bool           found;
+    uint64_t       last_epoch;   /**< witness_rows_clear_body: highest epoch cleared. */
+};
+
+static int raw_set_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
+{
+    struct raw_ctx *c = arg;
+
+    fdb_txn_set(tr, &c->key, c->val, c->len);
+    *st_out = MDS_OK;
+    return FDB_BODY_COMMIT;
+}
+
+static int raw_get_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
+{
+    struct raw_ctx *c = arg;
+    fdb_error_t err;
+
+    err = fdb_txn_get(tr, &c->key, false, c->val, sizeof(c->val), &c->len, &c->found);
+    if (err != 0) {
+        return (int)err;
+    }
+    *st_out = MDS_OK;
+    return FDB_BODY_COMMIT;
+}
+
+/* Clear WITNESS + mds_id + [0, last_epoch + 1): the rows the test wrote
+ * by hand under an mds_id no handle of this process owns any more. */
+static int witness_rows_clear_body(FDBTransaction *tr, void *arg, enum mds_status *st_out)
+{
+    struct raw_ctx *c = arg;
+    struct fdb_key_range r;
+
+    r.begin = c->key;
+    fdb_key_be64(&r.begin, 0);
+    r.end = c->key;
+    fdb_key_be64(&r.end, c->last_epoch + 1U);
+    if (!fdb_key_ok(&r.begin) || !fdb_key_ok(&r.end)) {
+        return FDB_ERR_PLATFORM_ERROR;
+    }
+    fdb_txn_clear_range(tr, &r);
+    *st_out = MDS_OK;
+    return FDB_BODY_COMMIT;
+}
+
+static enum mds_status witness_row_set(struct fdb_backend *b, uint32_t mds_id, uint64_t epoch)
+{
+    struct raw_ctx c;
+
+    memset(&c, 0, sizeof(c));
+    fdb_key_witness(&c.key, &b->prefix, mds_id, epoch, 0);
+    fdb_le64_put(c.val, 1);
+    c.len = 8;
+    return fdb_run_txn(b, FDB_TXN_MUTATING, "wit_set", raw_set_body, &c);
+}
+
+/* 1 present, 0 absent, -1 when the read failed. */
+static int witness_row_present(struct fdb_backend *b, uint32_t mds_id, uint64_t epoch)
+{
+    struct raw_ctx c;
+
+    memset(&c, 0, sizeof(c));
+    fdb_key_witness(&c.key, &b->prefix, mds_id, epoch, 0);
+    if (fdb_run_txn(b, FDB_TXN_READONLY, "wit_get", raw_get_body, &c) != MDS_OK) {
+        return -1;
+    }
+    return c.found ? 1 : 0;
+}
+
+static enum mds_status witness_rows_clear(struct fdb_backend *b, uint32_t mds_id,
+                                          uint64_t last_epoch)
+{
+    struct raw_ctx c;
+
+    memset(&c, 0, sizeof(c));
+    fdb_key_witness_mds_prefix(&c.key, &b->prefix, mds_id);
+    c.last_epoch = last_epoch;
+    return fdb_run_txn(b, FDB_TXN_MUTATING, "wit_clear", witness_rows_clear_body, &c);
+}
+
+/* A registry row for @p mds_id carrying @p witness_epoch, written by
+ * hand: the slot would stamp this process's own epoch. */
+static enum mds_status node_row_set(struct fdb_backend *b, uint32_t mds_id,
+                                    uint64_t witness_epoch)
+{
+    struct raw_ctx c;
+    struct fdb_node_val v;
+
+    memset(&c, 0, sizeof(c));
+    memset(&v, 0, sizeof(v));
+    v.boot_epoch = 1;
+    v.witness_epoch = witness_epoch;
+    v.nfs_port = 2049;
+    (void)snprintf(v.hostname, sizeof(v.hostname), "previous");
+    fdb_key_init(&c.key, &b->prefix, FDB_KT_NODE_REGISTRY);
+    fdb_key_be32(&c.key, mds_id);
+    if (!fdb_node_encode(&v, c.val, sizeof(c.val), &c.len)) {
+        return MDS_ERR_INVAL;
+    }
+    return fdb_run_txn(b, FDB_TXN_MUTATING, "node_set", raw_set_body, &c);
+}
+
+static bool node_row_get(struct fdb_backend *b, uint32_t mds_id, struct fdb_node_val *out)
+{
+    struct raw_ctx c;
+
+    memset(&c, 0, sizeof(c));
+    fdb_key_init(&c.key, &b->prefix, FDB_KT_NODE_REGISTRY);
+    fdb_key_be32(&c.key, mds_id);
+    if (fdb_run_txn(b, FDB_TXN_READONLY, "node_get", raw_get_body, &c) != MDS_OK || !c.found) {
+        return false;
+    }
+    return fdb_node_decode(c.val, c.len, out);
+}
+
+/* The open-time witness sweep of an mds_id clears only the rows strictly
+ * below the witness epoch its registry row carries (catalogue_fdb.c,
+ * witness_clear_body): the registered incarnation's rows -- possibly a
+ * still-running daemon's -- and the opener's own survive.  Every handle
+ * of this process shares one epoch E, so the previous incarnation is
+ * emulated by a hand-written registry row at W < E with witness rows at
+ * W - 1, W and E.  Then: no row sweeps everything below E; a row
+ * without an epoch sweeps nothing. */
+static void test_witness_sweep_bound(void)
+{
+    struct fdb_backend *b = g_cat->backend_private;
+    const uint64_t epoch = fdb_txn_witness_epoch();
+    const uint64_t w = epoch - 1000U;
+    const uint32_t id_reg = 41;
+    const uint32_t id_none = 42;
+    const uint32_t id_zero = 43;
+    struct mds_catalogue *cat;
+    struct fdb_node_val row;
+
+    ASSERT_TRUE(b != NULL && epoch > 1000U);
+
+    ASSERT_EQ(node_row_set(b, id_reg, w), MDS_OK);
+    ASSERT_EQ(witness_row_set(b, id_reg, w - 1U), MDS_OK);
+    ASSERT_EQ(witness_row_set(b, id_reg, w), MDS_OK);
+    ASSERT_EQ(witness_row_set(b, id_reg, epoch), MDS_OK);
+    cat = open_handle(id_reg);
+    ASSERT_TRUE(cat != NULL);
+    ASSERT_EQ(witness_row_present(b, id_reg, w - 1U), 0);
+    ASSERT_EQ(witness_row_present(b, id_reg, w), 1);
+    ASSERT_EQ(witness_row_present(b, id_reg, epoch), 1);
+    /* Registering through the new handle stamps this process's epoch
+     * and a heartbeat, which rewrites the row, keeps it. */
+    ASSERT_EQ(mds_cluster_node_register(cat, id_reg, 2, "next", 2049, 9401), MDS_OK);
+    ASSERT_TRUE(node_row_get(b, id_reg, &row));
+    ASSERT_EQ(row.boot_epoch, 2);
+    ASSERT_TRUE(row.witness_epoch == epoch);
+    ASSERT_EQ(mds_cluster_node_heartbeat(cat, id_reg, 2), MDS_OK);
+    ASSERT_TRUE(node_row_get(b, id_reg, &row));
+    ASSERT_TRUE(row.witness_epoch == epoch);
+    ASSERT_EQ(mds_cluster_node_deregister(cat, id_reg, 2), MDS_OK);
+    mds_catalogue_close(cat);
+
+    ASSERT_EQ(witness_row_set(b, id_none, epoch - 1U), MDS_OK);
+    ASSERT_EQ(witness_row_set(b, id_none, epoch), MDS_OK);
+    cat = open_handle(id_none);
+    ASSERT_TRUE(cat != NULL);
+    ASSERT_EQ(witness_row_present(b, id_none, epoch - 1U), 0);
+    ASSERT_EQ(witness_row_present(b, id_none, epoch), 1);
+    mds_catalogue_close(cat);
+
+    ASSERT_EQ(node_row_set(b, id_zero, 0), MDS_OK);
+    ASSERT_EQ(witness_row_set(b, id_zero, epoch - 1U), MDS_OK);
+    cat = open_handle(id_zero);
+    ASSERT_TRUE(cat != NULL);
+    ASSERT_EQ(witness_row_present(b, id_zero, epoch - 1U), 1);
+    mds_catalogue_close(cat);
+
+    ASSERT_EQ(witness_rows_clear(b, id_reg, epoch), MDS_OK);
+    ASSERT_EQ(witness_rows_clear(b, id_none, epoch), MDS_OK);
+    ASSERT_EQ(witness_rows_clear(b, id_zero, epoch), MDS_OK);
+    ASSERT_EQ(witness_row_present(b, id_zero, epoch - 1U), 0);
+}
+
 /* --- codecs: malformed values are rejected, never defaulted ------------------- */
 
 static void test_codecs_reject(void)
@@ -1361,6 +1554,7 @@ int main(void)
     RUN_TEST(test_shared_state);
     RUN_TEST(test_locks);
     RUN_TEST(test_cluster_contract);
+    RUN_TEST(test_witness_sweep_bound);
 
     (void)catalogue_fdb_keyspace_clear(g_cat);
     mds_catalogue_close(g_cat0);
