@@ -100,7 +100,7 @@ static int tests_failed;
 
 /* Every ASSERT_* above is one branch: the complexity metric counts the
  * assertions, not control flow (same shape as every test in tests/unit). */
-// NOLINTBEGIN(readability-function-cognitive-complexity)
+/* NOLINTBEGIN(readability-function-cognitive-complexity) */
 
 /* -----------------------------------------------------------------------
  * Part 1: every status has a name and an NFS mapping
@@ -565,7 +565,7 @@ COORD_FWD(slot_get,
 /* Signatures are fixed by the vtable slot types (catalogue_internal.h):
  * the out-parameters cannot be const even though a stand-in that
  * answers INDOUBT deliberately leaves them untouched. */
-// NOLINTBEGIN(readability-non-const-parameter)
+/* NOLINTBEGIN(readability-non-const-parameter) */
 
 static enum mds_status fake_ns_create_indoubt(
 	struct mds_catalogue *cat, struct mds_cat_txn *txn, uint64_t parent,
@@ -673,7 +673,7 @@ static enum mds_status fake_layoutget_fused_indoubt(
 	return fake_indoubt();
 }
 
-// NOLINTEND(readability-non-const-parameter)
+/* NOLINTEND(readability-non-const-parameter) */
 
 /* --- lifecycle of the proxy ------------------------------------------- */
 
@@ -1422,4 +1422,4 @@ int main(void)
 	return (tests_failed == 0 && tests_passed == tests_run) ? 0 : 1;
 }
 
-// NOLINTEND(readability-function-cognitive-complexity)
+/* NOLINTEND(readability-function-cognitive-complexity) */
