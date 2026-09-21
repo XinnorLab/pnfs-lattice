@@ -887,7 +887,7 @@ struct mds_config {
                                                * (0 = engine default). */
 
     /* Inline data (small file acceleration) */
-    bool                inline_enabled;       /* Master switch (default true) */
+    bool                inline_enabled;       /* Master switch (default false) */
     uint32_t            inline_max_size;      /* Max bytes for inline storage (default 65536) */
 
     /* Commit pipeline (single-writer batch commit) */

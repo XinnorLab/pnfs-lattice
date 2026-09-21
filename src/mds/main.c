@@ -2085,7 +2085,7 @@ int main(int argc, char *argv[])
 
 		/* Delegation state table (RFC 8881 S10.4).
 		 *
-		 * Gated by cfg.file_delegations_enabled (default true).  When
+		 * Gated by cfg.file_delegations_enabled (default false).  When
 		 * false, we skip the table init entirely and leave
 		 * rpc_cfg.dt == NULL so cd->dt == NULL in compound_data;
 		 * op_open's deleg-grant arm short-circuits at the

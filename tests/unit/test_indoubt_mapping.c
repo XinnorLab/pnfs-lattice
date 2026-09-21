@@ -44,6 +44,7 @@
 #include "catalogue_memdb.h"
 #include "compound.h"
 #include "ds_prealloc.h"
+#include "layout_recall.h"
 #include "open_state.h"
 #include "parent_touch.h"
 #include "remove_manifest.h"
@@ -1419,6 +1420,9 @@ int main(void)
 	RUN_TEST(test_link_indoubt);
 
 	(void)fprintf(stdout, "\n%d/%d tests passed\n", tests_passed, tests_run);
+	/* The LAYOUTGET paths above populate the process-global seqid
+	 * table; release it so the leak check sees no reachable blocks. */
+	layout_seqid_table_destroy();
 	return (tests_failed == 0 && tests_passed == tests_run) ? 0 : 1;
 }
 

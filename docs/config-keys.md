@@ -64,6 +64,7 @@ are logged as `WARN:` and the default is kept.
 Operator surface for the per-inode N-to-1 mode described in `hpc-shared-files.md`.
 - `hpc_max_stripe_count` — cap on `stripe_count` for HPC-Shared creates regardless of ONLINE DS count (1..1024, the compile-time `MDS_MAX_STRIPES`).  Default: 128.  An out-of-range value is a fatal configuration error, not a warning.
 - `hpc_serve_layouts` — bool.  Default: false.  Serve pNFS layouts for HPC-Shared inodes; off answers their LAYOUTGET with `LAYOUTUNAVAILABLE` (MDS proxy I/O).  Turn on only when every client runs Linux 6.18+ (multi-DS-per-mirror flex-files); older clients treat the stripes as mirrors and corrupt data.  Independent of `serve_layouts`, which must also be on.
+- `hpc_pending_recovery_scan` — bool.  Default: false.  Run the start-up scan that repairs PENDING wide-create inodes left by pre-atomic releases (namespace rows persisted separately from the stripe map).  The scan walks the whole namespace from the root before requests are accepted, so enable it once after upgrading from an affected release; lazy lookup-time recovery is always active regardless.
 - `hpc_xdr_form` — `auto|legacy|striped`.  Default: auto (multi-DS-per-mirror form only for HPC-Shared inodes with `mirror_count == 1` and `stripe_count > 1`; `legacy` forces one-DS-per-mirror, `striped` forces multi-DS-per-mirror).  Any other token is a fatal configuration error.
 ## Commit pipeline
 - `CommitBatchSize`, `CommitBatchMaxBytes`, `CommitFlushMs`, `CommitQueueDepth` — single-writer batch commit knobs.

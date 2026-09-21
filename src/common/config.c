@@ -1236,6 +1236,9 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
         } else if (strcmp(key, "file_delegations_enabled") == 0) {
             cfg->file_delegations_enabled =
                 (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+        } else if (strcmp(key, "hpc_pending_recovery_scan") == 0) {
+            cfg->hpc_pending_recovery_scan =
+                (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
         } else if (strcmp(key, "ndb_conn_pool_size") == 0) {
             unsigned long v = strtoul(val, NULL, 10);
             if (v > 0 && v <= 64) {
