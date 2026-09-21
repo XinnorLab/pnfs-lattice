@@ -1004,6 +1004,7 @@ static void test_compound_open_create_close(void)
 	uint32_t n;
 	char *path;
 
+	memset(res, 0, sizeof(res));
 	path = make_temp_db_path();
 	db = open_scratch_db(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
@@ -1066,6 +1067,7 @@ static void test_compound_open_existing(void)
 	uint32_t n;
 	char *path;
 
+	memset(res, 0, sizeof(res));
 	path = make_temp_db_path();
 	db = open_scratch_db(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
@@ -1122,6 +1124,7 @@ static void test_compound_open_noent(void)
 	uint32_t n;
 	char *path;
 
+	memset(res, 0, sizeof(res));
 	path = make_temp_db_path();
 	db = open_scratch_db(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
@@ -1156,6 +1159,7 @@ static void test_compound_open_guarded_exist(void)
 	uint32_t n;
 	char *path;
 
+	memset(res, 0, sizeof(res));
 	path = make_temp_db_path();
 	db = open_scratch_db(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
@@ -1237,6 +1241,7 @@ static void test_compound_share_conflict(void)
 	static const uint8_t owner_a[] = { 'A', 'A', 'A', 'A' };
 	static const uint8_t owner_b[] = { 'B', 'B', 'B', 'B' };
 
+	memset(res, 0, sizeof(res));
 	path = make_temp_db_path();
 	db = open_scratch_db(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
@@ -1291,6 +1296,7 @@ static void test_compound_open_claim_fh(void)
 	uint32_t n;
 	char *path;
 
+	memset(res, 0, sizeof(res));
 	path = make_temp_db_path();
 	db = open_scratch_db(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
@@ -1348,6 +1354,7 @@ static void test_compound_close_bad_stateid(void)
 	uint32_t n;
 	char *path;
 
+	memset(res, 0, sizeof(res));
 	path = make_temp_db_path();
 	db = open_scratch_db(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
@@ -1382,6 +1389,7 @@ static void test_compound_reopen_after_close(void)
 	uint32_t n;
 	char *path;
 
+	memset(res, 0, sizeof(res));
 	path = make_temp_db_path();
 	db = open_scratch_db(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
@@ -1443,6 +1451,7 @@ static void test_compound_open_directory(void)
 	uint32_t n;
 	char *path;
 
+	memset(res, 0, sizeof(res));
 	path = make_temp_db_path();
 	db = open_scratch_db(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
