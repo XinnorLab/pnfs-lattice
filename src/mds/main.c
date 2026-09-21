@@ -2499,6 +2499,10 @@ cleanup:
 		mds_catalogue_close(cat);
 		cat = NULL;
 	}
+	/* Process-wide backend state (e.g. the FoundationDB client network
+	 * thread) goes after the LAST handle is closed and before the log
+	 * is shut down; no catalogue may be opened after this point. */
+	mds_catalogue_process_shutdown();
 	mds_tls_ctx_destroy(cluster_tls);
 	mds_tls_ctx_destroy(cluster_tls_client);
 

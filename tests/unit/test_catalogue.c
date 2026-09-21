@@ -1644,7 +1644,8 @@ int main(void)
 	 * test_catalogue_root_global_helper_routing retired -- see
 	 * comment at the function definitions. */
 
-	fprintf(stdout, "\ntest_catalogue: %d/%d passed\n",
-		tests_passed, tests_run);
-	return (tests_passed == tests_run) ? 0 : 1;
+		fprintf(stdout, "\ntest_catalogue: %d/%d passed\n",
+			tests_passed, tests_run);
+		conformance_shutdown();
+		return (tests_passed == tests_run) ? 0 : 1;
 }

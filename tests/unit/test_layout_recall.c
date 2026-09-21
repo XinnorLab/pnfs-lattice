@@ -1468,5 +1468,6 @@ int main(void)
                                      "test_unlink_revoke_forces_revoke_on_delay");
 
     printf("\n%d passed, %d failed\n", pass_count, fail_count);
+    conformance_shutdown();
     return fail_count > 0 ? 1 : 0;
 }

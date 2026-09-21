@@ -42,6 +42,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1032,6 +1033,10 @@ struct watchdog {
     unsigned seconds;
 };
 
+/* Name of the sub-test the driver is running (NULL between two), so a
+ * suite-watchdog report says where the binary was stuck. */
+static const char *_Atomic g_running_subtest;
+
 static void *watchdog_main(void *arg)
 {
     struct watchdog *w = arg;
@@ -1045,9 +1050,12 @@ static void *watchdog_main(void *arg)
         rc = pthread_cond_timedwait(&w->cond, &w->lock, &deadline);
     }
     if (!w->done) {
+        const char *sub = atomic_load(&g_running_subtest);
+        bool name_sub = sub != NULL && strcmp(sub, w->what) != 0;
+
         pthread_mutex_unlock(&w->lock);
-        (void)printf("  FAIL %s: no progress for %u s (deadlock)\n", w->what,
-                     w->seconds);
+        (void)printf("  FAIL %s: no progress for %u s (deadlock%s%s)\n", w->what,
+                     w->seconds, name_sub ? " in " : "", name_sub ? sub : "");
         (void)fflush(stdout);
         _exit(1);
     }
@@ -1382,11 +1390,26 @@ static void heartbeat_passthrough(struct ctx *c)
 
 #define CAPACITY_BUDGET 100000U
 
+/* A store without a capacity bound (FoundationDB) would run the whole
+ * create budget -- two transactions per iteration -- only to SKIP, and
+ * the suite watchdog would fire first.  The wall-clock budget reaches
+ * that SKIP in bounded time; memdb hits NOSPC well inside it. */
+#define CAPACITY_TIME_BUDGET_SEC 120U
+
+static uint64_t monotonic_sec(void)
+{
+    struct timespec ts;
+
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec;
+}
+
 static void capacity_exhaustion(struct ctx *c)
 {
     struct mds_catalogue *cat = NULL;
     struct mds_inode out, last_parent, parent, seen;
     uint64_t dir = 0;
+    uint64_t start_sec;
     unsigned created = 0;
     unsigned i;
     enum mds_status st = MDS_OK;
@@ -1404,6 +1427,7 @@ static void capacity_exhaustion(struct ctx *c)
         mds_catalogue_close(cat);
         return;
     }
+    start_sec = monotonic_sec();
     for (i = 0; i < CAPACITY_BUDGET; i++) {
         (void)snprintf(name, sizeof(name), "cap-%u", i);
         memset(&out, 0, sizeof(out));
@@ -1417,10 +1441,18 @@ static void capacity_exhaustion(struct ctx *c)
             ctx_fail(c, "parent getattr failed after create %u", i);
             break;
         }
+        if (monotonic_sec() - start_sec >= CAPACITY_TIME_BUDGET_SEC) {
+            break;
+        }
     }
     if (c->res != R_FAIL) {
         if (st == MDS_OK) {
-            ctx_skip(c, "no MDS_ERR_NOSPC within the create budget");
+            char why[128];
+
+            (void)snprintf(why, sizeof(why), "no MDS_ERR_NOSPC within the "
+                           "create/time budget (%u creates in %u s)", created,
+                           (unsigned)(monotonic_sec() - start_sec));
+            ctx_skip(c, why);
         } else if (st != MDS_ERR_NOSPC) {
             ctx_fail(c, "create %u returned %s (want NOSPC)", created,
                      status_name(st));
@@ -1508,6 +1540,7 @@ int main(int argc, char **argv)
         memset(&c, 0, sizeof(c));
         c.cat = cat;
         c.res = R_PASS;
+        atomic_store(&g_running_subtest, subtests[i].name);
         if (subtests[i].needs_scratch &&
             conformance_scratch_dir(cat, &c.dir) != MDS_OK) {
             ctx_fail(&c, "cannot create scratch directory");
@@ -1517,6 +1550,7 @@ int main(int argc, char **argv)
         if (subtests[i].needs_scratch && c.dir != 0) {
             conformance_scratch_cleanup(cat, c.dir);
         }
+        atomic_store(&g_running_subtest, NULL);
         switch (c.res) {
         case R_PASS:
             passed++;
@@ -1543,5 +1577,6 @@ int main(int argc, char **argv)
     mds_catalogue_close(cat);
     (void)printf("\ntest_contract: %u passed, %u failed, %u skipped\n", passed,
                  failed, skipped);
+    conformance_shutdown();
     return (failed == 0) ? 0 : 1;
 }

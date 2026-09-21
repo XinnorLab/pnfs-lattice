@@ -1246,6 +1246,15 @@ static bool rondb_compiled_in(void)
 #endif
 }
 
+static bool fdb_compiled_in(void)
+{
+#ifdef HAVE_FDB
+    return true;
+#else
+    return false;
+#endif
+}
+
 static void test_backend_names(void)
 {
     enum mds_catalogue_backend be = MDS_BACKEND_NONE;
@@ -1305,20 +1314,24 @@ static void test_backend_registry(void)
     size_t n;
     size_t expect = 0;
 
-    /* fdb is known but never available; NONE and garbage never are. */
-    ASSERT_TRUE(!mds_catalogue_backend_available(MDS_BACKEND_FDB));
+    /* NONE and garbage are never available. */
     ASSERT_TRUE(!mds_catalogue_backend_available(MDS_BACKEND_NONE));
     ASSERT_TRUE(!mds_catalogue_backend_available(
                     (enum mds_catalogue_backend)77));
-    /* rondb availability follows the build flavour exactly. */
+    /* rondb / fdb availability follows the build flavour exactly. */
     ASSERT_EQ((int)mds_catalogue_backend_available(MDS_BACKEND_RONDB),
               (int)rondb_compiled_in());
+    ASSERT_EQ((int)mds_catalogue_backend_available(MDS_BACKEND_FDB),
+              (int)fdb_compiled_in());
 
     /* The name list agrees with the availability predicate. */
     if (mds_catalogue_backend_available(MDS_BACKEND_RONDB)) {
         expect++;
     }
     if (mds_catalogue_backend_available(MDS_BACKEND_MEMDB)) {
+        expect++;
+    }
+    if (mds_catalogue_backend_available(MDS_BACKEND_FDB)) {
         expect++;
     }
     n = mds_catalogue_backend_available_names(names, sizeof(names));
@@ -1331,7 +1344,8 @@ static void test_backend_registry(void)
                   (int)mds_catalogue_backend_available(MDS_BACKEND_RONDB));
         ASSERT_EQ((int)(strstr(names, "memdb") != NULL),
                   (int)mds_catalogue_backend_available(MDS_BACKEND_MEMDB));
-        ASSERT_TRUE(strstr(names, "fdb") == NULL);
+        ASSERT_EQ((int)(strstr(names, "fdb") != NULL),
+                  (int)mds_catalogue_backend_available(MDS_BACKEND_FDB));
     }
     ASSERT_EQ(mds_catalogue_backend_available_names(NULL, 8), 0U);
     ASSERT_EQ(mds_catalogue_backend_available_names(names, 0), 0U);
@@ -1349,14 +1363,17 @@ static void test_open_unavailable_backend(void)
 
     memset(&cfg, 0, sizeof(cfg));
 
-    /* Known, never compiled in. */
-    cfg.catalogue_backend = MDS_BACKEND_FDB;
-    ASSERT_EQ(stderr_capture_begin(&cap), 0);
-    ASSERT_EQ(mds_catalogue_open(&cfg, &cat), MDS_ERR_INVAL);
-    stderr_capture_end(&cap, err, sizeof(err));
-    ASSERT_TRUE(cat == (struct mds_catalogue *)&fake_feed);
-    ASSERT_TRUE(strstr(err, "catalogue_backend fdb not compiled in") != NULL);
-    ASSERT_TRUE(strstr(err, "available:") != NULL);
+    /* Known; refused by name when this build lacks it. */
+    if (!fdb_compiled_in()) {
+        cfg.catalogue_backend = MDS_BACKEND_FDB;
+        ASSERT_EQ(stderr_capture_begin(&cap), 0);
+        ASSERT_EQ(mds_catalogue_open(&cfg, &cat), MDS_ERR_INVAL);
+        stderr_capture_end(&cap, err, sizeof(err));
+        ASSERT_TRUE(cat == (struct mds_catalogue *)&fake_feed);
+        ASSERT_TRUE(strstr(err, "catalogue_backend fdb not compiled in")
+                    != NULL);
+        ASSERT_TRUE(strstr(err, "available:") != NULL);
+    }
 
     /* No backend configured (the no-RonDB default). */
     cfg.catalogue_backend = MDS_BACKEND_NONE;

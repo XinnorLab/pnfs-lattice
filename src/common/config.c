@@ -1248,6 +1248,41 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
         } else if (strcmp(key, "ndb_async_writes") == 0) {
             cfg->ndb_async_writes = (strcmp(val, "true") == 0 ||
                                      strcmp(val, "1") == 0);
+
+        /* FoundationDB backend (see struct mds_config). */
+        } else if (strcmp(key, "fdb_cluster_file") == 0) {
+            (void)snprintf(cfg->fdb_cluster_file,
+                sizeof(cfg->fdb_cluster_file), "%s", val);
+        } else if (strcmp(key, "fdb_key_prefix") == 0) {
+            if (strlen(val) >= sizeof(cfg->fdb_key_prefix)) {
+                (void)fprintf(stderr,
+                    "ERROR: fdb_key_prefix longer than %zu bytes\n",
+                    sizeof(cfg->fdb_key_prefix) - 1);
+                (void)fclose(fp);
+                return MDS_ERR_INVAL;
+            }
+            (void)snprintf(cfg->fdb_key_prefix,
+                sizeof(cfg->fdb_key_prefix), "%s", val);
+        } else if (strcmp(key, "fdb_op_deadline_ms") == 0) {
+            unsigned long v = strtoul(val, NULL, 10);
+            if (v > 0 && v <= 600000UL) {
+                cfg->fdb_op_deadline_ms = (uint32_t)v;
+            } else {
+                (void)fprintf(stderr,
+                    "WARN: fdb_op_deadline_ms=%lu out of range "
+                    "(1..600000); using default\n", v);
+            }
+        } else if (strcmp(key, "fdb_txn_timeout_ms") == 0) {
+            /* One attempt must finish inside the 5 s FDB transaction
+             * window, so the cap is 4900 ms. */
+            unsigned long v = strtoul(val, NULL, 10);
+            if (v > 0 && v <= 4900UL) {
+                cfg->fdb_txn_timeout_ms = (uint32_t)v;
+            } else {
+                (void)fprintf(stderr,
+                    "WARN: fdb_txn_timeout_ms=%lu out of range "
+                    "(1..4900); using default\n", v);
+            }
         } else if (strcmp(key, "placement_policy") == 0) {
             if (strcmp(val, "rr") == 0) {
                 cfg->placement_policy = PLACEMENT_RR;

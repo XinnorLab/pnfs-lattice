@@ -78,6 +78,7 @@ add_executable(test_rondb_schema    unit/test_rondb_schema.c)
 add_executable(test_rondb_lock_shim unit/test_rondb_lock_shim.c)
 add_executable(test_rondb_changefeed unit/test_rondb_changefeed.c)
 add_executable(test_coord_shared_state unit/test_coord_shared_state.c)
+add_executable(test_dispatch_null_slots unit/test_dispatch_null_slots.c)
 add_executable(test_dir_delegation  unit/test_dir_delegation.c)
 add_executable(test_delegation      unit/test_delegation.c)
 add_executable(test_ds_capacity     unit/test_ds_capacity.c)
@@ -146,6 +147,7 @@ foreach(test_target
     test_rondb_lock_shim
     test_rondb_changefeed
     test_coord_shared_state
+    test_dispatch_null_slots
     test_dir_delegation
     test_delegation
     test_ds_capacity
@@ -538,3 +540,46 @@ target_link_libraries(test_proxy_seek_hole PRIVATE
 )
 add_test(NAME test_proxy_seek_hole COMMAND test_proxy_seek_hole)
 set_tests_properties(test_proxy_seek_hole PROPERTIES LABELS "unit")
+
+# -------------------------------------------------------------------
+# fdb track (Phase 5) -- FoundationDB backend foundation.
+#
+# test_fdb_codec compiles the pure-C codec straight into the binary so
+# the value formats and the key registry are checked in every tree,
+# ENABLE_FDB or not.  test_fdb_txn links the backend through
+# pnfs_mds_core (HAVE_FDB is PUBLIC there); without ENABLE_FDB, or
+# without a readable cluster file / reachable fdbserver, it exits 77,
+# registered as SKIP_RETURN_CODE.  Appended block.
+# -------------------------------------------------------------------
+add_executable(test_fdb_codec unit/test_fdb_codec.c
+                              ${PROJECT_SOURCE_DIR}/src/catalogue/fdb_codec.c)
+target_include_directories(test_fdb_codec PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src/catalogue
+)
+add_test(NAME test_fdb_codec COMMAND test_fdb_codec)
+set_tests_properties(test_fdb_codec PROPERTIES LABELS "unit")
+
+add_executable(test_fdb_txn unit/test_fdb_txn.c)
+target_include_directories(test_fdb_txn PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src/catalogue
+    ${PROJECT_SOURCE_DIR}/tests
+)
+if(ENABLE_FDB)
+    target_include_directories(test_fdb_txn SYSTEM PRIVATE ${FDB_INCLUDE_DIR})
+endif()
+target_link_libraries(test_fdb_txn PRIVATE
+    pnfs_mds_core
+    pnfs_cluster
+    pnfs_fsal_obj
+    pnfs_common
+    pnfs_mds_core
+    pnfs_cluster
+    pnfs_mds_core
+    rondb_schema
+    pthread
+)
+add_test(NAME test_fdb_txn COMMAND test_fdb_txn)
+set_tests_properties(test_fdb_txn PROPERTIES LABELS "unit" SKIP_RETURN_CODE 77)
+# End of fdb track block.

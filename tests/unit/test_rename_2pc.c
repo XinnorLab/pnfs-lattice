@@ -557,5 +557,6 @@ int main(void)
     test_2pc_recover_prepared_participant_kept();
 
     fprintf(stdout, "\n  %d passed, %d failed\n", passed, failed);
+    conformance_shutdown();
     return failed ? 1 : 0;
 }

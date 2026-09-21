@@ -168,6 +168,34 @@ size_t mds_catalogue_backend_available_names(char *buf, size_t cap);
  */
 void mds_catalogue_close(struct mds_catalogue *cat);
 
+/**
+ * Release process-wide backend resources after the LAST catalogue handle
+ * of the process has been closed.
+ *
+ * Some client libraries hold once-per-process state that a handle
+ * close cannot release: the FoundationDB client runs one network
+ * thread per process and stopping it is terminal, so no open() may
+ * follow.  The daemon calls this exactly once, after its final
+ * mds_catalogue_close() and before the log is shut down; the test
+ * harness calls it at exit.  Backends that need it register a hook
+ * with mds_catalogue_register_process_shutdown() when they start their
+ * process-wide state; each registered hook runs once, in reverse
+ * registration order, and the table is emptied.  Safe to call with no
+ * hooks registered and safe to call more than once.  Backends without
+ * process-wide state (RonDB, memdb) register nothing.
+ */
+void mds_catalogue_process_shutdown(void);
+
+/**
+ * Register a backend's process-shutdown hook (backend constructors
+ * only).  Bounded static table; a hook already registered is not added
+ * twice.
+ *
+ * @return MDS_OK; MDS_ERR_INVAL for NULL; MDS_ERR_NOSPC when the table
+ *         is full.
+ */
+enum mds_status mds_catalogue_register_process_shutdown(void (*hook)(void));
+
 /** Return the backend's native client handle (e.g. RonDB shim handle)
  *  for backend-specific tools.  Returns NULL if cat is NULL or the
  *  backend exposes no native handle (in-memory test backend). */

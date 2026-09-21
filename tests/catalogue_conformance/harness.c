@@ -15,9 +15,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "harness.h"
+#ifdef HAVE_FDB
+#include "catalogue_fdb.h"
+#endif
 
 /* Bounded table of scratch directories created by this process so the
  * cleanup helper can remove them by (root, name) again.  Beyond the
@@ -130,15 +134,154 @@ static enum mds_status open_rondb(struct mds_catalogue **out)
 #endif
 }
 
+#ifdef HAVE_FDB
+/*
+ * FoundationDB: every open of the process shares one key prefix, taken
+ * from CATALOGUE_TEST_KEY_PREFIX or generated once per process, so
+ * concurrent binaries against one fdbserver never see each other's
+ * rows.  The prefix range is cleared and bootstrapped on the first
+ * open and cleared again by conformance_shutdown(), which then stops
+ * the client network (mds_catalogue_process_shutdown; terminal for the
+ * process).  An atexit() hook runs the same teardown for a main that
+ * exits without the explicit call.
+ */
+static pthread_mutex_t g_fdb_lock = PTHREAD_MUTEX_INITIALIZER;
+static char            g_fdb_prefix[32];
+static bool            g_fdb_prepared;
+static bool            g_fdb_torn_down;
+
+static void fdb_fill_cfg(struct mds_config *cfg)
+{
+    const char *cluster = getenv("FDB_CLUSTER_FILE");
+
+    cfg->catalogue_backend = MDS_BACKEND_FDB;
+    if (cluster != NULL && cluster[0] != '\0') {
+        (void)snprintf(cfg->fdb_cluster_file, sizeof(cfg->fdb_cluster_file), "%s",
+                       cluster);
+    }
+    (void)snprintf(cfg->fdb_key_prefix, sizeof(cfg->fdb_key_prefix), "%s",
+                   g_fdb_prefix);
+    cfg->self.id = 1;
+    cfg->cluster_size = 1;
+}
+
+/* Once per process, after the last test handle is closed: wipe the
+ * run's rows with a fresh handle, then stop the client network. */
+static void fdb_teardown_once(void)
+{
+    struct mds_config *cfg;
+    struct mds_catalogue *cat = NULL;
+
+    pthread_mutex_lock(&g_fdb_lock);
+    if (!g_fdb_prepared || g_fdb_torn_down) {
+        pthread_mutex_unlock(&g_fdb_lock);
+        return;
+    }
+    g_fdb_torn_down = true;
+    pthread_mutex_unlock(&g_fdb_lock);
+
+    cfg = calloc(1, sizeof(*cfg));
+    if (cfg != NULL) {
+        fdb_fill_cfg(cfg);
+        if (mds_catalogue_open(cfg, &cat) == MDS_OK) {
+            (void)catalogue_fdb_keyspace_clear(cat);
+            mds_catalogue_close(cat);
+        }
+        free(cfg);
+    }
+    mds_catalogue_process_shutdown();
+}
+
+/* Safety net for a main that exits without conformance_shutdown(). */
+static void fdb_atexit(void)
+{
+    fdb_teardown_once();
+}
+
+/* Once per process: choose the prefix, clear it, bootstrap the root. */
+static enum mds_status fdb_prepare_once(void)
+{
+    struct mds_config *cfg;
+    struct mds_catalogue *cat = NULL;
+    const char *env;
+    enum mds_status st;
+
+    pthread_mutex_lock(&g_fdb_lock);
+    if (g_fdb_prepared) {
+        pthread_mutex_unlock(&g_fdb_lock);
+        return MDS_OK;
+    }
+    env = getenv("CATALOGUE_TEST_KEY_PREFIX");
+    if (env != NULL && env[0] != '\0') {
+        (void)snprintf(g_fdb_prefix, sizeof(g_fdb_prefix), "%s", env);
+    } else {
+        struct timespec ts;
+
+        (void)clock_gettime(CLOCK_REALTIME, &ts);
+        (void)snprintf(g_fdb_prefix, sizeof(g_fdb_prefix), "ct-%ld-%08lx",
+                       (long)getpid(), (unsigned long)ts.tv_nsec);
+    }
+    cfg = calloc(1, sizeof(*cfg));
+    if (cfg == NULL) {
+        pthread_mutex_unlock(&g_fdb_lock);
+        return MDS_ERR_NOMEM;
+    }
+    fdb_fill_cfg(cfg);
+    st = mds_catalogue_open(cfg, &cat);
+    free(cfg);
+    if (st != MDS_OK) {
+        pthread_mutex_unlock(&g_fdb_lock);
+        return st;
+    }
+    st = catalogue_fdb_keyspace_clear(cat);
+    if (st == MDS_OK) {
+        st = mds_catalogue_bootstrap(cat);
+    }
+    mds_catalogue_close(cat);
+    if (st == MDS_OK) {
+        g_fdb_prepared = true;
+        (void)atexit(fdb_atexit);
+    }
+    pthread_mutex_unlock(&g_fdb_lock);
+    return st;
+}
+#endif /* HAVE_FDB */
+
 static enum mds_status open_fdb(struct mds_catalogue **out)
 {
-    /* Gate 2.  When the FoundationDB backend exists, this opens it with
-     * FDB_CLUSTER_FILE and an isolated per-run key prefix taken from
-     * CATALOGUE_TEST_KEY_PREFIX (generated randomly when unset, cleared
-     * at start and at exit) so concurrent runs against one fdbserver
-     * never see each other's rows.  Hook only; no implementation. */
+#ifdef HAVE_FDB
+    struct mds_config *cfg;
+    const char *cluster;
+    enum mds_status st;
+
+    if (!mds_catalogue_backend_available(MDS_BACKEND_FDB)) {
+        conformance_skip("fdb backend not compiled in (ENABLE_FDB=OFF)");
+    }
+    cluster = getenv("FDB_CLUSTER_FILE");
+    if (cluster == NULL || cluster[0] == '\0') {
+        cluster = "/etc/foundationdb/fdb.cluster";
+    }
+    if (access(cluster, R_OK) != 0) {
+        conformance_skip("no readable FoundationDB cluster file "
+                         "(FDB_CLUSTER_FILE / /etc/foundationdb/fdb.cluster)");
+    }
+    st = fdb_prepare_once();
+    if (st != MDS_OK) {
+        (void)fprintf(stdout, "SKIP: FoundationDB cluster not usable (%d)\n", (int)st);
+        conformance_skip("FoundationDB cluster unreachable");
+    }
+    cfg = calloc(1, sizeof(*cfg));
+    if (cfg == NULL) {
+        return MDS_ERR_NOMEM;
+    }
+    fdb_fill_cfg(cfg);
+    st = mds_catalogue_open(cfg, out);
+    free(cfg);
+    return st;
+#else
     (void)out;
-    conformance_skip("FoundationDB backend is not built in gate 1");
+    conformance_skip("fdb backend not compiled in (ENABLE_FDB=OFF)");
+#endif
 }
 
 enum mds_status conformance_open(struct mds_catalogue **out)
@@ -165,6 +308,16 @@ enum mds_status conformance_open(struct mds_catalogue **out)
                   "conformance: unknown " CONFORMANCE_BACKEND_ENV
                   " '%s' (expected memdb|rondb|fdb)\n", name);
     exit(1);
+}
+
+void conformance_shutdown(void)
+{
+#ifdef HAVE_FDB
+    fdb_teardown_once();
+#endif
+    /* No hooks are registered on memdb / rondb: a no-op there, and
+     * idempotent after the fdb teardown above. */
+    mds_catalogue_process_shutdown();
 }
 
 struct mds_catalogue *conformance_open_checked(void)

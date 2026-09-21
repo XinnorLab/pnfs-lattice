@@ -29,9 +29,12 @@
 #ifdef HAVE_MEMDB_BACKEND
 #include "catalogue_memdb.h"
 #endif
+#ifdef HAVE_FDB
+#include "catalogue_fdb.h"
+#endif
 
 /** One row per known backend.  open == NULL means "known, not compiled
- *  in" (and, for fdb, "reserved: not built yet"). */
+ *  in". */
 struct catalogue_backend_entry {
 	enum mds_catalogue_backend  id;
 	enum mds_status           (*open)(const struct mds_config *cfg,
@@ -56,11 +59,12 @@ static const struct catalogue_backend_entry catalogue_backends[] = {
 #endif
 	},
 	{
-		/* Reserved: the FoundationDB backend is not built in this
-		 * tree yet, so the row exists only to make the id known
-		 * ("not compiled in") and never available. */
 		.id   = MDS_BACKEND_FDB,
+#ifdef HAVE_FDB
+		.open = catalogue_fdb_open,
+#else
 		.open = NULL,
+#endif
 	},
 };
 

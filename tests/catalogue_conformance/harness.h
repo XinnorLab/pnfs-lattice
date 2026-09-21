@@ -67,6 +67,16 @@ bool conformance_backend_is(const char *name);
 _Noreturn void conformance_skip(const char *reason);
 
 /**
+ * Process-wide teardown; every test main calls it once, after its last
+ * handle is closed and immediately before returning.  On fdb it wipes
+ * the run's rows and stops and joins the client network
+ * (mds_catalogue_process_shutdown), which is terminal for the process:
+ * no conformance_open() may follow.  On memdb / rondb it is a no-op.
+ * Idempotent; an atexit() safety net covers a main that exits early.
+ */
+void conformance_shutdown(void);
+
+/**
  * Create a fresh, uniquely named scratch directory under the root so
  * tests never collide with each other or with a persistent store
  * (RonDB keeps its namespace across runs).

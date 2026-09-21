@@ -1480,6 +1480,7 @@ int main(void)
 	RUN_TEST(test_compound_reopen_after_close);
 	RUN_TEST(test_compound_open_directory);
 
-	fprintf(stdout, "\n%d/%d tests passed.\n", tests_passed, tests_run);
-	return (tests_passed == tests_run) ? 0 : 1;
+		fprintf(stdout, "\n%d/%d tests passed.\n", tests_passed, tests_run);
+		conformance_shutdown();
+		return (tests_passed == tests_run) ? 0 : 1;
 }

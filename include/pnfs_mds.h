@@ -179,6 +179,17 @@ enum mds_status {
     MDS_ERR_NOSPC      = -17,
     MDS_ERR_LAYOUTUNAVAIL = -18,
     MDS_ERR_NOSUPPORT  = -19,
+    /*
+     * The backend could not determine whether a commit landed: the
+     * mutation MAY or MAY NOT be persisted.  Never treat it as success
+     * and never retry the operation blindly (a landed CREATE/REMOVE
+     * would then come back EXISTS/NOENT and be misreported).  Callers
+     * must keep every resource the operation may have consumed
+     * (safe_to_discard = false), log the operation identity and
+     * surface a hard error to the client.  Appended: values are never
+     * renumbered.
+     */
+    MDS_ERR_INDOUBT    = -20,
 };
 
 /* -----------------------------------------------------------------------
@@ -1119,6 +1130,28 @@ struct mds_config {
      * conflict-recall (Mark's byte-range bug) is gated separately by
      * the layout_recall coordinator. */
     bool                file_delegations_enabled;
+
+    /*
+     * FoundationDB catalogue backend (catalogue_backend = fdb).
+     *
+     * fdb_cluster_file: path of the fdb.cluster file; empty selects the
+     * FDB_CLUSTER_FILE environment variable, then
+     * /etc/foundationdb/fdb.cluster.
+     * fdb_key_prefix: byte string prepended to every key so several
+     * independent catalogues (or test runs) can share one cluster;
+     * empty = the whole key space.
+     * fdb_op_deadline_ms: total budget of one catalogue operation across
+     * every transaction attempt and commit-outcome resolution (0 =
+     * default 8000).  Exhaustion yields MDS_ERR_DELAY when every attempt
+     * definitively aborted and MDS_ERR_INDOUBT when a commit outcome
+     * could not be resolved in time.
+     * fdb_txn_timeout_ms: FDB_TR_OPTION_TIMEOUT of one attempt (0 =
+     * default 4000); must stay under the 5 s transaction window.
+     */
+    char                fdb_cluster_file[MDS_MAX_PATH];
+    char                fdb_key_prefix[32];
+    uint32_t            fdb_op_deadline_ms;
+    uint32_t            fdb_txn_timeout_ms;
 
     /* RonDB connection pool */
     /* NDB connections per MDS (0 = auto, max 64). */

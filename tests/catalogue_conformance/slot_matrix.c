@@ -31,16 +31,16 @@
  * Accessors generated from the expected table
  * ----------------------------------------------------------------------- */
 
-#define AUTH_ACCESSOR(name, m, r)                                     \
+#define AUTH_ACCESSOR(name, m, r, f)                                  \
     static bool auth_has_##name(const struct mds_catalogue *c)        \
     { return c->auth_ops != NULL && c->auth_ops->name != NULL; }
-#define COORD_ACCESSOR(name, m, r)                                    \
+#define COORD_ACCESSOR(name, m, r, f)                                 \
     static bool coord_has_##name(const struct mds_catalogue *c)       \
     { return c->coord_ops != NULL && c->coord_ops->name != NULL; }
-#define CLUSTER_ACCESSOR(name, m, r)                                  \
+#define CLUSTER_ACCESSOR(name, m, r, f)                               \
     static bool cluster_has_##name(const struct mds_catalogue *c)     \
     { return c->cluster_ops != NULL && c->cluster_ops->name != NULL; }
-#define LIFECYCLE_ACCESSOR(name, m, r)                                \
+#define LIFECYCLE_ACCESSOR(name, m, r, f)                             \
     static bool lifecycle_has_##name(const struct mds_catalogue *c)   \
     { return c->ops != NULL && c->ops->name != NULL; }
 
@@ -49,18 +49,26 @@ CONFORMANCE_COORD_SLOTS(COORD_ACCESSOR)
 CONFORMANCE_CLUSTER_SLOTS(CLUSTER_ACCESSOR)
 CONFORMANCE_LIFECYCLE_SLOTS(LIFECYCLE_ACCESSOR)
 
+/* Which expected column applies to the backend under test. */
+enum matrix_column {
+    COL_MEMDB,
+    COL_RONDB,
+    COL_FDB,
+};
+
 struct slot_row {
     const char *table;
     const char *slot;
     bool (*present)(const struct mds_catalogue *cat);
     bool expect_memdb;
     bool expect_rondb;
+    bool expect_fdb;
 };
 
-#define AUTH_ROW(name, m, r)      { "auth",      #name, auth_has_##name, m, r },
-#define COORD_ROW(name, m, r)     { "coord",     #name, coord_has_##name, m, r },
-#define CLUSTER_ROW(name, m, r)   { "cluster",   #name, cluster_has_##name, m, r },
-#define LIFECYCLE_ROW(name, m, r) { "lifecycle", #name, lifecycle_has_##name, m, r },
+#define AUTH_ROW(name, m, r, f)      { "auth",      #name, auth_has_##name, m, r, f },
+#define COORD_ROW(name, m, r, f)     { "coord",     #name, coord_has_##name, m, r, f },
+#define CLUSTER_ROW(name, m, r, f)   { "cluster",   #name, cluster_has_##name, m, r, f },
+#define LIFECYCLE_ROW(name, m, r, f) { "lifecycle", #name, lifecycle_has_##name, m, r, f },
 
 static const struct slot_row auth_rows[] = {
     CONFORMANCE_AUTH_SLOTS(AUTH_ROW)
@@ -106,14 +114,24 @@ static const char *presence(bool p)
     return p ? "present" : "absent";
 }
 
-static void check_rows(const struct mds_catalogue *cat, bool memdb_column,
+static bool expected_of(const struct slot_row *row, enum matrix_column col)
+{
+    if (col == COL_MEMDB) {
+        return row->expect_memdb;
+    }
+    if (col == COL_RONDB) {
+        return row->expect_rondb;
+    }
+    return row->expect_fdb;
+}
+
+static void check_rows(const struct mds_catalogue *cat, enum matrix_column col,
                        const struct slot_row *rows, size_t n)
 {
     size_t i;
 
     for (i = 0; i < n; i++) {
-        bool expect = memdb_column ? rows[i].expect_memdb
-                                   : rows[i].expect_rondb;
+        bool expect = expected_of(&rows[i], col);
         bool actual = rows[i].present(cat);
 
         g_rows++;
@@ -145,24 +163,30 @@ static void check_value(const char *what, unsigned long expect,
 int main(void)
 {
     struct mds_catalogue *cat;
-    bool memdb_column;
+    enum matrix_column col;
     enum mds_catalogue_backend expect_type;
     uint32_t expect_caps;
     bool expect_cluster;
     bool expect_shared;
 
     if (conformance_backend_is("memdb")) {
-        memdb_column = true;
+        col = COL_MEMDB;
         expect_type = MDS_BACKEND_MEMDB;
         expect_caps = CONFORMANCE_CAPS_MEMDB;
         expect_cluster = CONFORMANCE_CLUSTER_SUPPORTED_MEMDB;
         expect_shared = CONFORMANCE_SHARED_STATE_SUPPORTED_MEMDB;
     } else if (conformance_backend_is("rondb")) {
-        memdb_column = false;
+        col = COL_RONDB;
         expect_type = MDS_BACKEND_RONDB;
         expect_caps = CONFORMANCE_CAPS_RONDB;
         expect_cluster = CONFORMANCE_CLUSTER_SUPPORTED_RONDB;
         expect_shared = CONFORMANCE_SHARED_STATE_SUPPORTED_RONDB;
+    } else if (conformance_backend_is("fdb")) {
+        col = COL_FDB;
+        expect_type = MDS_BACKEND_FDB;
+        expect_caps = CONFORMANCE_CAPS_FDB;
+        expect_cluster = CONFORMANCE_CLUSTER_SUPPORTED_FDB;
+        expect_shared = CONFORMANCE_SHARED_STATE_SUPPORTED_FDB;
     } else {
         conformance_skip("no expected slot table for this backend");
     }
@@ -172,10 +196,10 @@ int main(void)
 
     check_value("backend_type", (unsigned long)expect_type,
                 (unsigned long)mds_catalogue_backend_type(cat));
-    check_rows(cat, memdb_column, auth_rows, ROWS(auth_rows));
-    check_rows(cat, memdb_column, coord_rows, ROWS(coord_rows));
-    check_rows(cat, memdb_column, cluster_rows, ROWS(cluster_rows));
-    check_rows(cat, memdb_column, lifecycle_rows, ROWS(lifecycle_rows));
+    check_rows(cat, col, auth_rows, ROWS(auth_rows));
+    check_rows(cat, col, coord_rows, ROWS(coord_rows));
+    check_rows(cat, col, cluster_rows, ROWS(cluster_rows));
+    check_rows(cat, col, lifecycle_rows, ROWS(lifecycle_rows));
     check_value("caps", (unsigned long)expect_caps,
                 (unsigned long)cat->caps);
     check_value("mds_cluster_supported", expect_cluster ? 1UL : 0UL,
@@ -187,5 +211,6 @@ int main(void)
 
     (void)printf("\nslot_matrix: %u/%u rows match\n", g_rows - g_failed,
                  g_rows);
+    conformance_shutdown();
     return (g_failed == 0) ? 0 : 1;
 }

@@ -166,6 +166,7 @@ int main(void)
     /* Probe the backend once so an unavailable backend skips before
      * any counting happens. */
     struct mds_catalogue *probe = conformance_open_checked();
+    int rc;
 
     (void)printf("test_lifecycle (backend=%s):\n", conformance_backend_name());
     mds_catalogue_close(probe);
@@ -173,5 +174,7 @@ int main(void)
     test_open_close_cycles();
     test_concurrent_handles();
 
-    return check_summary("test_lifecycle");
+    rc = check_summary("test_lifecycle");
+    conformance_shutdown();
+    return rc;
 }

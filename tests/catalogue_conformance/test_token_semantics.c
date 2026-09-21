@@ -211,6 +211,7 @@ int main(void)
 {
     struct mds_catalogue *cat = conformance_open_checked();
     uint64_t dir = 0;
+    int rc;
 
     (void)printf("test_token_semantics (backend=%s):\n",
                  conformance_backend_name());
@@ -228,5 +229,7 @@ int main(void)
 
     conformance_scratch_cleanup(cat, dir);
     mds_catalogue_close(cat);
-    return check_summary("test_token_semantics");
+    rc = check_summary("test_token_semantics");
+    conformance_shutdown();
+    return rc;
 }

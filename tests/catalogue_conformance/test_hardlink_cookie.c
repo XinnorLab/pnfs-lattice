@@ -105,6 +105,7 @@ int main(void)
 {
     struct mds_catalogue *cat;
     uint64_t dir = 0;
+    int rc;
 
     if (conformance_backend_is("rondb")) {
         (void)printf("XFAIL: RonDB assigns cookie = child fileid and "
@@ -130,5 +131,7 @@ int main(void)
 
     conformance_scratch_cleanup(cat, dir);
     mds_catalogue_close(cat);
-    return check_summary("test_hardlink_cookie");
+    rc = check_summary("test_hardlink_cookie");
+    conformance_shutdown();
+    return rc;
 }
