@@ -13,8 +13,13 @@
  * for both links, so the second page (cookie > first) drops one name.
  *
  * RonDB resumes over ix_dirents_parent_child and has no per-dirent
- * ordering column until its schema change lands; on that backend the
- * failure is documented and the test reports XFAIL with exit 77.
+ * ordering column until its schema change lands, so there the walk
+ * delivers one page with one of the two names and then drains.  That
+ * shape is the documented deviation and is asserted as such (XFAIL,
+ * exit 0); a RonDB run that delivers both names fails with a message
+ * to drop the XFAIL, so the schema change cannot land unnoticed.
+ * Exit 77 is left to the harness: a backend that is not built or not
+ * reachable.
  */
 
 #include <stdio.h>
@@ -50,15 +55,29 @@ static int page_cb(const struct mds_cat_dirent *entry,
     return 0;
 }
 
-static void test_two_links_page_size_one(struct mds_catalogue *cat,
-                                         uint64_t dir)
+/* What the page-size-one walk over the two links delivered. */
+struct walk {
+    unsigned seen_a;
+    unsigned seen_b;
+    unsigned seen_other;
+    unsigned pages;
+};
+
+/*
+ * Create "a", link "b" to it and walk the directory one entry per
+ * page.  The checks made here hold on every backend (page size, no
+ * reserved cookie, strictly increasing cookies, the right fileid);
+ * how many names the walk delivers is the backend-specific verdict
+ * the caller draws from @p w.
+ */
+static void walk_two_links_page_size_one(struct mds_catalogue *cat,
+                                         uint64_t dir, struct walk *w)
 {
     struct mds_inode file, seen;
     uint64_t cookie = 0;
     uint64_t prev_cookie = 0;
-    unsigned seen_a = 0, seen_b = 0, seen_other = 0;
-    unsigned pages = 0;
 
+    memset(w, 0, sizeof(*w));
     memset(&file, 0, sizeof(file));
     REQUIRE_EQ(mds_cat_ns_create(cat, NULL, dir, "a", MDS_FTYPE_REG, 0644,
                                  0, 0, NULL, &file), MDS_OK);
@@ -76,46 +95,65 @@ static void test_two_links_page_size_one(struct mds_catalogue *cat,
         if (p.count == 0) {
             break; /* drained */
         }
-        pages++;
+        w->pages++;
         CHECK_EQ(p.count, 1);            /* page size honoured */
         CHECK(p.cookie >= 3);            /* never a reserved cookie */
         CHECK(p.cookie > prev_cookie);   /* strictly increasing */
         CHECK_EQ(p.fileid, file.fileid);
         if (strcmp(p.name, "a") == 0) {
-            seen_a++;
+            w->seen_a++;
         } else if (strcmp(p.name, "b") == 0) {
-            seen_b++;
+            w->seen_b++;
         } else {
-            seen_other++;
+            w->seen_other++;
         }
         prev_cookie = p.cookie;
         cookie = p.cookie;
-        if (pages >= MAX_PAGES) {
+        if (w->pages >= MAX_PAGES) {
             break; /* bounded: a broken cursor must not loop forever */
         }
     }
+}
 
-    CHECK_EQ(seen_a, 1);
-    CHECK_EQ(seen_b, 1);
-    CHECK_EQ(seen_other, 0);
-    CHECK_EQ(pages, 2);
+/* The contract: both names, each exactly once, on two pages. */
+static void expect_both_links(const struct walk *w)
+{
+    CHECK_EQ(w->seen_a, 1);
+    CHECK_EQ(w->seen_b, 1);
+    CHECK_EQ(w->seen_other, 0);
+    CHECK_EQ(w->pages, 2);
+}
+
+/*
+ * XFAIL on RonDB: cookie = child fileid and the resume runs over
+ * ix_dirents_parent_child, so the second page (cookie > first) finds
+ * nothing and exactly one of the two names is delivered (documented
+ * deviation, catalogue_internal.h ns_readdir_plus_from).  A walk that
+ * delivers both names means the per-dirent sequence column / ordered
+ * index schema change has landed: fail loudly so this XFAIL is dropped
+ * and the contract above applies to RonDB too.
+ */
+static void expect_rondb_shared_cookie(const struct walk *w)
+{
+    if (w->pages == 2 && w->seen_a == 1 && w->seen_b == 1) {
+        (void)fprintf(stderr, "  RonDB hard-link cookies now unique: drop "
+                      "the XFAIL (expect_rondb_shared_cookie) and let the "
+                      "contract check run on rondb\n");
+    } else if (w->pages == 1 && w->seen_a + w->seen_b == 1) {
+        (void)printf("  XFAIL: one page, one of two hard-link names "
+                     "(RonDB shared cookie, documented deviation)\n");
+    }
+    CHECK_EQ(w->pages, 1);
+    CHECK_EQ(w->seen_a + w->seen_b, 1);
+    CHECK_EQ(w->seen_other, 0);
 }
 
 int main(void)
 {
     struct mds_catalogue *cat;
+    struct walk w;
     uint64_t dir = 0;
     int rc;
-
-    if (conformance_backend_is("rondb")) {
-        (void)printf("XFAIL: RonDB assigns cookie = child fileid and "
-                     "resumes over ix_dirents_parent_child, so two hard "
-                     "links in one directory share a cookie until the "
-                     "per-dirent sequence column / ordered index schema "
-                     "change lands (documented deviation, "
-                     "catalogue_internal.h ns_readdir_plus_from)\n");
-        return CONFORMANCE_SKIP;
-    }
 
     cat = conformance_open_checked();
     (void)printf("test_hardlink_cookie (backend=%s):\n",
@@ -127,7 +165,12 @@ int main(void)
         return 1;
     }
 
-    test_two_links_page_size_one(cat, dir);
+    walk_two_links_page_size_one(cat, dir, &w);
+    if (conformance_backend_is("rondb")) {
+        expect_rondb_shared_cookie(&w);
+    } else {
+        expect_both_links(&w);
+    }
 
     conformance_scratch_cleanup(cat, dir);
     mds_catalogue_close(cat);
