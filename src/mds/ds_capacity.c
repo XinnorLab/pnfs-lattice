@@ -44,6 +44,7 @@
 #include "ds_cache.h"
 #include "ds_capacity.h"
 #include "mds_catalogue.h"
+#include "placement_gate.h"
 
 /* -----------------------------------------------------------------------
  * Internal structures
@@ -302,6 +303,8 @@ int ds_capacity_probe_once(struct ds_cache *cache,
 		probed += probe_one(cache, mount_path_fmt, ids[i],
 				    mode, NULL);
 	}
+	/* Placement modes read an immutable snapshot of the records. */
+	placement_gate_publish_capacity();
 	return probed;
 }
 
@@ -371,6 +374,9 @@ static void *capacity_thread(void *arg)
 		 * point above.
 		 */
 		capacity_reload_cluster_view(cap->cache, cap->cat);
+
+		/* Publish this sweep's observation records to the gate. */
+		placement_gate_publish_capacity();
 
 		if (!sleep_or_stop(cap->stop_pipe[0], cap->poll_ms)) {
 			break;

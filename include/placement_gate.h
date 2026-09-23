@@ -29,28 +29,7 @@
 #include "placement_modes.h"
 #include "ds_cache.h"
 
-/* Bounded reason vocabulary; names via placement_reason_name(). */
-enum placement_reason {
-    PR_NONE = 0,
-    PR_DS_OFFLINE,
-    PR_CAPACITY_UNKNOWN,
-    PR_CAPACITY_STALE,
-    PR_CAPACITY_FULL,
-    PR_DOMAIN_MAP_CONTRADICTION,
-    PR_SHARED_FS_ALIAS_UNMAPPED,
-    PR_ASSESSMENT_UNKNOWN,
-    PR_ASSESSMENT_STALE,
-    PR_CONNECTOR_DENIED,
-    PR_ZERO_MULTIPLIER,
-    PR_NO_BINDING,
-    PR_NO_ELIGIBLE_DS,
-    PR_INSUFFICIENT_ELIGIBLE_DS,
-    PR_MODE_NOT_READY,
-    PR_WEIGHT_OVERFLOW,
-    PR_COUNT
-};
-
-const char *placement_reason_name(enum placement_reason r);
+/* enum placement_reason and placement_reason_name() live in placement_modes.h. */
 
 /* Immutable capacity input for one decision (built from the DS cache). */
 struct placement_capacity_view {

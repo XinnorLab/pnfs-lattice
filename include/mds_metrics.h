@@ -171,6 +171,7 @@ struct mds_branch_metrics {
     _Atomic uint64_t placement_rejections_total[16]; /**< indexed by enum placement_reason */
     _Atomic uint64_t placement_eligible_ds;          /**< gauge: candidates at the last admit */
     _Atomic uint64_t placement_alias_suspected_total;
+    _Atomic uint64_t placement_mode_gauge;           /**< enum placement_mode of the gate (0 = legacy) */
 
     /*
      * IO_ADVISE accounting (RFC 7862 S15.5).  io_advise_total

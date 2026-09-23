@@ -39,6 +39,33 @@ const char *placement_mode_name(enum placement_mode m)
     }
 }
 
+static const char *const reason_names[PR_COUNT] = {
+    [PR_NONE]                     = "NONE",
+    [PR_DS_OFFLINE]               = "DS_OFFLINE",
+    [PR_CAPACITY_UNKNOWN]         = "CAPACITY_UNKNOWN",
+    [PR_CAPACITY_STALE]           = "CAPACITY_STALE",
+    [PR_CAPACITY_FULL]            = "CAPACITY_FULL",
+    [PR_DOMAIN_MAP_CONTRADICTION] = "DOMAIN_MAP_CONTRADICTION",
+    [PR_SHARED_FS_ALIAS_UNMAPPED] = "SHARED_FS_ALIAS_UNMAPPED",
+    [PR_ASSESSMENT_UNKNOWN]       = "ASSESSMENT_UNKNOWN",
+    [PR_ASSESSMENT_STALE]         = "ASSESSMENT_STALE",
+    [PR_CONNECTOR_DENIED]         = "CONNECTOR_DENIED",
+    [PR_ZERO_MULTIPLIER]          = "ZERO_MULTIPLIER",
+    [PR_NO_BINDING]               = "NO_BINDING",
+    [PR_NO_ELIGIBLE_DS]           = "NO_ELIGIBLE_DS",
+    [PR_INSUFFICIENT_ELIGIBLE_DS] = "INSUFFICIENT_ELIGIBLE_DS",
+    [PR_MODE_NOT_READY]           = "MODE_NOT_READY",
+    [PR_WEIGHT_OVERFLOW]          = "WEIGHT_OVERFLOW",
+};
+
+const char *placement_reason_name(enum placement_reason r)
+{
+    if ((unsigned)r >= PR_COUNT || reason_names[r] == NULL) {
+        return "UNKNOWN_REASON";
+    }
+    return reason_names[r];
+}
+
 const char *placement_shrink_name(enum placement_shrink s)
 {
     return (s == PM_SHRINK_STRICT) ? "strict" : "allow";

@@ -48,6 +48,28 @@ enum placement_shrink {
 #define PM_WEIGHT_SCALE             65536u
 #define PM_MAX_DOMAINS              256   /* == MDS_MAX_DS_NODES; asserted in placement_config.c */
 
+/* Bounded reason vocabulary of the gate (metrics labels, logs, config show). */
+enum placement_reason {
+    PR_NONE = 0,
+    PR_DS_OFFLINE,
+    PR_CAPACITY_UNKNOWN,
+    PR_CAPACITY_STALE,
+    PR_CAPACITY_FULL,
+    PR_DOMAIN_MAP_CONTRADICTION,
+    PR_SHARED_FS_ALIAS_UNMAPPED,
+    PR_ASSESSMENT_UNKNOWN,
+    PR_ASSESSMENT_STALE,
+    PR_CONNECTOR_DENIED,
+    PR_ZERO_MULTIPLIER,
+    PR_NO_BINDING,
+    PR_NO_ELIGIBLE_DS,
+    PR_INSUFFICIENT_ELIGIBLE_DS,
+    PR_MODE_NOT_READY,
+    PR_WEIGHT_OVERFLOW,
+    PR_COUNT
+};
+
+const char *placement_reason_name(enum placement_reason r);
 const char *placement_mode_name(enum placement_mode m);     /* "legacy"|"rr"|"fill"|"smart" */
 const char *placement_shrink_name(enum placement_shrink s); /* "allow"|"strict" */
 

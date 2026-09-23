@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "mds_metrics.h"
+#include "placement_modes.h"
 #include "mds_histogram.h"
 #include "mds_op_metrics.h"
 #include "pnfs_mds.h"
@@ -581,6 +582,44 @@ int mds_metrics_prometheus_v2(const struct mds_metrics_snapshot *snap,
      * operators scanning /metrics grep for it to spot unexpected
      * ds_count > 64 deployments.
      */
+    /* XinnorLab placement modes: mode gauge, rejection reasons, eligibility. */
+    {
+        enum placement_mode pm = (enum placement_mode)atomic_load(
+            (_Atomic uint64_t *)&branch->placement_mode_gauge);
+        extra = snprintf(buf + base, cap - (size_t)base,
+            "# HELP pnfs_mds_placement_mode Effective placement mode (1 on the active series).\n"
+            "# TYPE pnfs_mds_placement_mode gauge\n"
+            "pnfs_mds_placement_mode{mode=\"%s\"} 1\n"
+            "# HELP pnfs_mds_placement_eligible_ds Candidates at the last placement decision.\n"
+            "# TYPE pnfs_mds_placement_eligible_ds gauge\n"
+            "pnfs_mds_placement_eligible_ds %lu\n"
+            "# HELP pnfs_mds_placement_alias_suspected_total Same filesystem id behind two host names.\n"
+            "# TYPE pnfs_mds_placement_alias_suspected_total counter\n"
+            "pnfs_mds_placement_alias_suspected_total %lu\n"
+            "# HELP pnfs_mds_placement_rejections_total DS rejected by the placement gate, by reason.\n"
+            "# TYPE pnfs_mds_placement_rejections_total counter\n",
+            placement_mode_name(pm),
+            (unsigned long)atomic_load(
+                (_Atomic uint64_t *)&branch->placement_eligible_ds),
+            (unsigned long)atomic_load(
+                (_Atomic uint64_t *)&branch->placement_alias_suspected_total));
+        if (extra < 0 || ((size_t)base + (size_t)extra) >= cap) {
+            return -1;
+        }
+        base += extra;
+        for (int r = 1; r < PR_COUNT; r++) {
+            extra = snprintf(buf + base, cap - (size_t)base,
+                "pnfs_mds_placement_rejections_total{reason=\"%s\"} %lu\n",
+                placement_reason_name((enum placement_reason)r),
+                (unsigned long)atomic_load(
+                    (_Atomic uint64_t *)&branch->placement_rejections_total[r]));
+            if (extra < 0 || ((size_t)base + (size_t)extra) >= cap) {
+                return -1;
+            }
+            base += extra;
+        }
+    }
+
     extra = snprintf(buf + base, cap - (size_t)base,
         "# HELP pnfs_mds_placement_heap_fallback_total "
             "Placement dispatcher heap-fallback count "

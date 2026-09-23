@@ -14,6 +14,7 @@
 #include "mds_catalogue.h"
 #include "ds_capacity.h"
 #include "wrr.h"
+#include "mds_metrics.h"
 
 struct mds_catalogue *catalogue_memdb_open(void);
 
@@ -526,9 +527,212 @@ static void test_admit_argument_checks(void)
     ASSERT_EQ(placement_admit(&c, ds, 0, &sc, 1, 0, &e, &why), MDS_ERR_INVAL);
 }
 
+/* -----------------------------------------------------------------------
+ * Singleton (Task 5): published capacity view, init rules, site helper
+ * ----------------------------------------------------------------------- */
+
+static struct ds_cache *cache_with_ds(struct mds_catalogue **cat_out, uint32_t ds_id)
+{
+    struct mds_catalogue *cat = catalogue_memdb_open();
+    struct mds_cat_txn *txn = NULL;
+    struct mds_ds_info info;
+    struct ds_cache *c = NULL;
+
+    if (cat == NULL) {
+        return NULL;
+    }
+    memset(&info, 0, sizeof(info));
+    info.ds_id = ds_id;
+    info.state = DS_ONLINE;
+    info.port = 2049;
+    snprintf(info.host, sizeof(info.host), "ds-host");
+    if (mds_cat_txn_begin(cat, MDS_CAT_TXN_WRITE, &txn) != MDS_OK ||
+        mds_cat_ds_put(cat, txn, &info) != MDS_OK ||
+        mds_cat_txn_commit(txn) != MDS_OK) {
+        return NULL;
+    }
+    if (ds_cache_create(cat, &c) != 0) {
+        return NULL;
+    }
+    *cat_out = cat;
+    return c;
+}
+
+static void add_cache_ds(struct mds_catalogue *cat, struct ds_cache *c, uint32_t ds_id, const char *host)
+{
+    struct mds_cat_txn *txn = NULL;
+    struct mds_ds_info info;
+    memset(&info, 0, sizeof(info));
+    info.ds_id = ds_id;
+    info.state = DS_ONLINE;
+    info.port = 2049;
+    snprintf(info.host, sizeof(info.host), "%s", host);
+    (void)mds_cat_txn_begin(cat, MDS_CAT_TXN_WRITE, &txn);
+    (void)mds_cat_ds_put(cat, txn, &info);
+    (void)mds_cat_txn_commit(txn);
+    (void)ds_cache_invalidate(c, cat);
+}
+
+static struct mds_config fill_cfg(void)
+{
+    struct mds_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.placement_mode = PM_FILL;
+    cfg.placement_mode_set = true;
+    cfg.placement_capacity_max_age_ms = 120000;
+    cfg.placement_stripe_shrink = PM_SHRINK_ALLOW;
+    snprintf(cfg.placement_config_generation, sizeof(cfg.placement_config_generation), "%064x", 1);
+    return cfg;
+}
+
+static void test_singleton_legacy_when_not_initialised(void)
+{
+    struct placement_ctx c;
+    ASSERT_EQ(placement_gate_mode(), PM_LEGACY);
+    ASSERT_EQ(strcmp(placement_gate_generation(), ""), 0);
+    placement_gate_ctx(&c, 5);
+    ASSERT_EQ(c.mode, PM_LEGACY);
+    ASSERT_TRUE(c.cap == NULL);
+    placement_gate_ctx_release(&c);
+    placement_gate_publish_capacity();   /* no-op, no crash */
+    placement_gate_destroy();            /* no-op */
+}
+
+static void test_singleton_init_requires_mode_set(void)
+{
+    struct mds_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    ASSERT_EQ(placement_gate_init(&cfg, NULL), -1);
+    ASSERT_EQ(placement_gate_init(NULL, NULL), -1);
+    ASSERT_EQ(placement_gate_mode(), PM_LEGACY);
+}
+
+static void test_singleton_fill_needs_cache_and_kernel(void)
+{
+    struct mds_config cfg = fill_cfg();
+    ASSERT_EQ(placement_gate_init(&cfg, NULL), -1);   /* fill without a DS cache */
+    struct mds_catalogue *cat = NULL;
+    struct ds_cache *cache = cache_with_ds(&cat, 0);
+    ASSERT_TRUE(cache != NULL);
+    int rc = placement_gate_init(&cfg, cache);
+    ASSERT_EQ(rc, mds_wrr_kernel_id() == 0 ? -1 : 0);
+    placement_gate_destroy();
+    ASSERT_EQ(placement_gate_mode(), PM_LEGACY);
+    ds_cache_destroy(cache);
+    mds_catalogue_close(cat);
+}
+
+static void test_singleton_rr_needs_no_cache(void)
+{
+    struct mds_config cfg = fill_cfg();
+    cfg.placement_mode = PM_RR;
+    ASSERT_EQ(placement_gate_init(&cfg, NULL), 0);
+    ASSERT_EQ(placement_gate_mode(), PM_RR);
+    ASSERT_EQ(strlen(placement_gate_generation()), 64u);
+    struct placement_ctx c;
+    placement_gate_ctx(&c, 1);
+    ASSERT_EQ(c.mode, PM_RR);
+    ASSERT_TRUE(c.cap == NULL);
+    ASSERT_TRUE(c.rr_counter != NULL);
+    placement_gate_ctx_release(&c);
+    placement_gate_destroy();
+}
+
+static void test_singleton_publishes_capacity_from_cache(void)
+{
+    struct mds_config cfg = fill_cfg();
+    struct mds_catalogue *cat = NULL;
+    struct ds_cache *cache = cache_with_ds(&cat, 0);
+    ASSERT_TRUE(cache != NULL);
+    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
+    ASSERT_EQ(placement_gate_mode(), PM_FILL);
+    struct placement_ctx c;
+    placement_gate_ctx(&c, ds_cache_mono_ms());
+    ASSERT_TRUE(c.cap != NULL);
+    ASSERT_EQ(c.cap->count, 1u);
+    ASSERT_EQ(c.cap->rows[0].obs.observed_mono_ms, 0u);
+    ASSERT_EQ(c.capacity_max_age_ms, 120000u);
+    placement_gate_ctx_release(&c);
+    ASSERT_TRUE(c.cap == NULL);
+    ASSERT_EQ(ds_capacity_probe_once(cache, "/tmp", CAP_WEIGHT_OFF), 1);   /* probe_once publishes */
+    placement_gate_ctx(&c, ds_cache_mono_ms());
+    ASSERT_TRUE(c.cap->rows[0].obs.observed_mono_ms != 0);
+    /* a ctx keeps its snapshot alive across a republish */
+    struct ds_capacity_obs o = { 1000, 10, 1, ds_cache_mono_ms(), 0 };
+    ASSERT_EQ(ds_cache_set_capacity_obs(cache, 0, &o), 0);
+    placement_gate_publish_capacity();
+    ASSERT_TRUE(c.cap->rows[0].obs.total_bytes != 1000);
+    placement_gate_ctx_release(&c);
+    placement_gate_ctx(&c, ds_cache_mono_ms());
+    ASSERT_EQ(c.cap->rows[0].obs.total_bytes, 1000u);
+    placement_gate_ctx_release(&c);
+    placement_gate_destroy();
+    ds_cache_destroy(cache);
+    mds_catalogue_close(cat);
+}
+
+static void test_select_gated_legacy_path(void)
+{
+    struct mds_ds_info ds[2];
+    mk_ds(&ds[0], 0, DS_ONLINE, "a");
+    mk_ds(&ds[1], 1, DS_OFFLINE, "b");
+    ASSERT_EQ(placement_gate_mode(), PM_LEGACY);
+    struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why = PR_CAPACITY_FULL;
+    ASSERT_EQ(placement_select_gated(false, PLACEMENT_RR, ds, 2, &sc, 1, 65536, 0, &e, &why), MDS_OK);
+    ASSERT_EQ(e.ds_id, 0u);
+    ASSERT_EQ(why, PR_NONE);
+    ASSERT_EQ(placement_select_gated(true, PLACEMENT_WEIGHTED_RR, ds, 2, &sc, 1, 65536, 0, &e, &why), MDS_OK);
+    ASSERT_EQ(e.ds_id, 0u);
+    sc = 1;
+    ASSERT_EQ(placement_select_gated(false, PLACEMENT_RR, ds, 2, &sc, 1, 65536, 12345, &e, &why), MDS_OK);
+    ASSERT_EQ(e.ds_id, 0u);
+}
+
+static void test_select_gated_fill_path_uses_the_gate(void)
+{
+    struct mds_config cfg = fill_cfg();
+    struct mds_catalogue *cat = NULL;
+    struct ds_cache *cache = cache_with_ds(&cat, 0);
+    ASSERT_TRUE(cache != NULL);
+    add_cache_ds(cat, cache, 1, "other");
+    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
+    struct ds_capacity_obs full = { 1000, 0, 1, ds_cache_mono_ms(), 0 };
+    struct ds_capacity_obs half = { 1000, 500, 2, ds_cache_mono_ms(), 0 };
+    ASSERT_EQ(ds_cache_set_capacity_obs(cache, 0, &full), 0);
+    ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &half), 0);
+    placement_gate_publish_capacity();
+    struct mds_ds_info ds[2];
+    mk_ds(&ds[0], 0, DS_ONLINE, "ds-host");
+    mk_ds(&ds[1], 1, DS_ONLINE, "other");
+    for (int i = 0; i < 50; i++) {
+        struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why;
+        ASSERT_EQ(placement_select_gated(true, PLACEMENT_WEIGHTED_RR, ds, 2, &sc, 1, 65536, 0, &e, &why), MDS_OK);
+        ASSERT_EQ(e.ds_id, 1u);
+    }
+    uint64_t before = atomic_load(&g_branch_metrics.placement_rejections_total[PR_NO_ELIGIBLE_DS]);
+    ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &full), 0);
+    placement_gate_publish_capacity();
+    struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why;
+    ASSERT_EQ(placement_select_gated(true, PLACEMENT_WEIGHTED_RR, ds, 2, &sc, 1, 65536, 0, &e, &why), MDS_ERR_NOSPC);
+    ASSERT_EQ(why, PR_NO_ELIGIBLE_DS);
+    ASSERT_EQ(atomic_load(&g_branch_metrics.placement_rejections_total[PR_NO_ELIGIBLE_DS]), before + 1);
+    ASSERT_EQ(atomic_load(&g_branch_metrics.placement_mode_gauge), (uint64_t)PM_FILL);
+    placement_gate_destroy();
+    ASSERT_EQ(atomic_load(&g_branch_metrics.placement_mode_gauge), 0u);
+    ds_cache_destroy(cache);
+    mds_catalogue_close(cat);
+}
+
 int main(void)
 {
     printf("test_placement_gate\n");
+    RUN_TEST(test_singleton_legacy_when_not_initialised);
+    RUN_TEST(test_singleton_init_requires_mode_set);
+    RUN_TEST(test_singleton_fill_needs_cache_and_kernel);
+    RUN_TEST(test_singleton_rr_needs_no_cache);
+    RUN_TEST(test_singleton_publishes_capacity_from_cache);
+    RUN_TEST(test_select_gated_legacy_path);
+    RUN_TEST(test_select_gated_fill_path_uses_the_gate);
     RUN_TEST(test_rr_is_cyclic_over_the_gated_list);
     RUN_TEST(test_rr_ignores_capacity);
     RUN_TEST(test_rr_mirrors_are_distinct_and_shrink);

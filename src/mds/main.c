@@ -47,6 +47,7 @@
 #include "mds_shard.h"
 #include "ds_cache.h"
 #include "ds_capacity.h"
+#include "placement_gate.h"
 #include "ds_io_limits.h"
 #include "inode_cache.h"
 #include "parent_touch.h"
@@ -1048,6 +1049,24 @@ if (s_pt != NULL) {
 	 */
 	if (ds_cache != NULL) {
 		ds_cache_apply_weights(ds_cache, cfg.ds_weight_by_id);
+	}
+
+	/*
+	 * XinnorLab placement modes: the gate in front of every selector
+	 * and every DS file creation.  Only with an explicit placement_mode;
+	 * a refusal here (stub kernel, no DS cache for fill/smart) is fatal
+	 * because silently running another mode is exactly what the design
+	 * forbids.
+	 */
+	if (cfg.placement_mode_set) {
+		if (placement_gate_init(&cfg, ds_cache) != 0) {
+			MDS_LOG_ERROR(LOG_COMP_MDS,
+				"placement gate init failed (placement_mode=%s); "
+				"refusing to start",
+				placement_mode_name(cfg.placement_mode));
+			exit_code = EXIT_FAILURE;
+			goto cleanup;
+		}
 	}
 
 	/*
@@ -2210,6 +2229,7 @@ cleanup:
 	 * writes into.  ds_capacity_stop joins the worker thread. */
 	ds_capacity_stop(ds_cap);
 	ds_cap = NULL;
+	placement_gate_destroy();
 	session_table_destroy(session_tbl);
 	open_state_table_destroy(ot);
 	commit_queue_destroy(cq);

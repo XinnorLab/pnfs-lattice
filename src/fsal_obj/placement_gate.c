@@ -21,38 +21,7 @@
 #include "mds_log.h"
 #include "wrr.h"
 
-/* -----------------------------------------------------------------------
- * Reasons
- * ----------------------------------------------------------------------- */
-
-static const char *const reason_names[PR_COUNT] = {
-    [PR_NONE]                     = "NONE",
-    [PR_DS_OFFLINE]               = "DS_OFFLINE",
-    [PR_CAPACITY_UNKNOWN]         = "CAPACITY_UNKNOWN",
-    [PR_CAPACITY_STALE]           = "CAPACITY_STALE",
-    [PR_CAPACITY_FULL]            = "CAPACITY_FULL",
-    [PR_DOMAIN_MAP_CONTRADICTION] = "DOMAIN_MAP_CONTRADICTION",
-    [PR_SHARED_FS_ALIAS_UNMAPPED] = "SHARED_FS_ALIAS_UNMAPPED",
-    [PR_ASSESSMENT_UNKNOWN]       = "ASSESSMENT_UNKNOWN",
-    [PR_ASSESSMENT_STALE]         = "ASSESSMENT_STALE",
-    [PR_CONNECTOR_DENIED]         = "CONNECTOR_DENIED",
-    [PR_ZERO_MULTIPLIER]          = "ZERO_MULTIPLIER",
-    [PR_NO_BINDING]               = "NO_BINDING",
-    [PR_NO_ELIGIBLE_DS]           = "NO_ELIGIBLE_DS",
-    [PR_INSUFFICIENT_ELIGIBLE_DS] = "INSUFFICIENT_ELIGIBLE_DS",
-    [PR_MODE_NOT_READY]           = "MODE_NOT_READY",
-    [PR_WEIGHT_OVERFLOW]          = "WEIGHT_OVERFLOW",
-};
-
 _Static_assert(PR_COUNT <= 16, "placement_rejections_total[16] must hold every reason");
-
-const char *placement_reason_name(enum placement_reason r)
-{
-    if ((unsigned)r >= PR_COUNT || reason_names[r] == NULL) {
-        return "UNKNOWN_REASON";
-    }
-    return reason_names[r];
-}
 
 /* -----------------------------------------------------------------------
  * Weight
@@ -417,11 +386,13 @@ enum mds_status placement_admit(const struct placement_ctx *ctx,
     if (ctx->mode == PM_RR || ctx->mode == PM_LEGACY) {
         uint32_t start;
 
-        if (ctx->rr_counter != NULL) {
+        if (rr_key != 0) {
+            start = (uint32_t)(rr_key % (uint64_t)n_c);
+        } else if (ctx->rr_counter != NULL) {
             start = atomic_fetch_add_explicit(ctx->rr_counter, sc * mirror_count,
                                               memory_order_relaxed);
         } else {
-            start = (uint32_t)(rr_key % (uint64_t)n_c);
+            start = 0;
         }
         for (s = 0; s < sc; s++) {
             for (m = 0; m < mirror_count; m++) {
@@ -579,4 +550,241 @@ void placement_gate_note_alias_suspected(uint32_t a, uint32_t b)
             "both if they share a filesystem (ALIAS_SUSPECTED)",
             (unsigned)a, (unsigned)b);
     }
+}
+
+/* =======================================================================
+ * Process singleton: effective mode + published capacity view + tokens
+ * ======================================================================= */
+
+#include <pthread.h>
+#include "ds_cache.h"
+
+struct cap_view_ref {
+    _Atomic uint32_t refs;
+    struct placement_capacity_view view;
+};
+
+static struct {
+    bool                  initialised;
+    enum placement_mode   mode;
+    enum placement_shrink shrink;
+    uint32_t              max_age_ms;
+    uint64_t              min_free;
+    char                  domain_of[MDS_MAX_DS_NODES][PM_DOMAIN_ID_MAX];
+    char                  generation[65];
+    struct ds_cache      *cache;
+    pthread_rwlock_t      lock;     /* guards cur */
+    struct cap_view_ref  *cur;
+    _Atomic uint32_t      rr_counter;
+    _Atomic uint32_t      snapshot_gen;
+} g;
+
+static void view_unref(struct cap_view_ref *ref)
+{
+    if (ref != NULL &&
+        atomic_fetch_sub_explicit(&ref->refs, 1, memory_order_acq_rel) == 1) {
+        free(ref);
+    }
+}
+
+enum placement_mode placement_gate_mode(void)
+{
+    return g.initialised ? g.mode : PM_LEGACY;
+}
+
+const char *placement_gate_generation(void)
+{
+    return g.initialised ? g.generation : "";
+}
+
+void placement_gate_publish_capacity(void)
+{
+    struct cap_view_ref *fresh;
+    struct cap_view_ref *old;
+
+    if (!g.initialised || g.cache == NULL) {
+        return;
+    }
+    fresh = calloc(1, sizeof(*fresh));
+    if (fresh == NULL) {
+        return;
+    }
+    atomic_store_explicit(&fresh->refs, 1, memory_order_relaxed);
+    fresh->view.count = ds_cache_capacity_view(g.cache, fresh->view.rows,
+                                               MDS_MAX_DS_NODES);
+    pthread_rwlock_wrlock(&g.lock);
+    old = g.cur;
+    g.cur = fresh;
+    pthread_rwlock_unlock(&g.lock);
+    atomic_fetch_add_explicit(&g.snapshot_gen, 1, memory_order_release);
+    view_unref(old);
+}
+
+void placement_gate_ctx(struct placement_ctx *out, uint64_t now_mono_ms)
+{
+    struct cap_view_ref *ref = NULL;
+
+    memset(out, 0, sizeof(*out));
+    out->now_mono_ms = now_mono_ms;
+    if (!g.initialised) {
+        out->mode = PM_LEGACY;
+        return;
+    }
+    out->mode = g.mode;
+    out->shrink = g.shrink;
+    out->capacity_max_age_ms = g.max_age_ms;
+    out->min_free_bytes = g.min_free;
+    out->domain_of = (const char (*)[PM_DOMAIN_ID_MAX])g.domain_of;
+    out->rr_counter = &g.rr_counter;
+    if (g.mode == PM_FILL || g.mode == PM_SMART) {
+        pthread_rwlock_rdlock(&g.lock);
+        ref = g.cur;
+        if (ref != NULL) {
+            atomic_fetch_add_explicit(&ref->refs, 1, memory_order_acq_rel);
+        }
+        pthread_rwlock_unlock(&g.lock);
+        out->cap = (ref != NULL) ? &ref->view : NULL;
+        out->view_ref = ref;
+    }
+}
+
+void placement_gate_ctx_release(struct placement_ctx *ctx)
+{
+    if (ctx == NULL || ctx->view_ref == NULL) {
+        return;
+    }
+    view_unref((struct cap_view_ref *)ctx->view_ref);
+    ctx->view_ref = NULL;
+    ctx->cap = NULL;
+}
+
+int placement_gate_init(const struct mds_config *cfg, struct ds_cache *cache)
+{
+    if (cfg == NULL || !cfg->placement_mode_set) {
+        return -1;
+    }
+    if (g.initialised) {
+        placement_gate_destroy();
+    }
+    memset(&g, 0, sizeof(g));
+    g.mode = cfg->placement_mode;
+    g.shrink = cfg->placement_stripe_shrink;
+    g.max_age_ms = cfg->placement_capacity_max_age_ms;
+    g.min_free = cfg->placement_min_free_bytes;
+    memcpy(g.domain_of, cfg->ds_capacity_domain, sizeof(g.domain_of));
+    memcpy(g.generation, cfg->placement_config_generation, sizeof(g.generation));
+    g.generation[64] = '\0';
+    g.cache = cache;
+    if ((g.mode == PM_FILL || g.mode == PM_SMART) && mds_wrr_kernel_id() == 0) {
+        MDS_LOG_ERROR(LOG_COMP_FSAL,
+            "placement: mode %s needs the XinnorLab wrr kernel; this binary "
+            "carries the community stub (kernel id 0)",
+            placement_mode_name(g.mode));
+        return -1;
+    }
+    if ((g.mode == PM_FILL || g.mode == PM_SMART) && cache == NULL) {
+        MDS_LOG_ERROR(LOG_COMP_FSAL,
+            "placement: mode %s needs the DS cache (capacity observations)",
+            placement_mode_name(g.mode));
+        return -1;
+    }
+    if (pthread_rwlock_init(&g.lock, NULL) != 0) {
+        return -1;
+    }
+    g.initialised = true;
+    atomic_store_explicit(&g_branch_metrics.placement_mode_gauge,
+                          (uint64_t)g.mode, memory_order_relaxed);
+    placement_gate_publish_capacity();
+    MDS_LOG_INFO(LOG_COMP_FSAL,
+        "placement_mode=%s generation=%.12s kernel=%08x shrink=%s "
+        "max_age_ms=%u min_free=%llu",
+        placement_mode_name(g.mode), g.generation,
+        (unsigned)mds_wrr_kernel_id(), placement_shrink_name(g.shrink),
+        (unsigned)g.max_age_ms, (unsigned long long)g.min_free);
+    return 0;
+}
+
+void placement_gate_destroy(void)
+{
+    struct cap_view_ref *old;
+
+    if (!g.initialised) {
+        return;
+    }
+    pthread_rwlock_wrlock(&g.lock);
+    old = g.cur;
+    g.cur = NULL;
+    pthread_rwlock_unlock(&g.lock);
+    view_unref(old);
+    pthread_rwlock_destroy(&g.lock);
+    g.initialised = false;
+    g.cache = NULL;
+    atomic_store_explicit(&g_branch_metrics.placement_mode_gauge, 0,
+                          memory_order_relaxed);
+}
+
+/* -----------------------------------------------------------------------
+ * Site helper
+ * ----------------------------------------------------------------------- */
+
+static void note_refusal(enum placement_reason why)
+{
+    static _Atomic uint64_t last_warn_ms[PR_COUNT];
+    uint64_t now;
+    uint64_t last;
+
+    if ((unsigned)why >= PR_COUNT) {
+        return;
+    }
+    atomic_fetch_add_explicit(&g_branch_metrics.placement_rejections_total[why],
+                              1, memory_order_relaxed);
+    now = ds_cache_mono_ms();
+    last = atomic_load_explicit(&last_warn_ms[why], memory_order_relaxed);
+    if (now - last >= 10000ULL &&
+        atomic_compare_exchange_strong(&last_warn_ms[why], &last, now)) {
+        MDS_LOG_WARN(LOG_COMP_FSAL, "placement refused: %s (mode %s)",
+                     placement_reason_name(why),
+                     placement_mode_name(placement_gate_mode()));
+    }
+}
+
+enum mds_status placement_select_gated(bool legacy_policy_enabled,
+                                       enum mds_placement_policy legacy_policy,
+                                       const struct mds_ds_info *ds_list, uint32_t n,
+                                       uint32_t *stripe_count, uint32_t mirror_count,
+                                       uint32_t stripe_unit, uint64_t rr_key,
+                                       struct mds_ds_map_entry *entries,
+                                       enum placement_reason *reason)
+{
+    struct placement_ctx ctx;
+    enum mds_status st;
+    enum placement_reason why = PR_NONE;
+
+    if (reason != NULL) {
+        *reason = PR_NONE;
+    }
+    if (placement_gate_mode() == PM_LEGACY) {
+        if (!legacy_policy_enabled && rr_key != 0) {
+            return placement_select_rr_at2(ds_list, n, stripe_count, mirror_count,
+                                           stripe_unit, rr_key, entries);
+        }
+        if (legacy_policy_enabled) {
+            return placement_select_ex2(legacy_policy, ds_list, n, stripe_count,
+                                        mirror_count, stripe_unit, entries);
+        }
+        return placement_select2(ds_list, n, stripe_count, mirror_count,
+                                 stripe_unit, entries);
+    }
+    (void)stripe_unit;
+    placement_gate_ctx(&ctx, ds_cache_mono_ms());
+    st = placement_admit(&ctx, ds_list, n, stripe_count, mirror_count, rr_key,
+                         entries, &why);
+    placement_gate_ctx_release(&ctx);
+    if (st == MDS_ERR_NOSPC) {
+        note_refusal(why);
+    }
+    if (reason != NULL) {
+        *reason = why;
+    }
+    return st;
 }
