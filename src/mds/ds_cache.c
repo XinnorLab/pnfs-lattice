@@ -46,7 +46,18 @@ struct ds_cache_entry {
 	 * deliberately does not carry this field.
 	 */
 	uint64_t           last_observed_unix_sec;
+	/* Placement-mode capacity record; see ds_cache.h. */
+	struct ds_capacity_obs cap_obs;
 };
+
+uint64_t ds_cache_mono_ms(void)
+{
+	struct timespec ts;
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+		return 0;
+	}
+	return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
 
 static uint64_t cache_now_unix_sec(void)
 {
@@ -549,6 +560,90 @@ void ds_cache_apply_remote_observations(struct ds_cache *cache,
 		cache->entries[id].last_observed_unix_sec = now_sec;
 	}
 	pthread_rwlock_unlock(&cache->lock);
+}
+
+int ds_cache_set_capacity_obs(struct ds_cache *cache, uint32_t ds_id,
+			      const struct ds_capacity_obs *obs)
+{
+	int rc = -1;
+
+	if (cache == NULL || obs == NULL || ds_id >= MDS_MAX_DS_NODES) {
+		return -1;
+	}
+	pthread_rwlock_wrlock(&cache->lock);
+	if (cache->entries[ds_id].present) {
+		cache->entries[ds_id].cap_obs = *obs;
+		cache->entries[ds_id].cap_obs.consecutive_failures = 0;
+		rc = 0;
+	}
+	pthread_rwlock_unlock(&cache->lock);
+	return rc;
+}
+
+int ds_cache_note_capacity_failure(struct ds_cache *cache, uint32_t ds_id)
+{
+	int rc = -1;
+
+	if (cache == NULL || ds_id >= MDS_MAX_DS_NODES) {
+		return -1;
+	}
+	pthread_rwlock_wrlock(&cache->lock);
+	if (cache->entries[ds_id].present) {
+		if (cache->entries[ds_id].cap_obs.consecutive_failures < UINT32_MAX) {
+			cache->entries[ds_id].cap_obs.consecutive_failures++;
+		}
+		rc = 0;
+	}
+	pthread_rwlock_unlock(&cache->lock);
+	return rc;
+}
+
+enum mds_status ds_cache_get_capacity_obs(const struct ds_cache *cache,
+					  uint32_t ds_id,
+					  struct ds_capacity_obs *out)
+{
+	enum mds_status st = MDS_ERR_NOTFOUND;
+
+	if (out != NULL) {
+		memset(out, 0, sizeof(*out));
+	}
+	if (cache == NULL || out == NULL || ds_id >= MDS_MAX_DS_NODES) {
+		return MDS_ERR_NOTFOUND;
+	}
+	pthread_rwlock_rdlock((pthread_rwlock_t *)&cache->lock);
+	if (cache->entries[ds_id].present) {
+		*out = cache->entries[ds_id].cap_obs;
+		st = MDS_OK;
+	}
+	pthread_rwlock_unlock((pthread_rwlock_t *)&cache->lock);
+	return st;
+}
+
+uint32_t ds_cache_capacity_view(const struct ds_cache *cache,
+				struct ds_capacity_view_row *rows,
+				uint32_t cap)
+{
+	uint32_t n = 0;
+	uint32_t i;
+
+	if (cache == NULL || rows == NULL || cap == 0) {
+		return 0;
+	}
+	pthread_rwlock_rdlock((pthread_rwlock_t *)&cache->lock);
+	for (i = 0; i < MDS_MAX_DS_NODES && n < cap; i++) {
+		const struct ds_cache_entry *e = &cache->entries[i];
+
+		if (!e->present) {
+			continue;
+		}
+		rows[n].ds_id = e->info.ds_id;
+		rows[n].state = e->info.state;
+		memcpy(rows[n].host, e->info.host, sizeof(rows[n].host));
+		rows[n].obs = e->cap_obs;
+		n++;
+	}
+	pthread_rwlock_unlock((pthread_rwlock_t *)&cache->lock);
+	return n;
 }
 
 uint32_t ds_cache_snapshot_ids(const struct ds_cache *cache,

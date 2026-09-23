@@ -211,6 +211,7 @@ static int probe_one(struct ds_cache *cache,
 #pragma GCC diagnostic pop
 
 	if (statvfs(path, &sv) != 0) {
+		(void)ds_cache_note_capacity_failure(cache, ds_id);
 		return 0;
 	}
 
@@ -221,6 +222,7 @@ static int probe_one(struct ds_cache *cache,
 	 * what the client would see if it tried to write.
 	 */
 	if (sv.f_frsize == 0 || sv.f_blocks == 0) {
+		(void)ds_cache_note_capacity_failure(cache, ds_id);
 		return 0;
 	}
 	total_bytes = (uint64_t)sv.f_blocks * (uint64_t)sv.f_frsize;
@@ -233,6 +235,23 @@ static int probe_one(struct ds_cache *cache,
 	if (ds_cache_set_capacity(cache, ds_id, total_bytes,
 				  used_bytes) != 0) {
 		return 0;
+	}
+
+	/*
+	 * Placement-mode observation record: only a successful local
+	 * probe writes it (available bytes, the filesystem id used to
+	 * prove shared-filesystem aliases, and the monotonic time the
+	 * freshness gate measures against).  Design section 6.
+	 */
+	{
+		struct ds_capacity_obs obs;
+
+		memset(&obs, 0, sizeof(obs));
+		obs.total_bytes = total_bytes;
+		obs.avail_bytes = avail_bytes;
+		obs.fsid = (uint64_t)sv.f_fsid;
+		obs.observed_mono_ms = ds_cache_mono_ms();
+		(void)ds_cache_set_capacity_obs(cache, ds_id, &obs);
 	}
 
 	/*

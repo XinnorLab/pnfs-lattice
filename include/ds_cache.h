@@ -21,6 +21,53 @@
 struct ds_cache;
 struct mds_catalogue;
 
+/*
+ * Capacity observation record (placement modes, design section 6).
+ *
+ * Written only by a SUCCESSFUL local statvfs() probe; a failed probe
+ * keeps the last values and their time (so they age out) and counts
+ * the failure.  Peer observations merged from the catalogue never
+ * touch it: they carry no observation time.  The fill/smart gate reads
+ * it through ds_cache_capacity_view().
+ */
+struct ds_capacity_obs {
+	uint64_t total_bytes;
+	uint64_t avail_bytes;        /* f_bavail * f_frsize */
+	uint64_t fsid;               /* statvfs f_fsid (alias proof) */
+	uint64_t observed_mono_ms;   /* CLOCK_MONOTONIC ms of the last success; 0 = never */
+	uint32_t consecutive_failures;
+};
+
+struct ds_capacity_view_row {
+	uint32_t ds_id;
+	uint32_t state;              /* DS_ONLINE, ... */
+	char     host[MDS_DS_HOST_MAX];
+	struct ds_capacity_obs obs;
+};
+
+/** CLOCK_MONOTONIC in milliseconds (shared helper). */
+uint64_t ds_cache_mono_ms(void);
+
+/** Record a successful probe; resets consecutive_failures.  -1 if absent. */
+int ds_cache_set_capacity_obs(struct ds_cache *cache, uint32_t ds_id,
+			      const struct ds_capacity_obs *obs);
+
+/** Count a failed probe; values and time are kept.  -1 if absent. */
+int ds_cache_note_capacity_failure(struct ds_cache *cache, uint32_t ds_id);
+
+/** Copy the record.  MDS_ERR_NOTFOUND when the DS is not present. */
+enum mds_status ds_cache_get_capacity_obs(const struct ds_cache *cache,
+					  uint32_t ds_id,
+					  struct ds_capacity_obs *out);
+
+/**
+ * Snapshot every present DS (id, state, host, observation) in id
+ * order.  Returns the number of rows written (<= cap).
+ */
+uint32_t ds_cache_capacity_view(const struct ds_cache *cache,
+				struct ds_capacity_view_row *rows,
+				uint32_t cap);
+
 /**
  * @brief Create and populate the DS cache from the catalogue.
  *

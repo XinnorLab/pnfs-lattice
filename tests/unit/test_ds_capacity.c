@@ -21,6 +21,9 @@
 #include "pnfs_mds.h"
 #include "ds_cache.h"
 #include "ds_capacity.h"
+#include "mds_catalogue.h"
+
+struct mds_catalogue *catalogue_memdb_open(void);
 
 static int tests_run;
 static int tests_passed;
@@ -212,9 +215,141 @@ static void test_statvfs_tmp_works(void)
     ASSERT_TRUE(sv.f_blocks > 0);
 }
 
+/* -----------------------------------------------------------------------
+ * Placement-mode observation record (design section 6).
+ * A present entry needs a catalogue: the in-memory memdb backend.
+ * ----------------------------------------------------------------------- */
+
+static struct ds_cache *cache_with_ds(struct mds_catalogue **cat_out, uint32_t ds_id)
+{
+    struct mds_catalogue *cat = catalogue_memdb_open();
+    struct mds_cat_txn *txn = NULL;
+    struct mds_ds_info info;
+    struct ds_cache *c = NULL;
+
+    if (cat == NULL) {
+        return NULL;
+    }
+    memset(&info, 0, sizeof(info));
+    info.ds_id = ds_id;
+    info.state = DS_ONLINE;
+    info.port = 2049;
+    snprintf(info.host, sizeof(info.host), "ds-host");
+    if (mds_cat_txn_begin(cat, MDS_CAT_TXN_WRITE, &txn) != MDS_OK ||
+        mds_cat_ds_put(cat, txn, &info) != MDS_OK ||
+        mds_cat_txn_commit(txn) != MDS_OK) {
+        return NULL;
+    }
+    if (ds_cache_create(cat, &c) != 0) {
+        return NULL;
+    }
+    *cat_out = cat;
+    return c;
+}
+
+static void test_obs_absent_until_probed(void)
+{
+    struct mds_catalogue *cat = NULL;
+    struct ds_capacity_obs o;
+    struct ds_cache *c = cache_with_ds(&cat, 0);
+    ASSERT_TRUE(c != NULL);
+    ASSERT_EQ(ds_cache_get_capacity_obs(c, 0, &o), MDS_OK);
+    ASSERT_EQ(o.observed_mono_ms, 0u);
+    ASSERT_EQ(o.consecutive_failures, 0u);
+    ASSERT_EQ(ds_cache_get_capacity_obs(c, 5, &o), MDS_ERR_NOTFOUND);
+    ASSERT_EQ(ds_cache_get_capacity_obs(NULL, 0, &o), MDS_ERR_NOTFOUND);
+    ds_cache_destroy(c);
+    mds_catalogue_close(cat);
+}
+
+static void test_probe_records_avail_fsid_and_time(void)
+{
+    struct mds_catalogue *cat = NULL;
+    struct ds_capacity_obs o;
+    struct statvfs sv;
+    struct ds_cache *c = cache_with_ds(&cat, 0);
+    ASSERT_TRUE(c != NULL);
+    uint64_t before = ds_cache_mono_ms();
+    ASSERT_EQ(ds_capacity_probe_once(c, "/tmp", CAP_WEIGHT_OFF), 1);
+    ASSERT_EQ(ds_cache_get_capacity_obs(c, 0, &o), MDS_OK);
+    ASSERT_EQ(statvfs("/tmp", &sv), 0);
+    ASSERT_EQ(o.total_bytes, (uint64_t)sv.f_blocks * (uint64_t)sv.f_frsize);
+    ASSERT_TRUE(o.avail_bytes <= o.total_bytes);
+    ASSERT_TRUE(o.avail_bytes > 0);
+    ASSERT_EQ(o.fsid, (uint64_t)sv.f_fsid);
+    ASSERT_TRUE(o.observed_mono_ms >= before);
+    ASSERT_TRUE(o.observed_mono_ms <= ds_cache_mono_ms());
+    ASSERT_EQ(o.consecutive_failures, 0u);
+    ds_cache_destroy(c);
+    mds_catalogue_close(cat);
+}
+
+static void test_failed_probe_keeps_values_and_counts(void)
+{
+    struct mds_catalogue *cat = NULL;
+    struct ds_capacity_obs o;
+    struct ds_cache *c = cache_with_ds(&cat, 0);
+    ASSERT_TRUE(c != NULL);
+    ASSERT_EQ(ds_capacity_probe_once(c, "/tmp", CAP_WEIGHT_OFF), 1);
+    ASSERT_EQ(ds_cache_get_capacity_obs(c, 0, &o), MDS_OK);
+    uint64_t t = o.observed_mono_ms;
+    uint64_t total = o.total_bytes;
+    ASSERT_EQ(ds_capacity_probe_once(c, "/nonexistent-pnfs-%u", CAP_WEIGHT_OFF), 0);
+    ASSERT_EQ(ds_cache_get_capacity_obs(c, 0, &o), MDS_OK);
+    ASSERT_EQ(o.observed_mono_ms, t);       /* not refreshed by a failure */
+    ASSERT_EQ(o.consecutive_failures, 1u);
+    ASSERT_EQ(o.total_bytes, total);        /* last values kept */
+    ASSERT_EQ(ds_capacity_probe_once(c, "/tmp", CAP_WEIGHT_OFF), 1);
+    ASSERT_EQ(ds_cache_get_capacity_obs(c, 0, &o), MDS_OK);
+    ASSERT_EQ(o.consecutive_failures, 0u);  /* success resets the counter */
+    ds_cache_destroy(c);
+    mds_catalogue_close(cat);
+}
+
+static void test_remote_observation_does_not_touch_the_record(void)
+{
+    struct mds_catalogue *cat = NULL;
+    struct ds_capacity_obs o;
+    struct mds_ds_info remote;
+    struct ds_cache *c = cache_with_ds(&cat, 0);
+    ASSERT_TRUE(c != NULL);
+    memset(&remote, 0, sizeof(remote));
+    remote.ds_id = 0;
+    remote.total_bytes = 500;
+    remote.used_bytes = 100;
+    ds_cache_apply_remote_observations(c, &remote, 1);
+    ASSERT_EQ(ds_cache_get_capacity_obs(c, 0, &o), MDS_OK);
+    ASSERT_EQ(o.observed_mono_ms, 0u);
+    ASSERT_EQ(o.total_bytes, 0u);
+    ds_cache_destroy(c);
+    mds_catalogue_close(cat);
+}
+
+static void test_capacity_view_lists_present_ds(void)
+{
+    struct mds_catalogue *cat = NULL;
+    struct ds_capacity_view_row rows[4];
+    struct ds_cache *c = cache_with_ds(&cat, 3);
+    ASSERT_TRUE(c != NULL);
+    ASSERT_EQ(ds_cache_capacity_view(c, rows, 4), 1u);
+    ASSERT_EQ(rows[0].ds_id, 3u);
+    ASSERT_EQ(rows[0].state, DS_ONLINE);
+    ASSERT_EQ(strcmp(rows[0].host, "ds-host"), 0);
+    ASSERT_EQ(rows[0].obs.observed_mono_ms, 0u);
+    ASSERT_EQ(ds_cache_capacity_view(c, rows, 0), 0u);
+    ASSERT_EQ(ds_cache_capacity_view(NULL, rows, 4), 0u);
+    ds_cache_destroy(c);
+    mds_catalogue_close(cat);
+}
+
 int main(void)
 {
     fprintf(stdout, "test_ds_capacity:\n");
+    RUN_TEST(test_obs_absent_until_probed);
+    RUN_TEST(test_probe_records_avail_fsid_and_time);
+    RUN_TEST(test_failed_probe_keeps_values_and_counts);
+    RUN_TEST(test_remote_observation_does_not_touch_the_record);
+    RUN_TEST(test_capacity_view_lists_present_ds);
     RUN_TEST(test_set_capacity_rejects_absent);
     RUN_TEST(test_snapshot_empty);
     RUN_TEST(test_probe_once_empty);
