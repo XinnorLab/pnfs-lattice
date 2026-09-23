@@ -62,9 +62,11 @@ add_executable(test_backup        unit/test_backup.c)
 add_executable(test_rolling_upgrade unit/test_rolling_upgrade.c)
 add_executable(test_mds_metrics    unit/test_mds_metrics.c)
 add_executable(test_placement_policy unit/test_placement_policy.c)
+add_executable(test_wrr_kernel      unit/test_wrr_kernel.c)
 add_executable(test_mds_tls        unit/test_mds_tls.c)
 add_executable(test_mds_gss        unit/test_mds_gss.c)
 add_executable(test_config          unit/test_config.c)
+add_executable(test_placement_config unit/test_placement_config.c)
 add_executable(test_log             unit/test_log.c)
 if(ENABLE_DS_PREALLOC)
     add_executable(test_ds_prealloc       unit/test_ds_prealloc.c)
@@ -127,6 +129,7 @@ foreach(test_target
     test_cluster_membership
     test_drain
     test_config
+    test_placement_config
     test_log
     test_ds_prealloc
     test_ds_prealloc_batch
@@ -145,6 +148,7 @@ foreach(test_target
     test_apid_http
     test_mds_metrics
     test_placement_policy
+    test_wrr_kernel
     test_mds_tls
     test_mds_gss
     test_catalogue

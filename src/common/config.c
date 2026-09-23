@@ -297,6 +297,10 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
 
     /* Live DS capacity probe interval (ms).  60s by default. */
     cfg->ds_capacity_poll_ms = 60000;
+    /* Placement modes: absent key = legacy behaviour. */
+    cfg->placement_mode = PM_LEGACY;
+    cfg->placement_capacity_max_age_ms = PM_DEFAULT_CAP_MAX_AGE_MS;
+    cfg->placement_stripe_shrink = PM_SHRINK_ALLOW;
 
     /* Per-DS I/O limit (FSINFO) probe interval (ms).  60s by
      * default; 0 disables and restores the legacy 1 MiB wire
@@ -835,6 +839,7 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
              */
             unsigned long id = strtoul(key + 10, NULL, 10);
             unsigned long w = strtoul(val, NULL, 10);
+            cfg->ds_weight_set = true;
             if (id < MDS_MAX_DS_NODES && w <= UINT32_MAX) {
                 cfg->ds_weight_by_id[id] = (uint32_t)w;
             } else {
@@ -1266,10 +1271,91 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
                 return MDS_ERR_INVAL;
             }
             cfg->tuning_set |= MDS_CFG_SET_PLACEMENT_POLICY;
+            cfg->placement_policy_set = true;
         } else if (strcmp(key, "placement_policy_enabled") == 0) {
             cfg->placement_policy_enabled =
                 (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+            cfg->placement_policy_enabled_set = true;
+        } else if (strcmp(key, PM_KEY_MODE) == 0) {
+            if (strcmp(val, "rr") == 0) {
+                cfg->placement_mode = PM_RR;
+            } else if (strcmp(val, "fill") == 0) {
+                cfg->placement_mode = PM_FILL;
+            } else if (strcmp(val, "smart") == 0) {
+                cfg->placement_mode = PM_SMART;
+            } else {
+                (void)fprintf(stderr,
+                    "ERROR: invalid placement_mode '%s' "
+                    "(expected rr|fill|smart)\n", val);
+                (void)fclose(fp);
+                return MDS_ERR_INVAL;
+            }
+            cfg->placement_mode_set = true;
+        } else if (strcmp(key, PM_KEY_CAP_MAX_AGE_MS) == 0) {
+            unsigned long v = strtoul(val, NULL, 10);
+            if (v == 0 || v > PM_CAP_MAX_AGE_MS_MAX) {
+                (void)fprintf(stderr,
+                    "ERROR: %s=%lu out of range (1..%u)\n",
+                    key, v, (unsigned)PM_CAP_MAX_AGE_MS_MAX);
+                (void)fclose(fp);
+                return MDS_ERR_INVAL;
+            }
+            cfg->placement_capacity_max_age_ms = (uint32_t)v;
+        } else if (strcmp(key, PM_KEY_MIN_FREE_BYTES) == 0) {
+            cfg->placement_min_free_bytes = strtoull(val, NULL, 10);
+        } else if (strncmp(key, PM_KEY_DOMAIN_PREFIX,
+                           strlen(PM_KEY_DOMAIN_PREFIX)) == 0) {
+            const char *idtxt = key + strlen(PM_KEY_DOMAIN_PREFIX);
+            char *endp = NULL;
+            unsigned long id = strtoul(idtxt, &endp, 10);
+            if (idtxt[0] == '\0' || (endp != NULL && *endp != '\0') ||
+                id >= MDS_MAX_DS_NODES || val[0] == '\0' ||
+                strlen(val) >= PM_DOMAIN_ID_MAX) {
+                (void)fprintf(stderr,
+                    "ERROR: %s: bad ds id, or empty/too long domain "
+                    "(max %d bytes)\n", key, PM_DOMAIN_ID_MAX - 1);
+                (void)fclose(fp);
+                return MDS_ERR_INVAL;
+            }
+            (void)snprintf(cfg->ds_capacity_domain[id], PM_DOMAIN_ID_MAX,
+                           "%s", val);
+        } else if (strncmp(key, PM_KEY_DOMAIN_WEIGHT_PREFIX,
+                           strlen(PM_KEY_DOMAIN_WEIGHT_PREFIX)) == 0) {
+            const char *dom = key + strlen(PM_KEY_DOMAIN_WEIGHT_PREFIX);
+            unsigned long w = strtoul(val, NULL, 10);
+            if (dom[0] == '\0' || strlen(dom) >= PM_DOMAIN_ID_MAX ||
+                w < PM_DOMAIN_WEIGHT_MIN || w > PM_DOMAIN_WEIGHT_MAX ||
+                cfg->placement_domain_weight_count >= PM_MAX_DOMAINS) {
+                (void)fprintf(stderr,
+                    "ERROR: %s=%lu out of range (%u..%u)\n",
+                    key, w, (unsigned)PM_DOMAIN_WEIGHT_MIN,
+                    (unsigned)PM_DOMAIN_WEIGHT_MAX);
+                (void)fclose(fp);
+                return MDS_ERR_INVAL;
+            }
+            {
+                uint32_t n = cfg->placement_domain_weight_count++;
+                (void)snprintf(cfg->placement_domain_weight_id[n],
+                               PM_DOMAIN_ID_MAX, "%s", dom);
+                cfg->placement_domain_weight[n] = (uint32_t)w;
+            }
+        } else if (strcmp(key, PM_KEY_ALLOW_MANUAL) == 0) {
+            cfg->placement_allow_manual_base_weights =
+                (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+        } else if (strcmp(key, PM_KEY_SHRINK) == 0) {
+            if (strcmp(val, "allow") == 0) {
+                cfg->placement_stripe_shrink = PM_SHRINK_ALLOW;
+            } else if (strcmp(val, "strict") == 0) {
+                cfg->placement_stripe_shrink = PM_SHRINK_STRICT;
+            } else {
+                (void)fprintf(stderr,
+                    "ERROR: invalid %s '%s' (expected allow|strict)\n",
+                    key, val);
+                (void)fclose(fp);
+                return MDS_ERR_INVAL;
+            }
         } else if (strcmp(key, "placement_capacity_weighting") == 0) {
+            cfg->placement_capacity_weighting_set = true;
             if (strcmp(val, "off") == 0 ||
                 strcmp(val, "false") == 0 ||
                 strcmp(val, "0") == 0) {
@@ -1486,6 +1572,24 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
             return MDS_ERR_INVAL;
         }
         cfg->ds_synth_secret_len = (uint32_t)sizeof(cfg->ds_synth_secret);
+    }
+
+    /*
+     * Placement modes: validate the combination and derive the legacy
+     * dispatcher fields from the mode.  An explicit mode always takes
+     * the dispatcher branch so the configured stripe/mirror geometry
+     * applies in rr as well (design section 4, MODE-03).
+     */
+    if (cfg->placement_mode_set) {
+        char perr[256];
+        if (placement_config_validate(cfg, perr, sizeof(perr)) != MDS_OK) {
+            (void)fprintf(stderr, "ERROR: %s\n", perr);
+            return MDS_ERR_INVAL;
+        }
+        cfg->placement_policy_enabled = true;
+        cfg->placement_policy = (cfg->placement_mode == PM_RR)
+            ? PLACEMENT_RR : PLACEMENT_WEIGHTED_RR;
+        placement_config_generation(cfg, cfg->placement_config_generation);
     }
 
     /* Auto-size prealloc_pool_size based on ds_count, but only if

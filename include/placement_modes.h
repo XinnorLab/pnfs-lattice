@@ -1,0 +1,54 @@
+/*
+ * SPDX-License-Identifier: MIT
+ *
+ * placement_modes.h -- the operator-facing placement modes (rr / fill /
+ * smart): mode enum, INI key names, defaults and ranges.
+ *
+ * The values here mirror docs/placement-modes/contract-manifest.json in
+ * XinnorLab/pNFS; a unit test pins the numbers so the two cannot drift
+ * silently.  Design: docs/superpowers/specs/2026-09-23-placement-modes-
+ * design.md (XinnorLab/pNFS), sections 4 and 5.
+ */
+
+#ifndef PLACEMENT_MODES_H
+#define PLACEMENT_MODES_H
+
+#include <stdint.h>
+
+/*
+ * PM_LEGACY: `placement_mode` absent -- the upstream placement_policy*
+ * keys drive selection exactly as before.  The three explicit modes
+ * take the dispatcher branch and the candidate gate (placement_gate.h).
+ */
+enum placement_mode {
+    PM_LEGACY = 0,
+    PM_RR     = 1,
+    PM_FILL   = 2,
+    PM_SMART  = 3,
+};
+
+enum placement_shrink {
+    PM_SHRINK_ALLOW  = 0,   /* fewer eligible DS than stripes: place fewer stripes */
+    PM_SHRINK_STRICT = 1,   /* ... refuse the layout instead */
+};
+
+#define PM_KEY_MODE                 "placement_mode"
+#define PM_KEY_CAP_MAX_AGE_MS       "placement_capacity_max_age_ms"
+#define PM_KEY_MIN_FREE_BYTES       "placement_min_free_bytes"
+#define PM_KEY_DOMAIN_PREFIX        "ds_capacity_domain."
+#define PM_KEY_DOMAIN_WEIGHT_PREFIX "placement_domain_weight."
+#define PM_KEY_ALLOW_MANUAL         "placement_allow_manual_base_weights"
+#define PM_KEY_SHRINK               "placement_stripe_shrink"
+
+#define PM_DEFAULT_CAP_MAX_AGE_MS   120000u
+#define PM_CAP_MAX_AGE_MS_MAX       86400000u
+#define PM_DOMAIN_ID_MAX            128
+#define PM_DOMAIN_WEIGHT_MIN        1u
+#define PM_DOMAIN_WEIGHT_MAX        10000u
+#define PM_WEIGHT_SCALE             65536u
+#define PM_MAX_DOMAINS              256   /* == MDS_MAX_DS_NODES; asserted in placement_config.c */
+
+const char *placement_mode_name(enum placement_mode m);     /* "legacy"|"rr"|"fill"|"smart" */
+const char *placement_shrink_name(enum placement_shrink s); /* "allow"|"strict" */
+
+#endif /* PLACEMENT_MODES_H */

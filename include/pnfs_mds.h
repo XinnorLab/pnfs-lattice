@@ -34,6 +34,7 @@ _Static_assert(0, "pnfs-mds requires GCC >= 11.1 -- see docs/architecture.md sec
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "placement_modes.h"
 #include <pthread.h>
 #include <time.h>
 #include <stdio.h>
@@ -710,6 +711,28 @@ struct mds_config {
     uint32_t            ds_capacity_poll_ms;
 
     /*
+     * Placement modes (XinnorLab, placement_modes.h).  placement_mode_set
+     * is false when the key is absent: everything below is then unused
+     * and the legacy placement_policy* path runs unchanged.  The *_set
+     * flags of the legacy keys exist only for the conflict check.
+     */
+    enum placement_mode   placement_mode;
+    bool                  placement_mode_set;
+    bool                  placement_policy_set;
+    bool                  placement_policy_enabled_set;
+    bool                  placement_capacity_weighting_set;
+    bool                  ds_weight_set;
+    uint32_t              placement_capacity_max_age_ms;
+    uint64_t              placement_min_free_bytes;
+    char                  ds_capacity_domain[MDS_MAX_DS_NODES][PM_DOMAIN_ID_MAX];   /* "" = own domain */
+    char                  placement_domain_weight_id[PM_MAX_DOMAINS][PM_DOMAIN_ID_MAX];
+    uint32_t              placement_domain_weight[PM_MAX_DOMAINS];
+    uint32_t              placement_domain_weight_count;
+    bool                  placement_allow_manual_base_weights;
+    enum placement_shrink placement_stripe_shrink;
+    char                  placement_config_generation[65];   /* hex sha256; "" in legacy */
+
+    /*
      * Per-DS I/O limit probe interval (milliseconds).  The prober
      * asks each ONLINE generic DS for its real rtmax/wtmax via NFSv3
      * FSINFO so GETDEVICEINFO/LAYOUTGET advertise sizes the DS
@@ -1222,6 +1245,12 @@ struct mds_config {
  * @return MDS_OK on success.
  */
 enum mds_status mds_config_load(const char *path, struct mds_config *cfg);
+
+/* Placement modes (src/common/placement_config.c). */
+enum mds_status placement_config_validate(const struct mds_config *cfg,
+                                          char *err, size_t cap);
+void placement_config_generation(const struct mds_config *cfg, char out[65]);
+enum placement_mode placement_config_effective_mode(const struct mds_config *cfg);
 
 
 /* -----------------------------------------------------------------------

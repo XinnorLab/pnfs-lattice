@@ -74,6 +74,24 @@ Sizing knobs for the in-memory NFSv4.1 state tables (Wave 4).  All default to 0 
 - `placement_policy` — `rr|wrr|weighted_rr|capacity`.  Default: rr.
 - `placement_policy_enabled` — master switch.  Default: false.
 - `placement_capacity_weighting` — `off|proportional`.  Default: off.  When `proportional`, the statvfs probe derives `auto_weight = max(1, floor((1 - used/total) * 100))` in [1, 100] and writes it into the DS cache.  Overlay precedence: `ds_weight.<id>` > `auto_weight` > free-bytes > uniform, so an operator override always wins.  Visible as the `AUTO` column in `mds-admin ds capacity show`.
+### Placement modes (XinnorLab)
+One operator-facing key selects how a **new** backing object picks its
+data server; see `docs/placement-modes.md`.  When `placement_mode` is
+present it is authoritative: `placement_policy`,
+`placement_policy_enabled`, `placement_capacity_weighting` and a
+`workload_profile` that sets a placement policy are rejected at startup
+(`PLACEMENT_MODE_CONFLICT`).  Without the key nothing below applies and
+the legacy keys behave exactly as documented above.
+- `placement_mode` — `rr|fill|smart`.  No default (absent = legacy).  `rr` = cyclic order over the online DS, no weights; `fill` = weighted random by free fraction of the capacity domain, with a hard capacity gate; `smart` = `fill` × the connector assessment (needs a build with `ENABLE_DS_CONNECTOR`; refused otherwise with `PLACEMENT_MODE_UNSUPPORTED_BUILD`).
+- `placement_capacity_max_age_ms` — freshness bound of a capacity observation (1..86400000, must exceed `ds_capacity_poll_ms`).  Default: 120000.  fill/smart only.
+- `placement_min_free_bytes` — a domain is a candidate only when its available bytes exceed this.  Default: 0.  fill/smart only.
+- `ds_capacity_domain.<ds_id>` — capacity domain of DS `<ds_id>` (≤ 127 bytes).  Two exports of one filesystem must declare the same domain; the domain's weight is shared 1/N across its DS.  Default: the DS is its own domain.
+- `placement_stripe_shrink` — `allow|strict`: with fewer eligible DS than stripes, place fewer stripes or refuse.  Default: allow.
+- `placement_allow_manual_base_weights` — bool; smart only.  Default: false.
+- `placement_domain_weight.<domain>` — manual base weight of a domain (1..10000); smart only, needs the flag above (`DOMAIN_WEIGHT_FORBIDDEN` otherwise).
+- `ds_weight.<id>` is a conflict in `fill` (`PLACEMENT_MODE_CONFLICT`).
+- `fill`/`smart` require `ds_capacity_poll_ms > 0` (`RANGE`).
+The daemon logs `placement_mode=<mode> generation=<sha256[:12]> …` at startup; `placement_config_generation` (a SHA-256 of the managed keys) is what `lattice-placement mode verify` compares across MDS.
 ## Authentication
 - `nfs_auth_mode` — `sys|krb5|krb5i|krb5p`.
 - `krb5_keytab` / `krb5_principal` — GSS credentials.

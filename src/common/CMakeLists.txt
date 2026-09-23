@@ -6,6 +6,7 @@ add_library(pnfs_common STATIC
     threadpool.c
     heartbeat.c
     config.c
+    placement_config.c
     error.c
     mds_histogram.c
     mds_metrics.c
