@@ -23,6 +23,7 @@ target_include_directories(pnfs_cluster PUBLIC
 target_link_libraries(pnfs_cluster
     PUBLIC
         pnfs_common
+        pnfs_fsal_obj
         
         pthread
 )

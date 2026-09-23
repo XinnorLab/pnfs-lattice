@@ -21,6 +21,8 @@
 #include "test_helpers.h"
 #include "test_helpers.h"
 #include "cluster_transport.h"
+#include "placement_gate.h"
+#include "ds_cache.h"
 #include "mds_catalogue.h"
 #include "rename_2pc.h"
 #include "subtree_map.h"
@@ -1839,6 +1841,93 @@ static void test_admin_allowed_hosts_acl(void)
     PASS();
 }
 /* ------------------------------------------------------------------- */
+/* test_config_show_placement_rows
+ *
+ * XinnorLab placement modes: `config show` reports the desired and the
+ * effective mode, the config generation, the kernel id and one live
+ * gate verdict per registered DS (design section 9).
+ * ------------------------------------------------------------------- */
+
+static void test_config_show_placement_rows(void)
+{
+    fprintf(stdout, "  test_config_show_placement_rows:     ");
+    fflush(stdout);
+
+    struct mds_catalogue *db = open_test_db();
+    ASSERT_TRUE(db != NULL);
+    {
+        struct mds_cat_txn *txn = NULL;
+        struct mds_ds_info info;
+        memset(&info, 0, sizeof(info));
+        info.ds_id = 1;
+        info.state = DS_ONLINE;
+        info.port = 2049;
+        snprintf(info.host, sizeof(info.host), "ds-host");
+        ASSERT_EQ(mds_cat_txn_begin(db, MDS_CAT_TXN_WRITE, &txn), MDS_OK);
+        ASSERT_EQ(mds_cat_ds_put(db, txn, &info), MDS_OK);
+        ASSERT_EQ(mds_cat_txn_commit(txn), MDS_OK);
+    }
+    struct ds_cache *cache = NULL;
+    ASSERT_EQ(ds_cache_create(wrap_db_as_cat(db), &cache), 0);
+
+    struct cluster_server *srv = NULL;
+    enum mds_status st = cluster_transport_server_start(
+        0, "0.0.0.0", NULL, 0, 0,
+        wrap_db_as_cat(db), NULL, NULL, &srv);
+    ASSERT_EQ(st, MDS_OK);
+
+    struct mds_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.admin_allowed_hosts[0],
+             sizeof(cfg.admin_allowed_hosts[0]), "127.0.0.1");
+    cfg.admin_allowed_host_count = 1;
+    cfg.placement_mode = PM_FILL;
+    cfg.placement_mode_set = true;
+    cfg.placement_capacity_max_age_ms = 120000;
+    cfg.placement_stripe_shrink = PM_SHRINK_ALLOW;
+    snprintf(cfg.ds_capacity_domain[1], PM_DOMAIN_ID_MAX, "xi/fs-1");
+    snprintf(cfg.placement_config_generation,
+             sizeof(cfg.placement_config_generation), "%064x", 7);
+    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
+    {
+        struct ds_capacity_obs half = { 1000, 500, 9, ds_cache_mono_ms(), 0 };
+        ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &half), 0);
+    }
+    placement_gate_publish_capacity();
+    cluster_transport_server_set_config(srv, &cfg);
+
+    uint16_t port = cluster_transport_server_port(srv);
+    ASSERT_TRUE(port > 0);
+    char *text = NULL;
+    st = cluster_transport_request_config_show("127.0.0.1", port, NULL, &text);
+    ASSERT_EQ(st, MDS_OK);
+    ASSERT_TRUE(text != NULL);
+    ASSERT_TRUE(strstr(text, "placement_mode = fill\n") != NULL);
+    ASSERT_TRUE(strstr(text, "placement_mode_effective = fill\n") != NULL);
+    ASSERT_TRUE(strstr(text, "placement_config_generation = 0000000000000000000000000000000000000000000000000000000000000007\n") != NULL);
+    ASSERT_TRUE(strstr(text, "placement_kernel_id = 58494e01\n") != NULL);
+    ASSERT_TRUE(strstr(text, "ds_capacity_domain.1 = xi/fs-1\n") != NULL);
+    ASSERT_TRUE(strstr(text, "placement_ds.1 = domain=xi/fs-1 state=ONLINE capacity_age_ms=") != NULL);
+    ASSERT_TRUE(strstr(text, "avail=500 total=1000 weight=") != NULL);
+    ASSERT_TRUE(strstr(text, "reason=NONE\n") != NULL);
+    free(text);
+
+    /* the filter selects one per-DS row */
+    text = NULL;
+    st = cluster_transport_request_config_show("127.0.0.1", port, "placement_ds.1", &text);
+    ASSERT_EQ(st, MDS_OK);
+    ASSERT_TRUE(text != NULL && strncmp(text, "placement_ds.1 = ", 17) == 0);
+    free(text);
+
+    cluster_transport_server_stop(srv);
+    placement_gate_destroy();
+    ds_cache_destroy(cache);
+    mds_catalogue_close(db);
+    cleanup_db();
+    PASS();
+}
+
+/* ------------------------------------------------------------------- */
 /* test_hpc_mode_admin
  *
  * Drive the independent HPC admin transport against the memdb
@@ -1976,6 +2065,7 @@ int main(void)
     test_ds_admin_invalidates_cache();
     test_ds_add_v2_mode_transport();
     test_admin_allowed_hosts_acl();
+    test_config_show_placement_rows();
     test_hpc_mode_admin();
 
     fprintf(stdout, "\n  %d passed, %d failed\n", passed, failed);

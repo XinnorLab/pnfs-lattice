@@ -36,6 +36,8 @@
 #include "pnfs_mds.h"
 #include "subtree_map.h"
 #include "cluster_transport.h"
+#include "placement_gate.h"
+#include "wrr.h"
 #include "mds_catalogue.h"
 #include "rename_2pc.h"
 #include "mds_tls.h"
@@ -6643,6 +6645,66 @@ static void render_cfg_placement(const struct mds_config *cfg,
             (cfg->placement_capacity_weighting == CAP_WEIGHT_PROPORTIONAL)
                 ? "proportional" : "off";
         RENDER_KEY("placement_capacity_weighting", "%s", w);
+    }
+    /* XinnorLab placement modes (design section 9): desired vs
+     * effective mode, the config generation `verify` compares, the
+     * kernel identity, and the live gate verdict per registered DS
+     * (filter with `config show placement_ds.<id>` on big clusters). */
+    RENDER_KEY("placement_mode", "%s",
+               placement_mode_name(cfg->placement_mode_set
+                                   ? cfg->placement_mode : PM_LEGACY));
+    RENDER_KEY("placement_mode_effective", "%s",
+               placement_mode_name(placement_gate_mode()));
+    RENDER_KEY("placement_config_generation", "%s",
+               cfg->placement_config_generation[0] != '\0'
+                   ? cfg->placement_config_generation : "-");
+    RENDER_KEY("placement_kernel_id", "%08x", (unsigned)mds_wrr_kernel_id());
+    if (cfg->placement_mode_set) {
+        RENDER_KEY("placement_capacity_max_age_ms", "%u",
+                   (unsigned)cfg->placement_capacity_max_age_ms);
+        RENDER_KEY("placement_min_free_bytes", "%llu",
+                   (unsigned long long)cfg->placement_min_free_bytes);
+        RENDER_KEY("placement_stripe_shrink", "%s",
+                   placement_shrink_name(cfg->placement_stripe_shrink));
+        for (uint32_t i = 0; i < MDS_MAX_DS_NODES; i++) {
+            if (cfg->ds_capacity_domain[i][0] != '\0') {
+                char keybuf[40];
+                (void)snprintf(keybuf, sizeof(keybuf),
+                               "ds_capacity_domain.%u", (unsigned)i);
+                RENDER_KEY(keybuf, "%s", cfg->ds_capacity_domain[i]);
+            }
+        }
+    }
+    {
+        uint32_t ids[MDS_MAX_DS_NODES];
+        uint32_t n = placement_gate_ds_ids(ids, MDS_MAX_DS_NODES);
+        for (uint32_t i = 0; i < n; i++) {
+            struct placement_ds_status ps;
+            char keybuf[40];
+            char age[24];
+
+            if (!placement_gate_ds_status(ids[i], &ps)) {
+                continue;
+            }
+            if (ps.capacity_age_ms == UINT64_MAX) {
+                (void)snprintf(age, sizeof(age), "unknown");
+            } else {
+                (void)snprintf(age, sizeof(age), "%llu",
+                               (unsigned long long)ps.capacity_age_ms);
+            }
+            (void)snprintf(keybuf, sizeof(keybuf), "placement_ds.%u",
+                           (unsigned)ids[i]);
+            RENDER_KEY(keybuf,
+                       "domain=%s state=%s capacity_age_ms=%s avail=%llu "
+                       "total=%llu weight=%llu reason=%s",
+                       ps.domain,
+                       (ps.state == DS_ONLINE) ? "ONLINE" : "OFFLINE",
+                       age,
+                       (unsigned long long)ps.avail_bytes,
+                       (unsigned long long)ps.total_bytes,
+                       (unsigned long long)ps.weight,
+                       placement_reason_name(ps.reason));
+        }
     }
     *offp = off;
 }

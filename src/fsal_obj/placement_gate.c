@@ -883,3 +883,88 @@ enum mds_status placement_gate_admit_create(uint32_t ds_id, enum placement_purpo
     mint_token(tok, ds_id, p, now);
     return MDS_OK;
 }
+
+/* -----------------------------------------------------------------------
+ * config show support (design section 9)
+ * ----------------------------------------------------------------------- */
+
+uint32_t placement_gate_ds_ids(uint32_t *ids, uint32_t cap)
+{
+    struct placement_ctx ctx;
+    struct cap_view_ref *ref;
+    uint32_t n = 0;
+
+    if (ids == NULL || cap == 0) {
+        return 0;
+    }
+    placement_gate_ctx(&ctx, ds_cache_mono_ms());
+    ref = (struct cap_view_ref *)ctx.view_ref;
+    if (ref != NULL) {
+        for (uint32_t i = 0; i < ref->view.count && n < cap; i++) {
+            ids[n++] = ref->view.rows[i].ds_id;
+        }
+    }
+    placement_gate_ctx_release(&ctx);
+    return n;
+}
+
+bool placement_gate_ds_status(uint32_t ds_id, struct placement_ds_status *out)
+{
+    struct placement_ctx ctx;
+    struct cap_view_ref *ref;
+    struct placement_candidate *cands = NULL;
+    uint32_t n_c = 0;
+    bool found = false;
+
+    if (out == NULL) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    out->capacity_age_ms = UINT64_MAX;
+    out->reason = PR_DS_OFFLINE;
+    placement_gate_ctx(&ctx, ds_cache_mono_ms());
+    ref = (struct cap_view_ref *)ctx.view_ref;
+    if (ref == NULL || ref->n_infos == 0) {
+        placement_gate_ctx_release(&ctx);
+        return false;
+    }
+    for (uint32_t i = 0; i < ref->view.count; i++) {
+        const struct ds_capacity_view_row *r = &ref->view.rows[i];
+        if (r->ds_id != ds_id) {
+            continue;
+        }
+        found = true;
+        out->registered = true;
+        out->state = r->state;
+        out->avail_bytes = r->obs.avail_bytes;
+        out->total_bytes = r->obs.total_bytes;
+        if (r->obs.observed_mono_ms != 0 &&
+            ctx.now_mono_ms >= r->obs.observed_mono_ms) {
+            out->capacity_age_ms = ctx.now_mono_ms - r->obs.observed_mono_ms;
+        }
+        break;
+    }
+    if (!found) {
+        placement_gate_ctx_release(&ctx);
+        return false;
+    }
+    domain_for(&ctx, ds_id, out->domain);
+    cands = calloc(ref->n_infos, sizeof(*cands));
+    if (cands != NULL) {
+        n_c = placement_candidates(&ctx, ref->infos, ref->n_infos, cands, NULL);
+        for (uint32_t i = 0; i < n_c; i++) {
+            if (cands[i].ds_id == ds_id) {
+                out->weight = cands[i].weight;
+                out->reason = PR_NONE;
+                break;
+            }
+        }
+        if (out->reason != PR_NONE) {
+            (void)placement_ds_admitted(&ctx, ref->infos, ref->n_infos, ds_id,
+                                        &out->reason);
+        }
+        free(cands);
+    }
+    placement_gate_ctx_release(&ctx);
+    return true;
+}

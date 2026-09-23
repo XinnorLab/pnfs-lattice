@@ -133,6 +133,23 @@ enum mds_status placement_select_gated(bool legacy_policy_enabled,
                                        struct mds_ds_map_entry *entries,
                                        enum placement_reason *reason);
 
+/* Per-DS view for `config show` (design section 9). */
+struct placement_ds_status {
+    bool     registered;
+    uint32_t state;
+    char     domain[PM_DOMAIN_ID_MAX];
+    uint64_t capacity_age_ms;   /* UINT64_MAX when never observed */
+    uint64_t avail_bytes;
+    uint64_t total_bytes;
+    uint64_t weight;            /* 0 when not a candidate */
+    enum placement_reason reason;
+};
+
+/* DS ids in the published view (0 in rr/legacy or before the first publish). */
+uint32_t placement_gate_ds_ids(uint32_t *ids, uint32_t cap);
+/* The gate's current verdict for one DS; false when unknown to the gate. */
+bool placement_gate_ds_status(uint32_t ds_id, struct placement_ds_status *out);
+
 /* -----------------------------------------------------------------------
  * Create-boundary admission (Task 7).
  * ----------------------------------------------------------------------- */
