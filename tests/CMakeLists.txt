@@ -63,6 +63,7 @@ add_executable(test_rolling_upgrade unit/test_rolling_upgrade.c)
 add_executable(test_mds_metrics    unit/test_mds_metrics.c)
 add_executable(test_placement_policy unit/test_placement_policy.c)
 add_executable(test_wrr_kernel      unit/test_wrr_kernel.c)
+add_executable(test_placement_gate  unit/test_placement_gate.c)
 add_executable(test_mds_tls        unit/test_mds_tls.c)
 add_executable(test_mds_gss        unit/test_mds_gss.c)
 add_executable(test_config          unit/test_config.c)
@@ -149,6 +150,7 @@ foreach(test_target
     test_mds_metrics
     test_placement_policy
     test_wrr_kernel
+    test_placement_gate
     test_mds_tls
     test_mds_gss
     test_catalogue

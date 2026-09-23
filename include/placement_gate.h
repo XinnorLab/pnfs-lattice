@@ -1,0 +1,181 @@
+/*
+ * SPDX-License-Identifier: MIT
+ *
+ * placement_gate.h -- the candidate gate in front of every DS selector
+ * and the admission check at the create-if-absent boundary (XinnorLab
+ * placement modes; design sections 5, 5a, 6).
+ *
+ * Two layers:
+ *   - pure functions over explicit views (placement_candidates,
+ *     placement_admit, placement_ds_admitted, placement_weight) that unit
+ *     tests drive with synthetic data;
+ *   - a process singleton (placement_gate_init & co.) that owns the
+ *     effective mode, publishes the capacity view built from the DS
+ *     cache, and mints admission tokens for proxy_io.
+ *
+ * Legacy (placement_mode absent): the singleton is never initialised,
+ * placement_gate_mode() is PM_LEGACY and the selection sites take the
+ * upstream path via placement_select_gated().
+ */
+
+#ifndef PLACEMENT_GATE_H
+#define PLACEMENT_GATE_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdatomic.h>
+
+#include "pnfs_mds.h"
+#include "placement_modes.h"
+#include "ds_cache.h"
+
+/* Bounded reason vocabulary; names via placement_reason_name(). */
+enum placement_reason {
+    PR_NONE = 0,
+    PR_DS_OFFLINE,
+    PR_CAPACITY_UNKNOWN,
+    PR_CAPACITY_STALE,
+    PR_CAPACITY_FULL,
+    PR_DOMAIN_MAP_CONTRADICTION,
+    PR_SHARED_FS_ALIAS_UNMAPPED,
+    PR_ASSESSMENT_UNKNOWN,
+    PR_ASSESSMENT_STALE,
+    PR_CONNECTOR_DENIED,
+    PR_ZERO_MULTIPLIER,
+    PR_NO_BINDING,
+    PR_NO_ELIGIBLE_DS,
+    PR_INSUFFICIENT_ELIGIBLE_DS,
+    PR_MODE_NOT_READY,
+    PR_WEIGHT_OVERFLOW,
+    PR_COUNT
+};
+
+const char *placement_reason_name(enum placement_reason r);
+
+/* Immutable capacity input for one decision (built from the DS cache). */
+struct placement_capacity_view {
+    uint32_t count;
+    struct ds_capacity_view_row rows[MDS_MAX_DS_NODES];
+};
+
+/* Stage B: connector assessments.  Opaque here; NULL in Stage A. */
+struct placement_assessment_view;
+
+struct placement_ctx {
+    enum placement_mode   mode;
+    enum placement_shrink shrink;
+    uint64_t              now_mono_ms;
+    uint32_t              capacity_max_age_ms;
+    uint64_t              min_free_bytes;
+    /* cfg->ds_capacity_domain (indexed by ds_id) or NULL. */
+    const char          (*domain_of)[PM_DOMAIN_ID_MAX];
+    const struct placement_capacity_view   *cap;      /* NULL in rr/legacy */
+    const struct placement_assessment_view *assess;   /* NULL until Stage B */
+    _Atomic uint32_t     *rr_counter;                 /* shared rr cursor; NULL = rr_key only */
+    /* Singleton bookkeeping: the view reference held by this ctx. */
+    void                 *view_ref;
+};
+
+struct placement_candidate {
+    uint32_t idx;                      /* index into the caller's ds_list */
+    uint32_t ds_id;
+    uint64_t weight;                   /* > 0; 1 in rr */
+    char     domain[PM_DOMAIN_ID_MAX]; /* "" in rr */
+};
+
+struct placement_reject_counts {
+    uint32_t by_reason[PR_COUNT];
+};
+
+/*
+ * Fixed-point weight = domain_weight * ppm * PM_WEIGHT_SCALE / n_aliases,
+ * computed in unsigned __int128.  Returns 0 (and sets *overflow when
+ * given) if any input is 0, domain_weight exceeds PM_DOMAIN_WEIGHT_MAX,
+ * the result is 0, or MDS_MAX_DS_NODES such weights would reach 2^62.
+ */
+uint64_t placement_weight(uint32_t domain_weight, uint32_t ppm,
+                          uint32_t n_aliases, bool *overflow);
+
+/*
+ * Filter ds_list (already ONLINE/profile/io-limit filtered by the caller
+ * for the native rules; the gate re-checks DS_ONLINE) by mode.  Writes
+ * up to n candidates to out[] and per-reason rejection counts to why
+ * (may be NULL).  Returns the candidate count.
+ */
+uint32_t placement_candidates(const struct placement_ctx *ctx,
+                              const struct mds_ds_info *ds_list, uint32_t n,
+                              struct placement_candidate *out,
+                              struct placement_reject_counts *why);
+
+/*
+ * The one entry point for a new backing object's DS selection.
+ * stripe_count is in/out: on MDS_OK it holds the effective count (as
+ * placement_select2); unchanged on error.  MDS_ERR_NOSPC + *reason on
+ * refusal; MDS_ERR_INVAL on bad arguments; MDS_ERR_NOMEM.
+ * entries must hold *stripe_count x mirror_count slots.
+ */
+enum mds_status placement_admit(const struct placement_ctx *ctx,
+                                const struct mds_ds_info *ds_list, uint32_t n,
+                                uint32_t *stripe_count, uint32_t mirror_count,
+                                uint64_t rr_key,
+                                struct mds_ds_map_entry *entries,
+                                enum placement_reason *reason);
+
+/* Per-DS verdict under the same rules (used at the create boundary). */
+bool placement_ds_admitted(const struct placement_ctx *ctx,
+                           const struct mds_ds_info *ds_list, uint32_t n,
+                           uint32_t ds_id, enum placement_reason *reason);
+
+/* Diagnostics hook for a suspected (unprovable) alias: counter + WARN. */
+void placement_gate_note_alias_suspected(uint32_t a, uint32_t b);
+
+/* -----------------------------------------------------------------------
+ * Process singleton (Task 5) -- declared here, implemented alongside.
+ * ----------------------------------------------------------------------- */
+
+int  placement_gate_init(const struct mds_config *cfg, struct ds_cache *cache);
+void placement_gate_destroy(void);
+enum placement_mode placement_gate_mode(void);        /* PM_LEGACY when not initialised */
+const char *placement_gate_generation(void);          /* "" when not initialised */
+void placement_gate_publish_capacity(void);           /* rebuild the view from the DS cache */
+void placement_gate_ctx(struct placement_ctx *out, uint64_t now_mono_ms);
+void placement_gate_ctx_release(struct placement_ctx *ctx);
+
+/*
+ * Site helper: gated selection when a mode is set, the upstream selector
+ * otherwise (legacy_policy_enabled ? placement_select_ex2 : placement_select2,
+ * or placement_select_rr_at2 when rr_key != 0).
+ */
+enum mds_status placement_select_gated(bool legacy_policy_enabled,
+                                       enum mds_placement_policy legacy_policy,
+                                       const struct mds_ds_info *ds_list, uint32_t n,
+                                       uint32_t *stripe_count, uint32_t mirror_count,
+                                       uint32_t stripe_unit, uint64_t rr_key,
+                                       struct mds_ds_map_entry *entries,
+                                       enum placement_reason *reason);
+
+/* -----------------------------------------------------------------------
+ * Create-boundary admission (Task 7).
+ * ----------------------------------------------------------------------- */
+
+enum placement_purpose {
+    PP_NEW_OBJECT       = 1,
+    PP_RECREATE_MISSING = 2,
+};
+
+struct placement_token {
+    uint32_t ds_id;
+    uint32_t purpose;
+    uint64_t minted_mono_ms;
+    uint32_t snapshot_gen;
+};
+
+#define PLACEMENT_TOKEN_MAX_AGE_MS 2000u
+
+enum mds_status placement_gate_admit_create(uint32_t ds_id, enum placement_purpose p,
+                                            struct placement_token *tok,
+                                            enum placement_reason *reason);
+bool placement_token_valid(const struct placement_token *tok, uint32_t ds_id,
+                           uint64_t now_mono_ms);
+
+#endif /* PLACEMENT_GATE_H */

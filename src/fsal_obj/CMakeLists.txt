@@ -6,6 +6,7 @@ add_library(pnfs_fsal_obj STATIC
     layout.c
     ds_file.c
     placement.c
+    placement_gate.c
     referral.c
     lease_table.c
     lease_stripe_map.c

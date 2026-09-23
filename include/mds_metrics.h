@@ -167,6 +167,11 @@ struct mds_branch_metrics {
      */
     _Atomic uint64_t placement_degraded_total;
 
+    /* XinnorLab placement modes (placement_gate.c). */
+    _Atomic uint64_t placement_rejections_total[16]; /**< indexed by enum placement_reason */
+    _Atomic uint64_t placement_eligible_ds;          /**< gauge: candidates at the last admit */
+    _Atomic uint64_t placement_alias_suspected_total;
+
     /*
      * IO_ADVISE accounting (RFC 7862 S15.5).  io_advise_total
      * counts every IO_ADVISE op successfully dispatched; the two
