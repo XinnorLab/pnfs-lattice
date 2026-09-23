@@ -50,4 +50,22 @@ uint32_t mds_wrr_weighted_pick(const uint64_t *free_bytes, uint32_t n);
  */
 uint32_t mds_wrr_capacity_pick(const uint64_t *free_bytes, uint32_t n);
 
+/*
+ * Build identity: 0 in the community stub, non-zero in a real kernel.
+ * The MDS refuses the fill/smart placement modes when this is 0.
+ */
+#define MDS_WRR_KERNEL_XINNOR_V1 0x58494e01u
+uint32_t mds_wrr_kernel_id(void);
+
+/*
+ * Weighted pick that refuses instead of returning slot 0:
+ *   0  -> *out is a slot with weight > 0, P(i) = w[i] / sum(w)
+ *  -1  -> n == 0, w == NULL, every weight is zero, or the sum of the
+ *         weights reaches 2^62 (the sampler's range).
+ */
+int mds_wrr_weighted_pick2(const uint64_t *w, uint32_t n, uint32_t *out);
+
+/* Tests only: reseed the calling thread's PRNG for a reproducible draw. */
+void mds_wrr_test_seed(uint32_t seed);
+
 #endif /* WRR_H */

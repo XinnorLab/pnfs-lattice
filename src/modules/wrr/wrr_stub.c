@@ -30,3 +30,21 @@ uint32_t mds_wrr_capacity_pick(const uint64_t *free_bytes, uint32_t n)
     (void)n;
     return 0;
 }
+
+uint32_t mds_wrr_kernel_id(void)
+{
+    return 0;
+}
+
+int mds_wrr_weighted_pick2(const uint64_t *w, uint32_t n, uint32_t *out)
+{
+    (void)w;
+    (void)n;
+    (void)out;
+    return -1;
+}
+
+void mds_wrr_test_seed(uint32_t seed)
+{
+    (void)seed;
+}
