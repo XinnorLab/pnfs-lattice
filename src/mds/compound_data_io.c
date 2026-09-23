@@ -1907,7 +1907,11 @@ promote_inline_to_ds(struct compound_data *cd, struct mds_inode *inode)
 					cd->current_fh.fileid, s, m);
 				if (st != MDS_OK) {
 					free(entries);
-					nst = NFS4ERR_IO;
+					/* A creation refused by the placement
+					 * gate is "no space for a new object",
+					 * not an I/O failure. */
+					nst = (st == MDS_ERR_NOSPC)
+						? NFS4ERR_NOSPC : NFS4ERR_IO;
 					goto out_clear;
 				}
 			}

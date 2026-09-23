@@ -44,6 +44,7 @@
 #include <pthread.h>
 
 #include "proxy_io.h"
+#include "placement_gate.h"
 #include "mds_catalogue.h"
 #include "ds_nfs_rpc.h"
 #include "mds_op_metrics.h"
@@ -863,7 +864,19 @@ enum mds_status mds_proxy_write(const struct mds_proxy_ctx *ctx,
                               fileid, entries[entry_idx].ds_id,
                               stripe_idx, m, O_WRONLY | O_CREAT);
             if (fd < 0) {
-                fd = open(path, O_WRONLY | O_CREAT, 0644);
+                fd = open(path, O_WRONLY);
+                if (fd < 0 && errno == ENOENT) {
+                    /* Missing backing object: creation is gated
+                     * (design section 5a), never implicit. */
+                    enum mds_status est = mds_proxy_ensure_ds_file(
+                        ctx, entries[entry_idx].ds_id, fileid,
+                        stripe_idx, m);
+                    if (est != MDS_OK) {
+                        free(entries);
+                        return est;
+                    }
+                    fd = open(path, O_WRONLY);
+                }
                 if (fd < 0) {
                     free(entries);
                     return MDS_ERR_IO;
@@ -910,11 +923,10 @@ enum mds_status mds_proxy_write(const struct mds_proxy_ctx *ctx,
  * DS file creation helper
  * ----------------------------------------------------------------------- */
 
-enum mds_status mds_proxy_ensure_ds_file(const struct mds_proxy_ctx *ctx,
-                                         uint32_t ds_id,
-                                         uint64_t fileid,
-                                         uint32_t stripe,
-                                         uint32_t mirror)
+enum mds_status mds_proxy_create_ds_file(const struct mds_proxy_ctx *ctx,
+                                         uint32_t ds_id, uint64_t fileid,
+                                         uint32_t stripe, uint32_t mirror,
+                                         const struct placement_token *tok)
 {
     const char *mount;
     char dir_path[MDS_MAX_PATH];
@@ -923,24 +935,28 @@ enum mds_status mds_proxy_ensure_ds_file(const struct mds_proxy_ctx *ctx,
 
     if (ctx == NULL) {
         return MDS_ERR_INVAL;
-}
+    }
+    /* Design section 5a: no DS file is created without an admission
+     * token minted for this ds_id moments ago. */
+    if (!placement_token_valid(tok, ds_id, ds_cache_mono_ms())) {
+        return MDS_ERR_INVAL;
+    }
 
     MDS_PHASE_SCOPE(MDS_PHASE_DS_IO);
 
     mount = find_mount(ctx, ds_id);
     if (mount == NULL) {
         return MDS_ERR_NOTFOUND;
-}
+    }
 
     /* Ensure data/ subdirectory exists. */
     (void)snprintf(dir_path, sizeof(dir_path), "%s/data", mount);
     (void)mkdir(dir_path, 0755);  /* Ignore EEXIST. */
 
-    /* Create the data file if absent. */
     if (build_ds_path(file_path, sizeof(file_path), mount,
                       fileid, stripe, mirror) != 0) {
         return MDS_ERR_IO;
-}
+    }
 
     fd = open(file_path, O_WRONLY | O_CREAT, 0644);
     if (fd < 0) {
@@ -969,6 +985,58 @@ enum mds_status mds_proxy_ensure_ds_file(const struct mds_proxy_ctx *ctx,
     close(fd);
 
     return MDS_OK;
+}
+
+/* One rate-limited line per reason when the gate refuses a creation. */
+static void proxy_note_refused_create(uint32_t ds_id, uint64_t fileid,
+                                      enum placement_reason why)
+{
+    static _Atomic uint64_t last_ms;
+    uint64_t now = ds_cache_mono_ms();
+    uint64_t last = atomic_load_explicit(&last_ms, memory_order_relaxed);
+
+    if (now - last >= 10000ULL &&
+        atomic_compare_exchange_strong(&last_ms, &last, now)) {
+        MDS_LOG_WARN(LOG_COMP_MDS,
+            "DS file creation refused by the placement gate: ds=%u "
+            "fileid=%" PRIu64 " reason=%s",
+            (unsigned)ds_id, fileid, placement_reason_name(why));
+    }
+}
+
+enum mds_status mds_proxy_ensure_ds_file(const struct mds_proxy_ctx *ctx,
+                                         uint32_t ds_id,
+                                         uint64_t fileid,
+                                         uint32_t stripe,
+                                         uint32_t mirror)
+{
+    const char *mount;
+    char file_path[MDS_MAX_PATH];
+    struct placement_token tok;
+    enum placement_reason why = PR_NONE;
+    enum mds_status st;
+
+    if (ctx == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    mount = find_mount(ctx, ds_id);
+    if (mount == NULL) {
+        return MDS_ERR_NOTFOUND;
+    }
+    if (build_ds_path(file_path, sizeof(file_path), mount,
+                      fileid, stripe, mirror) != 0) {
+        return MDS_ERR_IO;
+    }
+    /* Existing object: never gated (LAT-15). */
+    if (access(file_path, F_OK) == 0) {
+        return MDS_OK;
+    }
+    st = placement_gate_admit_create(ds_id, PP_RECREATE_MISSING, &tok, &why);
+    if (st != MDS_OK) {
+        proxy_note_refused_create(ds_id, fileid, why);
+        return st;
+    }
+    return mds_proxy_create_ds_file(ctx, ds_id, fileid, stripe, mirror, &tok);
 }
 
 /* -----------------------------------------------------------------------
@@ -1105,84 +1173,12 @@ static int proxy_name_to_handle(const char *path, bool knfsd_strict,
  * @param fh_len    In: capacity of fh_out.  Out: actual handle length.
  * @return MDS_OK on success.
  */
-enum mds_status mds_proxy_ensure_ds_file_fh(
-    const struct mds_proxy_ctx *ctx,
-    uint32_t ds_id, uint64_t fileid,
-    uint32_t stripe, uint32_t mirror,
-    uint8_t *fh_out, uint32_t *fh_len)
+/* NFS3 MOUNT + LOOKUP RPC to the DS: finds an existing file, never creates. */
+static enum mds_status proxy_rpc_lookup_fh(const struct mds_proxy_ctx *ctx,
+                                           uint32_t ds_id, uint64_t fileid,
+                                           uint32_t stripe, uint32_t mirror,
+                                           uint8_t *fh_out, uint32_t *fh_len)
 {
-    const char *mount;
-    char file_path[MDS_MAX_PATH];
-
-    if (ctx == NULL || fh_out == NULL || fh_len == NULL) {
-        return MDS_ERR_INVAL;
-    }
-    if (ds_id >= MDS_PROXY_MAX_DS || !ctx->mounts[ds_id].registered) {
-        return MDS_ERR_NOTFOUND;
-    }
-
-    MDS_PHASE_SCOPE(MDS_PHASE_DS_IO);
-
-    mount = find_mount(ctx, ds_id);
-
-    /*
-     * Primary path: name_to_handle_at() on the local NFS mount.
-     * Requires the DS to be NFS-mounted on the MDS.
-     */
-    if (mount != NULL) {
-        char dir_path[MDS_MAX_PATH];
-        int fd;
-        struct timespec t0, t1, t2;
-
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-
-        /* Ensure data/ subdirectory exists. */
-        (void)snprintf(dir_path, sizeof(dir_path), "%s/data", mount);
-        (void)mkdir(dir_path, 0755);
-
-        /* Create the file if absent. */
-        if (build_ds_path(file_path, sizeof(file_path), mount,
-                          fileid, stripe, mirror) != 0) {
-            goto fallback_rpc;
-        }
-        fd = open(file_path, O_WRONLY | O_CREAT, 0644);
-        if (fd < 0) {
-            goto fallback_rpc;
-        }
-        /* 0666: DS backing file must be writable by the client's
-         * real (non-root) AUTH_SYS uid; see the mode rationale in
-         * mds_proxy_ensure_ds_file above. */
-        (void)fchmod(fd, 0666);
-        close(fd);
-
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-
-        /* Extract server FH via syscall. */
-        errno = 0;
-        if (proxy_name_to_handle(file_path, ctx->fh_knfsd_strict,
-                                 fh_out, *fh_len, fh_len) == 0) {
-            clock_gettime(CLOCK_MONOTONIC, &t2);
-            {
-                int64_t open_us = (t1.tv_sec - t0.tv_sec) * 1000000LL
-                    + (t1.tv_nsec - t0.tv_nsec) / 1000LL;
-                int64_t nth_us = (t2.tv_sec - t1.tv_sec) * 1000000LL
-                    + (t2.tv_nsec - t1.tv_nsec) / 1000LL;
-                MDS_LOG_DEBUG(LOG_COMP_MDS,
-                    "FH_TIMING syscall: open=%" PRId64 "us nth=%" PRId64
-                    "us total=%" PRId64 "us",
-                    open_us, nth_us, open_us + nth_us);
-            }
-            return MDS_OK;
-        }
-        /* name_to_handle_at failed -- fall through to RPC. */
-        MDS_LOG_WARN(LOG_COMP_MDS,
-            "ensure_ds_file_fh: name_to_handle_at path failed "
-            "(path=%s errno=%d) -- falling back to NFS3 RPC",
-            file_path, errno);
-    }
-
-fallback_rpc:
-    /* Fallback: NFS3 MOUNT + LOOKUP RPC to the DS. */
     {
         char rel_path[256];
         const char *host = ctx->mounts[ds_id].host;
@@ -1220,6 +1216,147 @@ fallback_rpc:
         }
         return MDS_OK;
     }
+}
+
+enum mds_status mds_proxy_lookup_ds_file_fh(
+    const struct mds_proxy_ctx *ctx,
+    uint32_t ds_id, uint64_t fileid,
+    uint32_t stripe, uint32_t mirror,
+    uint8_t *fh_out, uint32_t *fh_len)
+{
+    const char *mount;
+    char file_path[MDS_MAX_PATH];
+
+    if (ctx == NULL || fh_out == NULL || fh_len == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (ds_id >= MDS_PROXY_MAX_DS || !ctx->mounts[ds_id].registered) {
+        return MDS_ERR_NOTFOUND;
+    }
+
+    MDS_PHASE_SCOPE(MDS_PHASE_DS_IO);
+
+    mount = find_mount(ctx, ds_id);
+    if (mount != NULL &&
+        build_ds_path(file_path, sizeof(file_path), mount,
+                      fileid, stripe, mirror) == 0) {
+        if (access(file_path, F_OK) != 0) {
+            if (errno == ENOENT) {
+                return MDS_ERR_NOTFOUND;
+            }
+            /* any other error: let the RPC path decide */
+        } else {
+            errno = 0;
+            if (proxy_name_to_handle(file_path, ctx->fh_knfsd_strict,
+                                     fh_out, *fh_len, fh_len) == 0) {
+                return MDS_OK;
+            }
+            MDS_LOG_WARN(LOG_COMP_MDS,
+                "lookup_ds_file_fh: name_to_handle_at path failed "
+                "(path=%s errno=%d) -- falling back to NFS3 RPC",
+                file_path, errno);
+        }
+    }
+    return proxy_rpc_lookup_fh(ctx, ds_id, fileid, stripe, mirror,
+                               fh_out, fh_len);
+}
+
+enum mds_status mds_proxy_create_ds_file_fh(
+    const struct mds_proxy_ctx *ctx,
+    uint32_t ds_id, uint64_t fileid,
+    uint32_t stripe, uint32_t mirror,
+    const struct placement_token *tok,
+    uint8_t *fh_out, uint32_t *fh_len)
+{
+    const char *mount;
+    char dir_path[MDS_MAX_PATH];
+    char file_path[MDS_MAX_PATH];
+    struct timespec t0, t1, t2;
+    int fd;
+
+    if (ctx == NULL || fh_out == NULL || fh_len == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (!placement_token_valid(tok, ds_id, ds_cache_mono_ms())) {
+        return MDS_ERR_INVAL;
+    }
+    if (ds_id >= MDS_PROXY_MAX_DS || !ctx->mounts[ds_id].registered) {
+        return MDS_ERR_NOTFOUND;
+    }
+
+    MDS_PHASE_SCOPE(MDS_PHASE_DS_IO);
+
+    mount = find_mount(ctx, ds_id);
+    if (mount == NULL) {
+        /* Without a local mount nothing can be created (the RPC path
+         * only looks up); the upstream helper behaved the same way. */
+        return proxy_rpc_lookup_fh(ctx, ds_id, fileid, stripe, mirror,
+                                   fh_out, fh_len);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    (void)snprintf(dir_path, sizeof(dir_path), "%s/data", mount);
+    (void)mkdir(dir_path, 0755);
+    if (build_ds_path(file_path, sizeof(file_path), mount,
+                      fileid, stripe, mirror) != 0) {
+        return MDS_ERR_IO;
+    }
+    fd = open(file_path, O_WRONLY | O_CREAT, 0644);
+    if (fd < 0) {
+        return MDS_ERR_IO;
+    }
+    /* 0666: DS backing file must be writable by the client's real
+     * (non-root) AUTH_SYS uid; see mds_proxy_create_ds_file. */
+    (void)fchmod(fd, 0666);
+    close(fd);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    errno = 0;
+    if (proxy_name_to_handle(file_path, ctx->fh_knfsd_strict,
+                             fh_out, *fh_len, fh_len) == 0) {
+        clock_gettime(CLOCK_MONOTONIC, &t2);
+        {
+            int64_t open_us = (t1.tv_sec - t0.tv_sec) * 1000000LL
+                + (t1.tv_nsec - t0.tv_nsec) / 1000LL;
+            int64_t nth_us = (t2.tv_sec - t1.tv_sec) * 1000000LL
+                + (t2.tv_nsec - t1.tv_nsec) / 1000LL;
+            MDS_LOG_DEBUG(LOG_COMP_MDS,
+                "FH_TIMING syscall: open=%" PRId64 "us nth=%" PRId64
+                "us total=%" PRId64 "us",
+                open_us, nth_us, open_us + nth_us);
+        }
+        return MDS_OK;
+    }
+    MDS_LOG_WARN(LOG_COMP_MDS,
+        "create_ds_file_fh: name_to_handle_at path failed "
+        "(path=%s errno=%d) -- falling back to NFS3 RPC",
+        file_path, errno);
+    return proxy_rpc_lookup_fh(ctx, ds_id, fileid, stripe, mirror,
+                               fh_out, fh_len);
+}
+
+enum mds_status mds_proxy_ensure_ds_file_fh(
+    const struct mds_proxy_ctx *ctx,
+    uint32_t ds_id, uint64_t fileid,
+    uint32_t stripe, uint32_t mirror,
+    uint8_t *fh_out, uint32_t *fh_len)
+{
+    struct placement_token tok;
+    enum placement_reason why = PR_NONE;
+    enum mds_status st;
+
+    st = mds_proxy_lookup_ds_file_fh(ctx, ds_id, fileid, stripe, mirror,
+                                     fh_out, fh_len);
+    if (st != MDS_ERR_NOTFOUND) {
+        return st;
+    }
+    st = placement_gate_admit_create(ds_id, PP_RECREATE_MISSING, &tok, &why);
+    if (st != MDS_OK) {
+        proxy_note_refused_create(ds_id, fileid, why);
+        return st;
+    }
+    return mds_proxy_create_ds_file_fh(ctx, ds_id, fileid, stripe, mirror,
+                                       &tok, fh_out, fh_len);
 }
 
 /* -----------------------------------------------------------------------
@@ -1517,7 +1654,16 @@ enum mds_status mds_proxy_allocate(const struct mds_proxy_ctx *ctx,
             return MDS_ERR_IO;
         }
 
-        fd = open(path, O_WRONLY | O_CREAT, 0644);
+        fd = open(path, O_WRONLY);
+        if (fd < 0 && errno == ENOENT) {
+            enum mds_status est = mds_proxy_ensure_ds_file(
+                ctx, entries[entry_idx].ds_id, fileid, stripe_idx, m);
+            if (est != MDS_OK) {
+                free(entries);
+                return est;
+            }
+            fd = open(path, O_WRONLY);
+        }
         if (fd < 0) {
             free(entries);
             return MDS_ERR_IO;
@@ -2323,7 +2469,16 @@ enum mds_status mds_proxy_copy_direct(const struct mds_proxy_ctx *ctx,
     if (src_fd < 0) {
         return (errno == ENOENT) ? MDS_ERR_NOTFOUND : MDS_ERR_IO;
     }
-    dst_fd = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    {
+        /* The destination object is a new backing object: gated. */
+        enum mds_status est = mds_proxy_ensure_ds_file(
+            ctx, dst_ds_id, fileid, stripe, mirror);
+        if (est != MDS_OK) {
+            close(src_fd);
+            return est;
+        }
+    }
+    dst_fd = open(dst_path, O_WRONLY | O_TRUNC);
     if (dst_fd < 0) {
         close(src_fd);
         return MDS_ERR_IO;

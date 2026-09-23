@@ -232,6 +232,41 @@ enum mds_status mds_proxy_ensure_ds_file(const struct mds_proxy_ctx *ctx,
                                          uint32_t stripe,
                                          uint32_t mirror);
 
+/*
+ * XinnorLab placement modes -- the create-if-absent boundary (design
+ * section 5a).  Every DS file creation in this module goes through
+ * mds_proxy_create_ds_file* and needs an admission token minted by
+ * placement_gate_admit_create() immediately before the call; the
+ * mds_proxy_ensure_* helpers above and below are "lookup, then admit
+ * and create when absent".  Access to an EXISTING object is never
+ * gated (mds_proxy_lookup_ds_file_fh never creates).
+ */
+struct placement_token;
+
+/** Handle of an existing DS file; MDS_ERR_NOTFOUND when absent (local
+ *  mount) or MDS_ERR_IO when the RPC fallback cannot find it.  Never
+ *  creates. */
+enum mds_status mds_proxy_lookup_ds_file_fh(
+    const struct mds_proxy_ctx *ctx,
+    uint32_t ds_id, uint64_t fileid,
+    uint32_t stripe, uint32_t mirror,
+    uint8_t *fh_out, uint32_t *fh_len);
+
+/** Create the DS file (O_CREAT).  MDS_ERR_INVAL without a valid token
+ *  for this ds_id; MDS_ERR_NOTFOUND without a local mount. */
+enum mds_status mds_proxy_create_ds_file(const struct mds_proxy_ctx *ctx,
+                                         uint32_t ds_id, uint64_t fileid,
+                                         uint32_t stripe, uint32_t mirror,
+                                         const struct placement_token *tok);
+
+/** Create the DS file and return its handle.  Same token rule. */
+enum mds_status mds_proxy_create_ds_file_fh(
+    const struct mds_proxy_ctx *ctx,
+    uint32_t ds_id, uint64_t fileid,
+    uint32_t stripe, uint32_t mirror,
+    const struct placement_token *tok,
+    uint8_t *fh_out, uint32_t *fh_len);
+
 /**
  * Unlink a DS data file via the local NFS3 mount.
  *

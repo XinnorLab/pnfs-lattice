@@ -561,6 +561,10 @@ void placement_gate_note_alias_suspected(uint32_t a, uint32_t b)
 
 struct cap_view_ref {
     _Atomic uint32_t refs;
+    /* Compact registry (ds_id, state, host) derived from the rows so the
+     * create boundary can run the same gate without a catalogue read. */
+    struct mds_ds_info *infos;
+    uint32_t            n_infos;
     struct placement_capacity_view view;
 };
 
@@ -583,6 +587,7 @@ static void view_unref(struct cap_view_ref *ref)
 {
     if (ref != NULL &&
         atomic_fetch_sub_explicit(&ref->refs, 1, memory_order_acq_rel) == 1) {
+        free(ref->infos);
         free(ref);
     }
 }
@@ -612,6 +617,20 @@ void placement_gate_publish_capacity(void)
     atomic_store_explicit(&fresh->refs, 1, memory_order_relaxed);
     fresh->view.count = ds_cache_capacity_view(g.cache, fresh->view.rows,
                                                MDS_MAX_DS_NODES);
+    if (fresh->view.count > 0) {
+        fresh->infos = calloc(fresh->view.count, sizeof(*fresh->infos));
+        if (fresh->infos == NULL) {
+            free(fresh);
+            return;
+        }
+        for (uint32_t i = 0; i < fresh->view.count; i++) {
+            fresh->infos[i].ds_id = fresh->view.rows[i].ds_id;
+            fresh->infos[i].state = fresh->view.rows[i].state;
+            memcpy(fresh->infos[i].host, fresh->view.rows[i].host,
+                   sizeof(fresh->infos[i].host));
+        }
+        fresh->n_infos = fresh->view.count;
+    }
     pthread_rwlock_wrlock(&g.lock);
     old = g.cur;
     g.cur = fresh;
@@ -787,4 +806,80 @@ enum mds_status placement_select_gated(bool legacy_policy_enabled,
         *reason = why;
     }
     return st;
+}
+
+/* -----------------------------------------------------------------------
+ * Create-boundary admission (design section 5a)
+ * ----------------------------------------------------------------------- */
+
+bool placement_token_valid(const struct placement_token *tok, uint32_t ds_id,
+                           uint64_t now_mono_ms)
+{
+    if (tok == NULL || tok->ds_id != ds_id) {
+        return false;
+    }
+    if (tok->purpose != PP_NEW_OBJECT && tok->purpose != PP_RECREATE_MISSING) {
+        return false;
+    }
+    if (now_mono_ms < tok->minted_mono_ms) {
+        return false;
+    }
+    return (now_mono_ms - tok->minted_mono_ms) <= PLACEMENT_TOKEN_MAX_AGE_MS;
+}
+
+static void mint_token(struct placement_token *tok, uint32_t ds_id,
+                       enum placement_purpose p, uint64_t now)
+{
+    tok->ds_id = ds_id;
+    tok->purpose = (uint32_t)p;
+    tok->minted_mono_ms = now;
+    tok->snapshot_gen = atomic_load_explicit(&g.snapshot_gen, memory_order_acquire);
+}
+
+enum mds_status placement_gate_admit_create(uint32_t ds_id, enum placement_purpose p,
+                                            struct placement_token *tok,
+                                            enum placement_reason *reason)
+{
+    struct placement_ctx ctx;
+    struct cap_view_ref *ref;
+    enum placement_reason why = PR_NONE;
+    uint64_t now = ds_cache_mono_ms();
+    bool ok;
+
+    set_reason(reason, PR_NONE);
+    if (tok == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    memset(tok, 0, sizeof(*tok));
+    if (!g.initialised) {
+        /* Legacy: the upstream helpers created without any check. */
+        mint_token(tok, ds_id, p, now);
+        return MDS_OK;
+    }
+    if (g.mode == PM_RR) {
+        if (g.cache != NULL && !ds_cache_is_online(g.cache, ds_id)) {
+            note_refusal(PR_DS_OFFLINE);
+            set_reason(reason, PR_DS_OFFLINE);
+            return MDS_ERR_NOSPC;
+        }
+        mint_token(tok, ds_id, p, now);
+        return MDS_OK;
+    }
+    placement_gate_ctx(&ctx, now);
+    ref = (struct cap_view_ref *)ctx.view_ref;
+    if (ref == NULL || ref->n_infos == 0) {
+        placement_gate_ctx_release(&ctx);
+        note_refusal(PR_CAPACITY_UNKNOWN);
+        set_reason(reason, PR_CAPACITY_UNKNOWN);
+        return MDS_ERR_NOSPC;
+    }
+    ok = placement_ds_admitted(&ctx, ref->infos, ref->n_infos, ds_id, &why);
+    placement_gate_ctx_release(&ctx);
+    if (!ok) {
+        note_refusal(why);
+        set_reason(reason, why);
+        return MDS_ERR_NOSPC;
+    }
+    mint_token(tok, ds_id, p, now);
+    return MDS_OK;
 }
