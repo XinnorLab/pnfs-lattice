@@ -24,6 +24,7 @@
 #include "commit_queue.h"
 #include "ds_health.h"
 #include "placement.h"
+#include "placement_gate.h"
 #include "ds_prealloc.h"
 #include "quota.h"
 #include "health.h"
@@ -1865,9 +1866,21 @@ promote_inline_to_ds(struct compound_data *cd, struct mds_inode *inode)
 		goto out_clear;
 	}
 
-	st = placement_select(ds_list, ds_count,
-			      stripe_count, mirror_count,
-			      stripe_unit, entries);
+	/* Gated selection (legacy: plain RR as before).  stripe_count is
+	 * in/out so a shrunk layout is what the loop below creates. */
+	{
+		enum placement_reason why = PR_NONE;
+
+		st = placement_select_gated(false, PLACEMENT_RR,
+			ds_list, ds_count, &stripe_count, mirror_count,
+			stripe_unit, 0, entries, &why);
+		if (st != MDS_OK && why != PR_NONE) {
+			MDS_LOG_WARN(LOG_COMP_MDS,
+				"promotion fileid=%llu: no placement (%s)",
+				(unsigned long long)cd->current_fh.fileid,
+				placement_reason_name(why));
+		}
+	}
 	free(ds_list);
 	ds_list = NULL;
 	if (st != MDS_OK) {

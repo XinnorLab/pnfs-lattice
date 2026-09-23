@@ -48,6 +48,7 @@
 #include "mds_catalogue.h"
 #include "ds_cache.h"
 #include "placement.h"
+#include "placement_gate.h"
 #include "proxy_io.h"
 #include "mds_metrics.h"
 #include "pnfs_mds.h"
@@ -212,8 +213,13 @@ static enum mds_status ring_select_ds(struct ds_prealloc_ctx *ctx,
     if (ctx->cache != NULL) {
         ds_cache_overlay_weights(ctx->cache, mine, mine_count);
     }
-    st = placement_select_ex(ctx->policy, mine, mine_count, 1, 1,
-                             ctx->stripe_unit, entry);
+    {
+        uint32_t sc = 1;
+        enum placement_reason why = PR_NONE;
+
+        st = placement_select_gated(true, ctx->policy, mine, mine_count,
+                                    &sc, 1, ctx->stripe_unit, 0, entry, &why);
+    }
     free(mine);
     if (st != MDS_OK) {
         memset(entry, 0, sizeof(*entry));
@@ -383,8 +389,13 @@ static int sync_pop(struct ds_prealloc_ctx *ctx,
     if (ctx->cache != NULL) {
         ds_cache_overlay_weights(ctx->cache, ds_list, ds_count);
     }
-    st = placement_select_ex(ctx->policy, ds_list, ds_count, 1, 1,
-                             ctx->stripe_unit, entry);
+    {
+        uint32_t sc = 1;
+        enum placement_reason why = PR_NONE;
+
+        st = placement_select_gated(true, ctx->policy, ds_list, ds_count,
+                                    &sc, 1, ctx->stripe_unit, 0, entry, &why);
+    }
     free(ds_list);
     if (st != MDS_OK) {
         memset(entry, 0, sizeof(*entry));
@@ -739,8 +750,13 @@ enum mds_status ds_prealloc_select_any_online(
     if (ctx->cache != NULL) {
         ds_cache_overlay_weights(ctx->cache, ds_list, ds_count);
     }
-    st = placement_select_ex(ctx->policy, ds_list, ds_count, 1, 1,
-                             ctx->stripe_unit, entry);
+    {
+        uint32_t sc = 1;
+        enum placement_reason why = PR_NONE;
+
+        st = placement_select_gated(true, ctx->policy, ds_list, ds_count,
+                                    &sc, 1, ctx->stripe_unit, 0, entry, &why);
+    }
     free(ds_list);
     return st;
 }
@@ -862,8 +878,11 @@ enum mds_status ds_prealloc_batch(
 
         /* Fileid-rotated RR spreads wide layouts across the pool;
          * capacity/WRR would re-collapse onto the same hot N DSes. */
-        st = placement_select_rr_at2(ds_list, ds_count, &sc, mc,
-                                     stripe_unit, fileid, entries);
+        enum placement_reason why = PR_NONE;
+
+        st = placement_select_gated(false, PLACEMENT_RR, ds_list, ds_count,
+                                    &sc, mc, stripe_unit, fileid, entries,
+                                    &why);
         if (st != MDS_OK) {
             free(ds_list);
             free(entries);

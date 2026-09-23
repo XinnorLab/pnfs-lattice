@@ -47,6 +47,7 @@
 #include "mds_catalogue.h"
 #include "ds_cache.h"
 #include "placement.h"
+#include "placement_gate.h"
 #include "proxy_io.h"
 #include "pnfs_mds.h"
 
@@ -123,8 +124,13 @@ static int select_one_online(const struct ds_prealloc_ctx *ctx,
         ds_cache_overlay_weights(ctx->cache, ds_list, ds_count);
     }
 
-    st = placement_select_ex(ctx->policy, ds_list, ds_count,
-                             1, 1, ctx->stripe_unit, entry);
+    {
+        uint32_t sc = 1;
+        enum placement_reason why = PR_NONE;
+
+        st = placement_select_gated(true, ctx->policy, ds_list, ds_count,
+                                    &sc, 1, ctx->stripe_unit, 0, entry, &why);
+    }
     free(ds_list);
     if (st != MDS_OK) {
         memset(entry, 0, sizeof(*entry));
@@ -445,8 +451,11 @@ enum mds_status ds_prealloc_batch(
         uint32_t mc = (req->mirror_count == 0U) ? 1U : req->mirror_count;
         uint32_t sc = req->stripe_count;
 
-        st = placement_select_rr_at2(ds_list, ds_count, &sc, mc,
-                                     stripe_unit, fileid, entries);
+        enum placement_reason why = PR_NONE;
+
+        st = placement_select_gated(false, PLACEMENT_RR, ds_list, ds_count,
+                                    &sc, mc, stripe_unit, fileid, entries,
+                                    &why);
         if (st != MDS_OK) {
             free(ds_list);
             free(entries);

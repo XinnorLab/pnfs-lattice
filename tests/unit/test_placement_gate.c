@@ -15,6 +15,7 @@
 #include "ds_capacity.h"
 #include "wrr.h"
 #include "mds_metrics.h"
+#include "ds_prealloc.h"
 
 struct mds_catalogue *catalogue_memdb_open(void);
 
@@ -723,9 +724,47 @@ static void test_select_gated_fill_path_uses_the_gate(void)
     mds_catalogue_close(cat);
 }
 
+static void test_prealloc_stub_pop_is_gated(void)
+{
+    struct mds_config cfg = fill_cfg();
+    struct mds_catalogue *cat = NULL;
+    struct ds_cache *cache = cache_with_ds(&cat, 0);
+    ASSERT_TRUE(cache != NULL);
+    add_cache_ds(cat, cache, 1, "other");
+    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
+    struct ds_capacity_obs full = { 1000, 0, 1, ds_cache_mono_ms(), 0 };
+    struct ds_capacity_obs half = { 1000, 500, 2, ds_cache_mono_ms(), 0 };
+    ASSERT_EQ(ds_cache_set_capacity_obs(cache, 0, &full), 0);
+    ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &half), 0);
+    placement_gate_publish_capacity();
+    struct ds_prealloc_ctx *pa = NULL;
+    ASSERT_EQ(ds_prealloc_init_ex(cat, NULL, PLACEMENT_WEIGHTED_RR, 1, &pa), 0);
+    ASSERT_TRUE(pa != NULL);
+    ds_prealloc_set_ds_cache(pa, cache);
+    for (int i = 0; i < 50; i++) {
+        struct mds_ds_map_entry e; uint32_t su = 0; uint64_t fid = 0;
+        ASSERT_EQ(ds_prealloc_pop(pa, &e, &su, &fid), 0);
+        ASSERT_EQ(e.ds_id, 1u);
+        ASSERT_TRUE(fid != 0);
+    }
+    ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &full), 0);
+    placement_gate_publish_capacity();
+    {
+        struct mds_ds_map_entry e; uint32_t su = 0; uint64_t fid = 0;
+        ASSERT_EQ(ds_prealloc_pop(pa, &e, &su, &fid), -1);
+        ASSERT_EQ(ds_prealloc_peek(pa, &e, &su), -1);
+        ASSERT_EQ(ds_prealloc_select_any_online(pa, &e, &su), MDS_ERR_NOSPC);
+    }
+    ds_prealloc_destroy(pa);
+    placement_gate_destroy();
+    ds_cache_destroy(cache);
+    mds_catalogue_close(cat);
+}
+
 int main(void)
 {
     printf("test_placement_gate\n");
+    RUN_TEST(test_prealloc_stub_pop_is_gated);
     RUN_TEST(test_singleton_legacy_when_not_initialised);
     RUN_TEST(test_singleton_init_requires_mode_set);
     RUN_TEST(test_singleton_fill_needs_cache_and_kernel);

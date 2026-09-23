@@ -18,6 +18,7 @@
 #include "compound.h"
 #include "compound_internal.h"
 #include "placement.h"
+#include "placement_gate.h"
 #include "proxy_io.h"
 #include <stdatomic.h>
 #include "ds_prepare.h"
@@ -2022,16 +2023,24 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 			 * LAYOUTGET in an NFS4ERR_DELAY loop.  The entries
 			 * buffer stays at the requested (>= effective)
 			 * size, which is harmless. */
-			if (cd->cfg_placement_policy_enabled) {
-				st = placement_select_ex2(
+			/* XinnorLab placement modes: the gate in front of the
+			 * selector (placement_select_gated is the upstream
+			 * dispatcher/RR pair when no placement_mode is set). */
+			{
+				enum placement_reason why = PR_NONE;
+
+				st = placement_select_gated(
+					cd->cfg_placement_policy_enabled,
 					cd->cfg_placement_policy,
 					ds_list, ds_count,
 					&stripe_count, mirror_count,
-					stripe_unit, entries);
-			} else {
-				st = placement_select2(ds_list, ds_count,
-					      &stripe_count, mirror_count,
-					      stripe_unit, entries);
+					stripe_unit, 0, entries, &why);
+				if (st != MDS_OK && why != PR_NONE) {
+					MDS_LOG_WARN(LOG_COMP_MDS,
+						"LAYOUTGET fileid=%llu: no placement (%s)",
+						(unsigned long long)cd->current_fh.fileid,
+						placement_reason_name(why));
+				}
 			}
 			free(ds_list);
 			ds_list = NULL;
@@ -2214,9 +2223,21 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 				return NFS4ERR_RESOURCE;
 			}
 
-			st = placement_select(ds_list, ds_count,
-					      stripe_count, mirror_count,
-					      stripe_unit, entries);
+			/* Gated (legacy: plain RR as before). */
+			{
+				enum placement_reason why = PR_NONE;
+
+				st = placement_select_gated(false, PLACEMENT_RR,
+					ds_list, ds_count,
+					&stripe_count, mirror_count,
+					stripe_unit, 0, entries, &why);
+				if (st != MDS_OK && why != PR_NONE) {
+					MDS_LOG_WARN(LOG_COMP_MDS,
+						"LAYOUTGET fileid=%llu: no placement (%s)",
+						(unsigned long long)cd->current_fh.fileid,
+						placement_reason_name(why));
+				}
+			}
 			free(ds_list);
 			ds_list = NULL;
 			if (st != MDS_OK) {

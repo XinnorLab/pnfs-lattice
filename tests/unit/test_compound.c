@@ -25,6 +25,7 @@
 #include "mds_shard.h"
 #include "subtree_map.h"
 #include "ds_cache.h"
+#include "placement_gate.h"
 #include "xdr_codec.h"
 #include "layout_range.h"
 #include "layout_recall.h"
@@ -2099,6 +2100,89 @@ static void test_layoutget(void)
 	ASSERT_EQ(n, (uint32_t)4);
 	ASSERT_EQ(res[3].status, NFS4ERR_DELAY);
 
+	close_test_db(db, path);
+}
+
+/*
+ * XinnorLab placement modes: with placement_mode = fill and the only DS
+ * full (or unknown / stale), LAYOUTGET on a new file must refuse with
+ * NFS4ERR_NOSPC; once the DS has room the same request proceeds to the
+ * FH-pending NFS4ERR_DELAY of the no-proxy harness.  Legacy behaviour
+ * (no gate initialised) is covered by test_layoutget above.
+ */
+static void test_layoutget_fill_mode_gates_full_ds(void)
+{
+	struct mds_catalogue *db;
+	struct compound_data cd;
+	struct nfs4_op ops[6];
+	struct nfs4_result res[6];
+	struct ds_cache *dsc = NULL;
+	struct mds_config cfg;
+	uint32_t n;
+	char *path;
+
+	memset(res, 0, sizeof(res));
+	db = open_test_db(&path);
+	seed_patched_ready_ds(db, 1, "10.0.0.1:/export1");
+	seed_ds_provision(db, 1);
+	ASSERT_EQ(ds_cache_create(g_test_cat, &dsc), 0);
+
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.placement_mode = PM_FILL;
+	cfg.placement_mode_set = true;
+	cfg.placement_capacity_max_age_ms = 120000;
+	cfg.placement_stripe_shrink = PM_SHRINK_ALLOW;
+	ASSERT_EQ(placement_gate_init(&cfg, dsc), 0);
+	{
+		struct ds_capacity_obs full = { 1000, 0, 77, ds_cache_mono_ms(), 0 };
+		ASSERT_EQ(ds_cache_set_capacity_obs(dsc, 1, &full), 0);
+	}
+	placement_gate_publish_capacity();
+
+	compound_init(&cd);
+	cd.cat = g_test_cat;
+	cd.prealloc = g_prealloc;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_create("gated_file", MDS_FTYPE_REG, 0644);
+	n = compound_process(&cd, ops, res, 3);
+	ASSERT_EQ(n, (uint32_t)3);
+	ASSERT_EQ(res[2].status, NFS4_OK);
+	clear_inline_flag(db, res[2].res.create.inode.fileid);
+
+	compound_init(&cd);
+	cd.cat = g_test_cat;
+	cd.prealloc = g_prealloc;
+	cd.ds_cache = dsc;
+	cd.cfg_serve_layouts = true;
+	cd.cfg_placement_policy_enabled = true;
+	cd.cfg_placement_policy = PLACEMENT_WEIGHTED_RR;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_lookup("gated_file");
+	ops[3] = mk_layoutget(LAYOUTIOMODE4_RW);
+	n = compound_process(&cd, ops, res, 4);
+	ASSERT_EQ(n, (uint32_t)4);
+	ASSERT_EQ(res[3].status, NFS4ERR_NOSPC);
+
+	{
+		struct ds_capacity_obs half = { 1000, 500, 77, ds_cache_mono_ms(), 0 };
+		ASSERT_EQ(ds_cache_set_capacity_obs(dsc, 1, &half), 0);
+	}
+	placement_gate_publish_capacity();
+	compound_init(&cd);
+	cd.cat = g_test_cat;
+	cd.prealloc = g_prealloc;
+	cd.ds_cache = dsc;
+	cd.cfg_serve_layouts = true;
+	cd.cfg_placement_policy_enabled = true;
+	cd.cfg_placement_policy = PLACEMENT_WEIGHTED_RR;
+	n = compound_process(&cd, ops, res, 4);
+	ASSERT_EQ(n, (uint32_t)4);
+	ASSERT_TRUE(res[3].status == NFS4ERR_DELAY || res[3].status == NFS4_OK);
+
+	placement_gate_destroy();
+	ds_cache_destroy(dsc);
 	close_test_db(db, path);
 }
 
@@ -5513,6 +5597,7 @@ int main(void)
 	RUN_TEST(test_nofilehandle);
 	RUN_TEST(test_putfh_invalid);
 	RUN_TEST(test_layoutget);
+	RUN_TEST(test_layoutget_fill_mode_gates_full_ds);
 	RUN_TEST(test_layoutget_maxcount_toosmall_revokes_layout_state);
 	RUN_TEST(test_layoutget_newfile_fastpath);
 	RUN_TEST(test_layoutget_ds_pending_without_proxy_unavailable);
