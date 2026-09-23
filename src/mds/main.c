@@ -278,8 +278,10 @@ int main(int argc, char *argv[])
 	struct mds_config cfg;
 	enum mds_status rc;
 	const char *config_path = "/etc/pnfs-mds/mds.conf";
-#ifdef HAVE_RONDB
+	/* Used by remove_manifest_init() in every build; only the RonDB
+	 * heartbeat below assigns it a non-zero value. */
 	uint64_t rondb_boot_epoch = 0;
+#ifdef HAVE_RONDB
 	pthread_t rondb_hb_thread;
 	bool rondb_hb_running = false;
 #endif
