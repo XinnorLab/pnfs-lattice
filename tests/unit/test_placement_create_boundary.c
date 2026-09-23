@@ -230,9 +230,15 @@ static void test_ensure_creates_in_rr_and_refuses_full_ds_in_fill(void)
     placement_gate_publish_capacity();
     ASSERT_EQ(mds_proxy_ensure_ds_file(proxy, 1, 101, 0, 0), MDS_OK);
     ASSERT_TRUE(file_exists(dir, 101, 0, 0));
-    /* stale observation: refused again for a new object, existing one fine */
+    /* stale observation: refused again for a new object, existing one fine.
+     * CLOCK_MONOTONIC may be small on a fresh CI runner, so the staleness
+     * comes from a tiny max age, not from a large subtraction. */
+    placement_gate_destroy();
+    cfg.placement_capacity_max_age_ms = 1;
+    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
     {
-        struct ds_capacity_obs stale = { 1000, 500, 1, ds_cache_mono_ms() - 200000, 0 };
+        uint64_t now = ds_cache_mono_ms();
+        struct ds_capacity_obs stale = { 1000, 500, 1, (now > 50) ? now - 50 : 1, 0 };
         ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &stale), 0);
     }
     placement_gate_publish_capacity();

@@ -95,7 +95,10 @@ static bool row_fresh(const struct placement_ctx *ctx,
         return false;
     }
     if (ctx->now_mono_ms < r->obs.observed_mono_ms) {
-        return true; /* clock skew inside one process: treat as fresh */
+        /* A monotonic clock cannot run backwards inside one process;
+         * an observation "from the future" is corrupt data -- fail
+         * closed (not fresh) rather than trust it. */
+        return false;
     }
     return (ctx->now_mono_ms - r->obs.observed_mono_ms) <=
            (uint64_t)ctx->capacity_max_age_ms;

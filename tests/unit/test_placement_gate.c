@@ -217,6 +217,11 @@ static void test_fill_freshness_boundary(void)
     ASSERT_EQ(placement_candidates(&c, ds, 1, out, NULL), 1u);
     V.rows[0].obs.observed_mono_ms = 1000000 - 120001;
     ASSERT_EQ(placement_candidates(&c, ds, 1, out, NULL), 0u);
+    /* an observation from the future is corrupt: not fresh (fail closed) */
+    V.rows[0].obs.observed_mono_ms = 1000000 + 1;
+    struct placement_reject_counts why;
+    ASSERT_EQ(placement_candidates(&c, ds, 1, out, &why), 0u);
+    ASSERT_EQ(why.by_reason[PR_CAPACITY_STALE], 1u);
 }
 
 /* -----------------------------------------------------------------------
