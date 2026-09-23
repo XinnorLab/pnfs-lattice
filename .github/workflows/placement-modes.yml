@@ -1,0 +1,64 @@
+# XinnorLab placement modes -- build with the required flags, run the
+# suite and prove the invariants (real wrr kernel linked, no selector
+# outside the gate, no O_CREAT outside the token-guarded create helpers).
+name: Placement modes
+
+on:
+  push:
+    branches: ['xinnor/**']
+  pull_request:
+    branches: ['xinnor/**']
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-prove:
+    name: Build, test, prove (ENABLE_WRR=ON, ENABLE_DS_PREALLOC=OFF)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev libkrb5-dev liblmdb-dev \
+            libntirpc-dev libprotobuf-dev protobuf-compiler libgrpc-dev \
+            libgrpc++-dev protobuf-compiler-grpc gcc
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_TESTS=ON \
+            -DENABLE_EBPF=OFF -DENABLE_WRR=ON -DENABLE_DS_PREALLOC=OFF
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Unit and integration tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Proof -- the real wrr kernel is linked
+        run: |
+          nm build/src/mds/pnfs-mds | grep -q ' T mds_wrr_kernel_id'
+          ./build/tests/test_wrr_kernel | grep -q 'kernel_id_is_nonzero.*PASS'
+      - name: Proof -- no selector outside the gate
+        run: |
+          hits=$(grep -rnE '^[^*/]*placement_select(2|_ex2?|_rr_at2)?\(' src/ \
+                 | grep -v 'src/fsal_obj/placement.c\|src/fsal_obj/placement_gate.c' || true)
+          if [ -n "$hits" ]; then echo "$hits"; echo '::error::selector called outside placement_gate'; exit 1; fi
+      - name: Proof -- no O_CREAT outside the token-guarded create helpers
+        run: |
+          n=$(grep -c 'open(.*O_CREAT' src/mds/proxy_io.c)
+          if [ "$n" != "2" ]; then grep -n 'open(.*O_CREAT' src/mds/proxy_io.c; echo "::error::expected exactly 2 O_CREAT opens (create helpers), found $n"; exit 1; fi
+
+  build-prealloc-on:
+    name: Compile check with ENABLE_DS_PREALLOC=ON (gated enterprise module)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev libkrb5-dev liblmdb-dev \
+            libntirpc-dev libprotobuf-dev protobuf-compiler libgrpc-dev \
+            libgrpc++-dev protobuf-compiler-grpc gcc
+      - name: Configure and build the core library
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_TESTS=OFF \
+            -DENABLE_EBPF=OFF -DENABLE_WRR=ON -DENABLE_DS_PREALLOC=ON
+          cmake --build build -j"$(nproc)" --target pnfs_mds_core

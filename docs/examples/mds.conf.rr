@@ -1,0 +1,3 @@
+# Placement mode: classic round robin over the online data servers.
+# No capacity or health weighting; geometry keys apply as usual.
+placement_mode = rr

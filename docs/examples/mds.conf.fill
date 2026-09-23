@@ -1,0 +1,9 @@
+# Placement mode: weighted by free fraction of the capacity domain.
+placement_mode = fill
+ds_capacity_poll_ms = 30000
+placement_capacity_max_age_ms = 90000
+placement_min_free_bytes = 1073741824
+placement_stripe_shrink = allow
+# Two exports of one xiNAS filesystem are one capacity domain:
+ds_capacity_domain.0 = xinas-01/fs-uuid-01
+ds_capacity_domain.1 = xinas-01/fs-uuid-01
