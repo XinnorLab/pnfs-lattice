@@ -1866,14 +1866,19 @@ promote_inline_to_ds(struct compound_data *cd, struct mds_inode *inode)
 		goto out_clear;
 	}
 
-	/* Gated selection (legacy: plain RR as before).  stripe_count is
-	 * in/out so a shrunk layout is what the loop below creates. */
+	/* Gated selection (legacy: plain RR as before, with the upstream
+	 * by-value stripe count).  Under an explicit placement mode the
+	 * effective (possibly shrunk) count is what the loop below creates. */
 	{
 		enum placement_reason why = PR_NONE;
+		uint32_t sc_eff = stripe_count;
 
 		st = placement_select_gated(false, PLACEMENT_RR,
-			ds_list, ds_count, &stripe_count, mirror_count,
+			ds_list, ds_count, &sc_eff, mirror_count,
 			stripe_unit, 0, entries, &why);
+		if (st == MDS_OK && placement_gate_mode() != PM_LEGACY) {
+			stripe_count = sc_eff;
+		}
 		if (st != MDS_OK && why != PR_NONE) {
 			MDS_LOG_WARN(LOG_COMP_MDS,
 				"promotion fileid=%llu: no placement (%s)",

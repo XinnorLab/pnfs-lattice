@@ -159,6 +159,32 @@ static void test_ranges(void)
     ASSERT_EQ(cfg.ds_capacity_domain[2][0], '\0');
 }
 
+static void test_numbers_are_parsed_strictly(void)
+{
+    const char *bad[] = {
+        "placement_mode = fill\nplacement_min_free_bytes = -1\n",
+        "placement_mode = fill\nplacement_min_free_bytes = 1G\n",
+        "placement_mode = fill\nplacement_capacity_max_age_ms = 12abc\n",
+        "placement_mode = fill\nplacement_capacity_max_age_ms = +5\n",
+        "placement_mode = fill\nplacement_min_free_bytes = 99999999999999999999999\n",
+    };
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        struct mds_config cfg; char path[128];
+        ASSERT_EQ(write_tmp_ini(bad[i], path), 0);
+        ASSERT_EQ(mds_config_load(path, &cfg), MDS_ERR_INVAL);
+    }
+}
+
+static void test_generation_covers_the_poll_interval(void)
+{
+    struct mds_config a, b; char path[128];
+    ASSERT_EQ(write_tmp_ini("placement_mode = fill\nds_capacity_poll_ms = 30000\n", path), 0);
+    ASSERT_EQ(mds_config_load(path, &a), MDS_OK);
+    ASSERT_EQ(write_tmp_ini("placement_mode = fill\nds_capacity_poll_ms = 20000\n", path), 0);
+    ASSERT_EQ(mds_config_load(path, &b), MDS_OK);
+    ASSERT_TRUE(strcmp(a.placement_config_generation, b.placement_config_generation) != 0);
+}
+
 static void test_rr_does_not_need_the_probe(void)
 {
     struct mds_config cfg; char path[128];
@@ -229,6 +255,8 @@ int main(void)
     RUN_TEST(test_legacy_keys_conflict_with_mode);
     RUN_TEST(test_ranges);
     RUN_TEST(test_rr_does_not_need_the_probe);
+    RUN_TEST(test_numbers_are_parsed_strictly);
+    RUN_TEST(test_generation_covers_the_poll_interval);
     RUN_TEST(test_generation_is_stable_and_sensitive);
     RUN_TEST(test_rr_keeps_geometry);
     RUN_TEST(test_validate_is_pure);

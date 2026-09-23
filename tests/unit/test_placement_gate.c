@@ -511,6 +511,84 @@ static void test_ds_admitted_single(void)
     ASSERT_EQ(why, PR_DS_OFFLINE);
 }
 
+static void test_registry_view_drives_n_and_aliases_with_a_filtered_list(void)
+{
+    /* Scenario A (review finding 1): ds1 of domain d is OFFLINE and the
+     * caller's list no longer contains it; N must still be 2. */
+    struct mds_ds_info listed[2];
+    reset();
+    mk_ds(&listed[0], 0, DS_ONLINE, "xi");
+    mk_ds(&listed[1], 2, DS_ONLINE, "other");
+    add_row(0, "xi", 1000, 500, 7, 1000000);
+    add_row(1, "xi", 1000, 500, 7, 1000000);
+    V.rows[1].state = DS_OFFLINE;
+    add_row(2, "other", 1000, 500, 8, 1000000);
+    snprintf(DOM[0], PM_DOMAIN_ID_MAX, "d");
+    snprintf(DOM[1], PM_DOMAIN_ID_MAX, "d");
+    struct placement_ctx c = ctx_for(PM_FILL);
+    struct placement_candidate out[2];
+    ASSERT_EQ(placement_candidates(&c, listed, 2, out, NULL), 2u);
+    ASSERT_TRUE(out[0].weight == placement_weight(50, 1000000, 2, NULL));
+    ASSERT_TRUE(out[1].weight == placement_weight(50, 1000000, 1, NULL));
+    /* Scenario B: the filtered-out sibling is an undeclared proven alias. */
+    reset();
+    add_row(0, "xi", 1000, 500, 7, 1000000);
+    add_row(1, "xi", 1000, 500, 7, 1000000);
+    struct placement_reject_counts why;
+    ASSERT_EQ(placement_candidates(&c, listed, 1, out, &why), 0u);
+    ASSERT_EQ(why.by_reason[PR_SHARED_FS_ALIAS_UNMAPPED], 1u);
+    /* and the create boundary agrees with selection */
+    enum placement_reason r;
+    ASSERT_EQ(placement_ds_admitted(&c, listed, 1, 0, &r), false);
+    ASSERT_EQ(r, PR_SHARED_FS_ALIAS_UNMAPPED);
+}
+
+static void test_ds_admitted_reason_uses_domain_level_verdict(void)
+{
+    /* ds0 (avail 50) and ds1 (avail 800) share a domain; the conservative
+     * rule makes the domain full for min_free 100, ds1 included. */
+    struct mds_ds_info ds[2];
+    reset();
+    mk_ds(&ds[0], 0, DS_ONLINE, "xi");
+    mk_ds(&ds[1], 1, DS_ONLINE, "xi");
+    add_row(0, "xi", 1000, 50, 7, 1000000);
+    add_row(1, "xi", 1000, 800, 7, 1000000);
+    snprintf(DOM[0], PM_DOMAIN_ID_MAX, "d");
+    snprintf(DOM[1], PM_DOMAIN_ID_MAX, "d");
+    struct placement_ctx c = ctx_for(PM_FILL);
+    c.min_free_bytes = 100;
+    struct placement_candidate out[2];
+    ASSERT_EQ(placement_candidates(&c, ds, 2, out, NULL), 0u);
+    enum placement_reason r;
+    ASSERT_EQ(placement_ds_admitted(&c, ds, 2, 1, &r), false);
+    ASSERT_EQ(r, PR_CAPACITY_FULL);
+    /* a total of 0 with a time stamp is UNKNOWN, not STALE */
+    reset();
+    mk_ds(&ds[0], 0, DS_ONLINE, "h");
+    add_row(0, "h", 0, 0, 1, 1000000);
+    struct placement_reject_counts why;
+    ASSERT_EQ(placement_candidates(&c, ds, 1, out, &why), 0u);
+    ASSERT_EQ(why.by_reason[PR_CAPACITY_UNKNOWN], 1u);
+}
+
+static void test_admit_counts_per_ds_reasons(void)
+{
+    struct mds_ds_info ds[3];
+    reset();
+    for (uint32_t i = 0; i < 3; i++) mk_ds(&ds[i], i, DS_ONLINE, "h");
+    add_row(0, "h", 1000, 500, 1, 1000000);
+    add_row(1, "h", 1000, 0, 2, 1000000);           /* full */
+    add_row(2, "h", 1000, 500, 3, 1000000 - 500000); /* stale */
+    struct placement_ctx c = ctx_for(PM_FILL);
+    uint64_t full_before = atomic_load(&g_branch_metrics.placement_rejections_total[PR_CAPACITY_FULL]);
+    uint64_t stale_before = atomic_load(&g_branch_metrics.placement_rejections_total[PR_CAPACITY_STALE]);
+    struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why;
+    ASSERT_EQ(placement_admit(&c, ds, 3, &sc, 1, 0, &e, &why), MDS_OK);
+    ASSERT_EQ(e.ds_id, 0u);
+    ASSERT_EQ(atomic_load(&g_branch_metrics.placement_rejections_total[PR_CAPACITY_FULL]), full_before + 1);
+    ASSERT_EQ(atomic_load(&g_branch_metrics.placement_rejections_total[PR_CAPACITY_STALE]), stale_before + 1);
+}
+
 static void test_reason_names_are_bounded(void)
 {
     for (int r = 0; r < PR_COUNT; r++) {
@@ -694,6 +772,19 @@ static void test_select_gated_legacy_path(void)
     ASSERT_EQ(e.ds_id, 0u);
 }
 
+static void test_select_gated_legacy_rr_at2_branch(void)
+{
+    struct mds_ds_info ds[2];
+    mk_ds(&ds[0], 10, DS_ONLINE, "a");
+    mk_ds(&ds[1], 11, DS_ONLINE, "b");
+    ASSERT_EQ(placement_gate_mode(), PM_LEGACY);
+    struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why;
+    ASSERT_EQ(placement_select_gated(false, PLACEMENT_RR, ds, 2, &sc, 1, 65536, 1, &e, &why), MDS_OK);
+    ASSERT_EQ(e.ds_id, 11u);   /* start = 1 % 2 */
+    ASSERT_EQ(placement_select_gated(false, PLACEMENT_RR, ds, 2, &sc, 1, 65536, 2, &e, &why), MDS_OK);
+    ASSERT_EQ(e.ds_id, 10u);   /* start = 2 % 2 */
+}
+
 static void test_select_gated_fill_path_uses_the_gate(void)
 {
     struct mds_config cfg = fill_cfg();
@@ -776,6 +867,10 @@ int main(void)
     RUN_TEST(test_singleton_rr_needs_no_cache);
     RUN_TEST(test_singleton_publishes_capacity_from_cache);
     RUN_TEST(test_select_gated_legacy_path);
+    RUN_TEST(test_select_gated_legacy_rr_at2_branch);
+    RUN_TEST(test_registry_view_drives_n_and_aliases_with_a_filtered_list);
+    RUN_TEST(test_ds_admitted_reason_uses_domain_level_verdict);
+    RUN_TEST(test_admit_counts_per_ds_reasons);
     RUN_TEST(test_select_gated_fill_path_uses_the_gate);
     RUN_TEST(test_rr_is_cyclic_over_the_gated_list);
     RUN_TEST(test_rr_ignores_capacity);

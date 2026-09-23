@@ -17,6 +17,7 @@
 #include "ds_cache.h"
 #include "pnfs_mds.h"
 #include "mds_catalogue.h"
+#include "placement_gate.h"
 
 struct ds_cache_entry {
 	struct mds_ds_info info;
@@ -106,6 +107,12 @@ static int cache_reload_locked(struct ds_cache *cache,
 		}
 		entries[id].info = list[i];
 		entries[id].present = true;
+		/* A registry reload must not discard the capacity record of a
+		 * DS that stays registered: the placement gate would see it
+		 * as never observed for a whole poll interval. */
+		if (cache->entries[id].present) {
+			entries[id].cap_obs = cache->entries[id].cap_obs;
+		}
 
 		/* Try to load provisioning data. */
 		st = mds_cat_ds_provision_get(
@@ -249,6 +256,11 @@ int ds_cache_invalidate(struct ds_cache *cache, struct mds_catalogue *cat)
 	pthread_rwlock_wrlock(&cache->lock);
 	rc = cache_reload_locked(cache, cat);
 	pthread_rwlock_unlock(&cache->lock);
+	/* Registry changes (add/remove/set-state) reach the placement gate at
+	 * once, not at the next capacity sweep.  No-op without a gate. */
+	if (rc == 0) {
+		placement_gate_publish_capacity();
+	}
 	return rc;
 }
 

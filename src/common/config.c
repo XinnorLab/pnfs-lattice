@@ -181,6 +181,25 @@ static char *strip_whitespace(char *s)
     return s;
 }
 
+/* Digits only, no sign, no suffix, no overflow: the placement keys refuse
+ * "-1", "1G" and "12abc" instead of silently taking a wrong value. */
+static bool parse_u64_strict(const char *val, uint64_t *out)
+{
+    char *end = NULL;
+    unsigned long long v;
+
+    if (val == NULL || val[0] < '0' || val[0] > '9') {
+        return false;
+    }
+    errno = 0;
+    v = strtoull(val, &end, 10);
+    if (errno != 0 || end == NULL || *end != '\0') {
+        return false;
+    }
+    *out = (uint64_t)v;
+    return true;
+}
+
 /* NOLINTNEXTLINE(readability-function-cognitive-complexity) */
 enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
 {
@@ -1292,17 +1311,25 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
             }
             cfg->placement_mode_set = true;
         } else if (strcmp(key, PM_KEY_CAP_MAX_AGE_MS) == 0) {
-            unsigned long v = strtoul(val, NULL, 10);
-            if (v == 0 || v > PM_CAP_MAX_AGE_MS_MAX) {
+            uint64_t v = 0;
+            if (!parse_u64_strict(val, &v) || v == 0 || v > PM_CAP_MAX_AGE_MS_MAX) {
                 (void)fprintf(stderr,
-                    "ERROR: %s=%lu out of range (1..%u)\n",
-                    key, v, (unsigned)PM_CAP_MAX_AGE_MS_MAX);
+                    "ERROR: %s='%s' out of range (1..%u)\n",
+                    key, val, (unsigned)PM_CAP_MAX_AGE_MS_MAX);
                 (void)fclose(fp);
                 return MDS_ERR_INVAL;
             }
             cfg->placement_capacity_max_age_ms = (uint32_t)v;
         } else if (strcmp(key, PM_KEY_MIN_FREE_BYTES) == 0) {
-            cfg->placement_min_free_bytes = strtoull(val, NULL, 10);
+            uint64_t v = 0;
+            if (!parse_u64_strict(val, &v)) {
+                (void)fprintf(stderr,
+                    "ERROR: %s='%s' is not a non-negative integer (bytes)\n",
+                    key, val);
+                (void)fclose(fp);
+                return MDS_ERR_INVAL;
+            }
+            cfg->placement_min_free_bytes = v;
         } else if (strncmp(key, PM_KEY_DOMAIN_PREFIX,
                            strlen(PM_KEY_DOMAIN_PREFIX)) == 0) {
             const char *idtxt = key + strlen(PM_KEY_DOMAIN_PREFIX);
@@ -1322,23 +1349,37 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
         } else if (strncmp(key, PM_KEY_DOMAIN_WEIGHT_PREFIX,
                            strlen(PM_KEY_DOMAIN_WEIGHT_PREFIX)) == 0) {
             const char *dom = key + strlen(PM_KEY_DOMAIN_WEIGHT_PREFIX);
-            unsigned long w = strtoul(val, NULL, 10);
+            uint64_t w = 0;
+            uint32_t slot;
             if (dom[0] == '\0' || strlen(dom) >= PM_DOMAIN_ID_MAX ||
-                w < PM_DOMAIN_WEIGHT_MIN || w > PM_DOMAIN_WEIGHT_MAX ||
-                cfg->placement_domain_weight_count >= PM_MAX_DOMAINS) {
+                !parse_u64_strict(val, &w) ||
+                w < PM_DOMAIN_WEIGHT_MIN || w > PM_DOMAIN_WEIGHT_MAX) {
                 (void)fprintf(stderr,
-                    "ERROR: %s=%lu out of range (%u..%u)\n",
-                    key, w, (unsigned)PM_DOMAIN_WEIGHT_MIN,
+                    "ERROR: %s='%s' out of range (%u..%u)\n",
+                    key, val, (unsigned)PM_DOMAIN_WEIGHT_MIN,
                     (unsigned)PM_DOMAIN_WEIGHT_MAX);
                 (void)fclose(fp);
                 return MDS_ERR_INVAL;
             }
-            {
-                uint32_t n = cfg->placement_domain_weight_count++;
-                (void)snprintf(cfg->placement_domain_weight_id[n],
-                               PM_DOMAIN_ID_MAX, "%s", dom);
-                cfg->placement_domain_weight[n] = (uint32_t)w;
+            /* Last key wins, as for every other INI key. */
+            for (slot = 0; slot < cfg->placement_domain_weight_count; slot++) {
+                if (strcmp(cfg->placement_domain_weight_id[slot], dom) == 0) {
+                    break;
+                }
             }
+            if (slot == cfg->placement_domain_weight_count) {
+                if (slot >= PM_MAX_DOMAINS) {
+                    (void)fprintf(stderr,
+                        "ERROR: %s: more than %u domain weights\n",
+                        key, (unsigned)PM_MAX_DOMAINS);
+                    (void)fclose(fp);
+                    return MDS_ERR_INVAL;
+                }
+                cfg->placement_domain_weight_count++;
+                (void)snprintf(cfg->placement_domain_weight_id[slot],
+                               PM_DOMAIN_ID_MAX, "%s", dom);
+            }
+            cfg->placement_domain_weight[slot] = (uint32_t)w;
         } else if (strcmp(key, PM_KEY_ALLOW_MANUAL) == 0) {
             cfg->placement_allow_manual_base_weights =
                 (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);

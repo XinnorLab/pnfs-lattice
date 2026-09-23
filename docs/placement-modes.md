@@ -70,6 +70,17 @@ The domain's observation is the fresh one of the lowest DS id; a fresh
 sibling that disagrees by more than 1 % of `total` pulls `available`
 down to the smaller value.
 
+Every registry-level fact (N, the alias grades, the canonical
+observation) is taken from the published registry view of **all**
+registered DS, not from the subset a caller happened to pass — an
+offline or io-limit-filtered sibling still counts toward N and still
+proves an alias.  The registry view is republished after every capacity
+sweep and after every DS admin change (add/remove/set-state), and the
+create boundary additionally reads the DS admin state live.  A capacity
+probe of a mount path that is not a mount point (the empty directory an
+unmounted DS leaves behind) counts as a failed probe, never as an
+observation of the DS.
+
 ## Reasons
 
 A DS that is not a candidate carries one reason; the first failing check
@@ -111,7 +122,12 @@ and a proxy write on it fails instead of creating elsewhere.
   `pnfs_mds_placement_rejections_total{reason}`,
   `pnfs_mds_placement_alias_suspected_total`, plus the upstream
   `pnfs_mds_placement_degraded_total` when a layout shrank.
-- Refusals are logged once per reason per 10 s.
+- `pnfs_mds_placement_rejections_total{reason}` counts every DS the gate
+  rejected at every placement decision (a DS that stays full for an hour
+  keeps counting), `pnfs_mds_placement_alias_suspected_total` counts
+  warned episodes (one per 60 s).  Refusals are logged once per reason
+  per 10 s; the two alias grades that need an operator get an ERROR line
+  once per 60 s.
 
 ## Changing the mode
 

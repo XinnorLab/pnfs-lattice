@@ -342,9 +342,50 @@ static void test_capacity_view_lists_present_ds(void)
     mds_catalogue_close(cat);
 }
 
+static void test_invalidate_preserves_observation(void)
+{
+    struct mds_catalogue *cat = NULL;
+    struct ds_capacity_obs o;
+    struct ds_cache *c = cache_with_ds(&cat, 0);
+    ASSERT_TRUE(c != NULL);
+    ASSERT_EQ(ds_capacity_probe_once(c, "/tmp", CAP_WEIGHT_OFF), 1);
+    ASSERT_EQ(ds_cache_get_capacity_obs(c, 0, &o), MDS_OK);
+    uint64_t t = o.observed_mono_ms;
+    ASSERT_TRUE(t != 0);
+    ASSERT_EQ(ds_cache_invalidate(c, cat), 0);      /* admin RPCs reload the registry */
+    ASSERT_EQ(ds_cache_get_capacity_obs(c, 0, &o), MDS_OK);
+    ASSERT_EQ(o.observed_mono_ms, t);
+    ds_cache_destroy(c);
+    mds_catalogue_close(cat);
+}
+
+static void test_probe_ex_requires_a_mount_point(void)
+{
+    /* a plain directory (the shape an unmounted DS leaves behind) is not
+     * an observation of that DS */
+    char tpl[] = "/tmp/pnfs-ds-dir-XXXXXX";
+    char fmt[64];
+    struct mds_catalogue *cat = NULL;
+    struct ds_capacity_obs o;
+    struct ds_cache *c = cache_with_ds(&cat, 0);
+    ASSERT_TRUE(c != NULL);
+    ASSERT_TRUE(mkdtemp(tpl) != NULL);
+    snprintf(fmt, sizeof(fmt), "%s", tpl);
+    ASSERT_EQ(ds_capacity_probe_once_ex(c, fmt, CAP_WEIGHT_OFF, true), 0);
+    ASSERT_EQ(ds_cache_get_capacity_obs(c, 0, &o), MDS_OK);
+    ASSERT_EQ(o.observed_mono_ms, 0u);
+    ASSERT_EQ(o.consecutive_failures, 1u);
+    ASSERT_EQ(ds_capacity_probe_once_ex(c, fmt, CAP_WEIGHT_OFF, false), 1);
+    (void)rmdir(tpl);
+    ds_cache_destroy(c);
+    mds_catalogue_close(cat);
+}
+
 int main(void)
 {
     fprintf(stdout, "test_ds_capacity:\n");
+    RUN_TEST(test_invalidate_preserves_observation);
+    RUN_TEST(test_probe_ex_requires_a_mount_point);
     RUN_TEST(test_obs_absent_until_probed);
     RUN_TEST(test_probe_records_avail_fsid_and_time);
     RUN_TEST(test_failed_probe_keeps_values_and_counts);

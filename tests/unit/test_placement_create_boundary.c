@@ -253,6 +253,119 @@ static void test_ensure_creates_in_rr_and_refuses_full_ds_in_fill(void)
     mds_catalogue_close(cat);
 }
 
+static void test_admit_create_refuses_admin_offline_after_invalidate(void)
+{
+    struct mds_catalogue *cat = NULL;
+    struct ds_cache *cache = cache_with_ds(&cat, 1);
+    struct mds_config cfg;
+    struct placement_token tok;
+    enum placement_reason why;
+    ASSERT_TRUE(cache != NULL);
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.placement_mode = PM_FILL;
+    cfg.placement_mode_set = true;
+    cfg.placement_capacity_max_age_ms = 120000;
+    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
+    {
+        struct ds_capacity_obs half = { 1000, 500, 1, ds_cache_mono_ms(), 0 };
+        ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &half), 0);
+    }
+    placement_gate_publish_capacity();
+    ASSERT_EQ(placement_gate_admit_create(1, PP_NEW_OBJECT, &tok, &why), MDS_OK);
+    /* admin sets the DS OFFLINE: the registry reloads, no capacity sweep runs */
+    {
+        struct mds_cat_txn *txn = NULL;
+        struct mds_ds_info info;
+        ASSERT_EQ(mds_cat_ds_get(cat, 1, &info), MDS_OK);
+        info.state = DS_OFFLINE;
+        ASSERT_EQ(mds_cat_txn_begin(cat, MDS_CAT_TXN_WRITE, &txn), MDS_OK);
+        ASSERT_EQ(mds_cat_ds_put(cat, txn, &info), MDS_OK);
+        ASSERT_EQ(mds_cat_txn_commit(txn), MDS_OK);
+        ASSERT_EQ(ds_cache_invalidate(cache, cat), 0);
+    }
+    ASSERT_EQ(placement_gate_admit_create(1, PP_NEW_OBJECT, &tok, &why), MDS_ERR_NOSPC);
+    ASSERT_EQ(why, PR_DS_OFFLINE);
+    /* the reload kept the observation: back ONLINE -> admitted at once */
+    {
+        struct mds_cat_txn *txn = NULL;
+        struct mds_ds_info info;
+        ASSERT_EQ(mds_cat_ds_get(cat, 1, &info), MDS_OK);
+        info.state = DS_ONLINE;
+        ASSERT_EQ(mds_cat_txn_begin(cat, MDS_CAT_TXN_WRITE, &txn), MDS_OK);
+        ASSERT_EQ(mds_cat_ds_put(cat, txn, &info), MDS_OK);
+        ASSERT_EQ(mds_cat_txn_commit(txn), MDS_OK);
+        ASSERT_EQ(ds_cache_invalidate(cache, cat), 0);
+    }
+    ASSERT_EQ(placement_gate_admit_create(1, PP_NEW_OBJECT, &tok, &why), MDS_OK);
+    placement_gate_destroy();
+    ds_cache_destroy(cache);
+    mds_catalogue_close(cat);
+}
+
+static void test_token_expires_after_two_publishes(void)
+{
+    struct mds_catalogue *cat = NULL;
+    struct ds_cache *cache = cache_with_ds(&cat, 1);
+    struct mds_config cfg;
+    struct placement_token tok;
+    enum placement_reason why;
+    ASSERT_TRUE(cache != NULL);
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.placement_mode = PM_FILL;
+    cfg.placement_mode_set = true;
+    cfg.placement_capacity_max_age_ms = 120000;
+    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
+    {
+        struct ds_capacity_obs half = { 1000, 500, 1, ds_cache_mono_ms(), 0 };
+        ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &half), 0);
+    }
+    placement_gate_publish_capacity();
+    ASSERT_EQ(placement_gate_admit_create(1, PP_NEW_OBJECT, &tok, &why), MDS_OK);
+    ASSERT_EQ(placement_token_valid(&tok, 1, ds_cache_mono_ms()), true);
+    placement_gate_publish_capacity();                 /* one publish may race the create */
+    ASSERT_EQ(placement_token_valid(&tok, 1, ds_cache_mono_ms()), true);
+    placement_gate_publish_capacity();                 /* two: the token predates the previous snapshot */
+    ASSERT_EQ(placement_token_valid(&tok, 1, ds_cache_mono_ms()), false);
+    placement_gate_destroy();
+    ds_cache_destroy(cache);
+    mds_catalogue_close(cat);
+}
+
+static void test_batch_capture_does_not_create_on_a_refused_ds(void)
+{
+    struct mds_catalogue *cat = NULL;
+    struct ds_cache *cache = cache_with_ds(&cat, 1);
+    char *dir = make_ds_dir();
+    struct mds_proxy_ctx *proxy = NULL;
+    struct mds_config cfg;
+    struct mds_ds_map_entry entries[2];
+    ASSERT_TRUE(cache != NULL && dir != NULL);
+    ASSERT_EQ(mds_proxy_ctx_create(&proxy), MDS_OK);
+    ASSERT_EQ(mds_proxy_mount_set(proxy, 1, dir), MDS_OK);
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.placement_mode = PM_FILL;
+    cfg.placement_mode_set = true;
+    cfg.placement_capacity_max_age_ms = 120000;
+    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
+    {
+        struct ds_capacity_obs full = { 1000, 0, 1, ds_cache_mono_ms(), 0 };
+        ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &full), 0);
+    }
+    placement_gate_publish_capacity();
+    memset(entries, 0, sizeof(entries));
+    entries[0].ds_id = 1;
+    entries[1].ds_id = 1;
+    ASSERT_EQ(mds_proxy_ensure_ds_file_fh_batch(proxy, 400, 2, entries, 2), 2u);   /* both slots failed */
+    ASSERT_EQ(entries[0].nfs_fh_len, 0u);
+    ASSERT_TRUE(!file_exists(dir, 400, 0, 0));
+    ASSERT_TRUE(!file_exists(dir, 400, 1, 0));
+    placement_gate_destroy();
+    mds_proxy_ctx_destroy(proxy);
+    rm_ds_dir(dir);
+    ds_cache_destroy(cache);
+    mds_catalogue_close(cat);
+}
+
 static void test_write_direct_does_not_create_on_a_refused_ds(void)
 {
     struct mds_catalogue *cat = NULL;
@@ -296,6 +409,9 @@ int main(void)
     RUN_TEST(test_admit_create_legacy_and_rr);
     RUN_TEST(test_ensure_creates_in_rr_and_refuses_full_ds_in_fill);
     RUN_TEST(test_write_direct_does_not_create_on_a_refused_ds);
+    RUN_TEST(test_admit_create_refuses_admin_offline_after_invalidate);
+    RUN_TEST(test_token_expires_after_two_publishes);
+    RUN_TEST(test_batch_capture_does_not_create_on_a_refused_ds);
     printf("%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

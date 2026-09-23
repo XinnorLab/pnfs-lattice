@@ -1252,7 +1252,7 @@ enum mds_status mds_proxy_lookup_ds_file_fh(
                 return MDS_OK;
             }
             MDS_LOG_WARN(LOG_COMP_MDS,
-                "lookup_ds_file_fh: name_to_handle_at path failed "
+                "ensure_ds_file_fh: name_to_handle_at path failed "
                 "(path=%s errno=%d) -- falling back to NFS3 RPC",
                 file_path, errno);
         }

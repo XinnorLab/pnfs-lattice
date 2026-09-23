@@ -107,6 +107,8 @@ bool placement_ds_admitted(const struct placement_ctx *ctx,
 
 /* Diagnostics hook for a suspected (unprovable) alias: counter + WARN. */
 void placement_gate_note_alias_suspected(uint32_t a, uint32_t b);
+/* Per-DS rejection counts into the metrics (+ ERROR for the alias grades). */
+void placement_gate_note_rejections(const struct placement_reject_counts *why);
 
 /* -----------------------------------------------------------------------
  * Process singleton (Task 5) -- declared here, implemented alongside.

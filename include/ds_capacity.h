@@ -109,4 +109,14 @@ int ds_capacity_probe_once(struct ds_cache *cache,
 			   const char *mount_path_fmt,
 			   enum mds_placement_capacity_weighting mode);
 
+/**
+ * @brief Like ds_capacity_probe_once, with the background thread's
+ * mount-point requirement: a path on the same device as its parent (an
+ * unmounted DS directory) counts as a failed probe.
+ */
+int ds_capacity_probe_once_ex(struct ds_cache *cache,
+			      const char *mount_path_fmt,
+			      enum mds_placement_capacity_weighting mode,
+			      bool require_mountpoint);
+
 #endif /* DS_CAPACITY_H */

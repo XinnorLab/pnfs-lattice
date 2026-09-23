@@ -35,6 +35,7 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <sys/statvfs.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
@@ -190,10 +191,34 @@ uint32_t ds_capacity_derive_auto_weight(uint64_t total_bytes,
  * MDSes (including pure-metadata MDSes that don't proxy-mount the DS)
  * can pick up the observation through the periodic cluster reload.
  */
+/*
+ * A DS whose NFS mount dropped leaves an empty directory behind: statvfs()
+ * then reports the MDS root filesystem as the DS's capacity.  When
+ * @p require_mountpoint is set, the path must sit on a different device
+ * than its parent, else the probe counts as failed (placement modes rely
+ * on this; the legacy weighting path keeps its old behaviour).
+ */
+static bool path_is_mountpoint(const char *path)
+{
+	struct stat st_path;
+	struct stat st_parent;
+	char parent[256 + 4];
+
+	if (stat(path, &st_path) != 0) {
+		return false;
+	}
+	(void)snprintf(parent, sizeof(parent), "%s/..", path);
+	if (stat(parent, &st_parent) != 0) {
+		return false;
+	}
+	return st_path.st_dev != st_parent.st_dev;
+}
+
 static int probe_one(struct ds_cache *cache,
 		     const char *fmt, uint32_t ds_id,
 		     enum mds_placement_capacity_weighting mode,
-		     struct mds_catalogue *cat)
+		     struct mds_catalogue *cat,
+		     bool require_mountpoint)
 {
 	char path[256];
 	struct statvfs sv;
@@ -212,6 +237,10 @@ static int probe_one(struct ds_cache *cache,
 #pragma GCC diagnostic pop
 
 	if (statvfs(path, &sv) != 0) {
+		(void)ds_cache_note_capacity_failure(cache, ds_id);
+		return 0;
+	}
+	if (require_mountpoint && !path_is_mountpoint(path)) {
 		(void)ds_cache_note_capacity_failure(cache, ds_id);
 		return 0;
 	}
@@ -289,6 +318,14 @@ int ds_capacity_probe_once(struct ds_cache *cache,
 			   const char *mount_path_fmt,
 			   enum mds_placement_capacity_weighting mode)
 {
+	return ds_capacity_probe_once_ex(cache, mount_path_fmt, mode, false);
+}
+
+int ds_capacity_probe_once_ex(struct ds_cache *cache,
+			      const char *mount_path_fmt,
+			      enum mds_placement_capacity_weighting mode,
+			      bool require_mountpoint)
+{
 	uint32_t ids[MDS_MAX_DS_NODES];
 	uint32_t n;
 	uint32_t i;
@@ -301,7 +338,7 @@ int ds_capacity_probe_once(struct ds_cache *cache,
 	for (i = 0; i < n; i++) {
 		/* Test entry point: no catalogue persistence. */
 		probed += probe_one(cache, mount_path_fmt, ids[i],
-				    mode, NULL);
+				    mode, NULL, require_mountpoint);
 	}
 	/* Placement modes read an immutable snapshot of the records. */
 	placement_gate_publish_capacity();
@@ -360,7 +397,7 @@ static void *capacity_thread(void *arg)
 				(void)probe_one(cap->cache,
 						cap->mount_path_fmt,
 						ids[i], cap->mode,
-						cap->cat);
+						cap->cat, true);
 			}
 		}
 

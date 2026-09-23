@@ -182,6 +182,7 @@ void placement_config_generation(const struct mds_config *cfg, char out[65])
     } while (0)
 
     APPEND("mode=%s\n", placement_mode_name(cfg->placement_mode));
+    APPEND("poll=%u\n", (unsigned)cfg->ds_capacity_poll_ms);
     APPEND("max_age=%u\n", (unsigned)cfg->placement_capacity_max_age_ms);
     APPEND("min_free=%llu\n", (unsigned long long)cfg->placement_min_free_bytes);
     APPEND("shrink=%s\n", placement_shrink_name(cfg->placement_stripe_shrink));

@@ -104,22 +104,54 @@ static bool row_fresh(const struct placement_ctx *ctx,
            (uint64_t)ctx->capacity_max_age_ms;
 }
 
-/* Per-DS scratch for one candidates() call. */
-struct pc_scratch {
-    const struct ds_capacity_view_row *row;   /* NULL when absent from the view */
-    char     domain[PM_DOMAIN_ID_MAX];
-    uint32_t n_aliases;
-    bool     alias_contradiction;
-    bool     alias_unmapped;
+/*
+ * Weighted-mode candidate list (fill and, with an assessment view, smart).
+ *
+ * The caller's ds_list is only the NATIVE-eligible subset (ONLINE, profile,
+ * io-limit).  Every registry-level fact -- a domain's alias count N, the
+ * alias grades, the canonical observation -- comes from the published
+ * view, which holds every registered DS whatever the caller filtered, so
+ * a filtered list can neither inflate a domain's share nor hide an alias
+ * (MODE-07, review finding 1).
+ */
+struct row_scratch {
+    char domain[PM_DOMAIN_ID_MAX];
+    bool declared;
+    bool observed;   /* has an fsid and a total: usable for alias checks */
 };
 
-/* Weighted-mode candidate list (fill and, with an assessment view, smart). */
+static uint32_t domain_weight_of(uint64_t avail, uint64_t total)
+{
+    uint64_t w;
+
+    if (total == 0) {
+        return 0;
+    }
+    if (avail > total) {
+        avail = total;
+    }
+    /* Same guard as ds_capacity_derive_auto_weight: > 184 EiB totals. */
+    if (total > UINT64_MAX / 100ULL) {
+        w = avail / (total / 100ULL);
+    } else {
+        w = (avail * 100ULL) / total;
+    }
+    if (w == 0) {
+        w = 1;
+    }
+    if (w > 100) {
+        w = 100;
+    }
+    return (uint32_t)w;
+}
+
 static uint32_t candidates_weighted(const struct placement_ctx *ctx,
                                     const struct mds_ds_info *ds_list, uint32_t n,
                                     struct placement_candidate *out,
                                     struct placement_reject_counts *why)
 {
-    struct pc_scratch *sc;
+    const struct placement_capacity_view *cap = ctx->cap;
+    struct row_scratch *rs;
     uint32_t i, j;
     uint32_t n_out = 0;
 
@@ -130,82 +162,33 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
         }
         return 0;
     }
-    if (ctx->cap == NULL) {
+    if (cap == NULL || cap->count == 0) {
         for (i = 0; i < n; i++) {
             count_reason(why, PR_CAPACITY_UNKNOWN);
         }
         return 0;
     }
 
-    sc = calloc(n, sizeof(*sc));
-    if (sc == NULL) {
+    rs = calloc(cap->count, sizeof(*rs));
+    if (rs == NULL) {
         return 0;
     }
-
-    /* 1. Domain + row per registered DS (any state; N counts all). */
-    for (i = 0; i < n; i++) {
-        domain_for(ctx, ds_list[i].ds_id, sc[i].domain);
-        sc[i].row = NULL;
-        for (j = 0; j < ctx->cap->count; j++) {
-            if (ctx->cap->rows[j].ds_id == ds_list[i].ds_id) {
-                sc[i].row = &ctx->cap->rows[j];
-                break;
-            }
-        }
-    }
-    for (i = 0; i < n; i++) {
-        uint32_t cnt = 0;
-        for (j = 0; j < n; j++) {
-            if (strcmp(sc[i].domain, sc[j].domain) == 0) {
-                cnt++;
-            }
-        }
-        sc[i].n_aliases = cnt;
+    for (j = 0; j < cap->count; j++) {
+        domain_for(ctx, cap->rows[j].ds_id, rs[j].domain);
+        rs[j].declared = declared_domain(ctx, cap->rows[j].ds_id);
+        rs[j].observed = (cap->rows[j].obs.observed_mono_ms != 0 &&
+                          cap->rows[j].obs.total_bytes != 0);
     }
 
-    /* 2. Alias grades over every pair with an observed fsid. */
     for (i = 0; i < n; i++) {
-        const struct ds_capacity_view_row *ri = sc[i].row;
-        if (ri == NULL || ri->obs.observed_mono_ms == 0) {
-            continue;
-        }
-        for (j = i + 1; j < n; j++) {
-            const struct ds_capacity_view_row *rj = sc[j].row;
-            bool same_host;
-            bool same_domain;
-
-            if (rj == NULL || rj->obs.observed_mono_ms == 0) {
-                continue;
-            }
-            same_host = (strncmp(ri->host, rj->host, MDS_DS_HOST_MAX) == 0);
-            same_domain = declared_domain(ctx, ds_list[i].ds_id) &&
-                          declared_domain(ctx, ds_list[j].ds_id) &&
-                          strcmp(sc[i].domain, sc[j].domain) == 0;
-            if (same_domain) {
-                /* (a) one declared domain, one host, two filesystems */
-                if (same_host && ri->obs.fsid != rj->obs.fsid) {
-                    sc[i].alias_contradiction = true;
-                    sc[j].alias_contradiction = true;
-                }
-            } else if (ri->obs.fsid == rj->obs.fsid) {
-                if (same_host) {
-                    /* (b) proven alias without a shared declaration */
-                    sc[i].alias_unmapped = true;
-                    sc[j].alias_unmapped = true;
-                } else {
-                    /* (c) cannot be proven from NFS: diagnostics only */
-                    placement_gate_note_alias_suspected(ds_list[i].ds_id,
-                                                        ds_list[j].ds_id);
-                }
-            }
-        }
-    }
-
-    /* 3. Per DS: online -> alias marks -> domain observation -> gate. */
-    for (i = 0; i < n; i++) {
+        const struct ds_capacity_view_row *ri = NULL;
+        uint32_t r_i = 0;
+        bool contradiction = false;
+        bool unmapped = false;
         const struct ds_capacity_view_row *canon = NULL;
         uint64_t min_avail = UINT64_MAX;
         bool any_observed = false;
+        uint32_t n_aliases = 0;
         uint64_t avail;
         uint64_t total;
         uint32_t domain_weight;
@@ -216,23 +199,65 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
             count_reason(why, PR_DS_OFFLINE);
             continue;
         }
-        if (sc[i].alias_contradiction) {
+        for (j = 0; j < cap->count; j++) {
+            if (cap->rows[j].ds_id == ds_list[i].ds_id) {
+                ri = &cap->rows[j];
+                r_i = j;
+                break;
+            }
+        }
+        if (ri == NULL) {
+            count_reason(why, PR_CAPACITY_UNKNOWN);   /* not in the registry view */
+            continue;
+        }
+
+        /* Alias grades: this DS against every other registered DS. */
+        if (rs[r_i].observed) {
+            for (j = 0; j < cap->count; j++) {
+                const struct ds_capacity_view_row *rj = &cap->rows[j];
+                bool same_host;
+                bool same_domain;
+
+                if (j == r_i || !rs[j].observed) {
+                    continue;
+                }
+                same_host = (strncmp(ri->host, rj->host, MDS_DS_HOST_MAX) == 0);
+                same_domain = rs[r_i].declared && rs[j].declared &&
+                              strcmp(rs[r_i].domain, rs[j].domain) == 0;
+                if (same_domain) {
+                    /* (a) one declared domain, one host, two filesystems */
+                    if (same_host && ri->obs.fsid != rj->obs.fsid) {
+                        contradiction = true;
+                    }
+                } else if (ri->obs.fsid == rj->obs.fsid) {
+                    if (same_host) {
+                        unmapped = true;          /* (b) proven, undeclared */
+                    } else if (ri->ds_id < rj->ds_id) {
+                        placement_gate_note_alias_suspected(ri->ds_id, rj->ds_id);   /* (c) */
+                    }
+                }
+            }
+        }
+        if (contradiction) {
             count_reason(why, PR_DOMAIN_MAP_CONTRADICTION);
             continue;
         }
-        if (sc[i].alias_unmapped) {
+        if (unmapped) {
             count_reason(why, PR_SHARED_FS_ALIAS_UNMAPPED);
             continue;
         }
-        /* Canonical observation of the domain: the fresh row of the
-         * lowest ds_id; a fresh sibling that disagrees by more than 1 %
-         * of total pulls avail down to the smaller value. */
-        for (j = 0; j < n; j++) {
-            const struct ds_capacity_view_row *rj = sc[j].row;
-            if (strcmp(sc[i].domain, sc[j].domain) != 0) {
+
+        /* Domain aggregation over ALL registered members (any state): N,
+         * the canonical (lowest id, fresh) observation, the conservative
+         * minimum when fresh siblings disagree by more than 1 %. */
+        for (j = 0; j < cap->count; j++) {
+            const struct ds_capacity_view_row *rj = &cap->rows[j];
+
+            if (strcmp(rs[r_i].domain, rs[j].domain) != 0) {
                 continue;
             }
-            if (rj != NULL && rj->obs.observed_mono_ms != 0) {
+            n_aliases++;
+            if (rs[j].observed) {
                 any_observed = true;
             }
             if (!row_fresh(ctx, rj)) {
@@ -258,19 +283,12 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
         if (avail > total) {
             avail = total;
         }
-        if (total == 0) {
-            count_reason(why, PR_CAPACITY_UNKNOWN);
-            continue;
-        }
         if (avail <= ctx->min_free_bytes) {
             count_reason(why, PR_CAPACITY_FULL);
             continue;
         }
-        domain_weight = (uint32_t)((avail * 100ULL) / total);
-        if (domain_weight == 0) {
-            domain_weight = 1;
-        }
-        weight = placement_weight(domain_weight, 1000000u, sc[i].n_aliases, &ovf);
+        domain_weight = domain_weight_of(avail, total);
+        weight = placement_weight(domain_weight, 1000000u, n_aliases, &ovf);
         if (weight == 0 || ovf) {
             count_reason(why, PR_WEIGHT_OVERFLOW);
             continue;
@@ -278,11 +296,11 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
         out[n_out].idx = i;
         out[n_out].ds_id = ds_list[i].ds_id;
         out[n_out].weight = weight;
-        memcpy(out[n_out].domain, sc[i].domain, PM_DOMAIN_ID_MAX);
+        memcpy(out[n_out].domain, rs[r_i].domain, PM_DOMAIN_ID_MAX);
         n_out++;
     }
 
-    free(sc);
+    free(rs);
     return n_out;
 }
 
@@ -357,7 +375,12 @@ enum mds_status placement_admit(const struct placement_ctx *ctx,
     if (cands == NULL) {
         return MDS_ERR_NOMEM;
     }
-    n_c = placement_candidates(ctx, ds_list, n, cands, NULL);
+    {
+        struct placement_reject_counts why;
+
+        n_c = placement_candidates(ctx, ds_list, n, cands, &why);
+        placement_gate_note_rejections(&why);
+    }
     atomic_store_explicit(&g_branch_metrics.placement_eligible_ds, n_c,
                           memory_order_relaxed);
     if (n_c == 0) {
@@ -464,76 +487,78 @@ bool placement_ds_admitted(const struct placement_ctx *ctx,
                            const struct mds_ds_info *ds_list, uint32_t n,
                            uint32_t ds_id, enum placement_reason *reason)
 {
-    struct placement_candidate *cands;
+    struct placement_candidate one;
     struct placement_reject_counts why;
-    uint32_t n_c;
-    uint32_t i;
-    bool found = false;
+    uint32_t k;
 
     set_reason(reason, PR_DS_OFFLINE);
     if (ctx == NULL || ds_list == NULL || n == 0) {
         return false;
     }
-    for (i = 0; i < n; i++) {
-        if (ds_list[i].ds_id == ds_id) {
-            found = true;
+    for (k = 0; k < n; k++) {
+        if (ds_list[k].ds_id == ds_id) {
             break;
         }
     }
-    if (!found) {
+    if (k == n) {
         return false;
     }
     if (ctx->mode == PM_RR || ctx->mode == PM_LEGACY) {
-        if (ds_list[i].state == DS_ONLINE) {
+        if (ds_list[k].state == DS_ONLINE) {
             set_reason(reason, PR_NONE);
             return true;
         }
         return false;
     }
-    cands = calloc(n, sizeof(*cands));
-    if (cands == NULL) {
-        return false;
+    /* The registry-level facts come from the view, so a one-element list
+     * yields exactly the verdict the DS would get inside the full list. */
+    if (placement_candidates(ctx, &ds_list[k], 1, &one, &why) == 1) {
+        set_reason(reason, PR_NONE);
+        return true;
     }
-    n_c = placement_candidates(ctx, ds_list, n, cands, &why);
-    for (i = 0; i < n_c; i++) {
-        if (cands[i].ds_id == ds_id) {
-            free(cands);
-            set_reason(reason, PR_NONE);
-            return true;
-        }
-    }
-    free(cands);
-    /* Not a candidate: report the DS's own verdict by re-running the
-     * gate on a one-element list (cheap, and exact for the reason). */
-    {
-        struct placement_candidate one;
-        struct placement_reject_counts w1;
-        uint32_t k;
-
-        for (k = 0; k < n; k++) {
-            if (ds_list[k].ds_id == ds_id) {
-                break;
-            }
-        }
-        (void)placement_candidates(ctx, &ds_list[k], 1, &one, &w1);
-        for (k = 1; k < PR_COUNT; k++) {
-            if (w1.by_reason[k] != 0) {
-                set_reason(reason, (enum placement_reason)k);
-                return false;
-            }
-        }
-        /* Excluded only in the context of the full list (an alias
-         * grade): report the list-level reason. */
-        for (k = 1; k < PR_COUNT; k++) {
-            if (why.by_reason[k] != 0 &&
-                (k == PR_DOMAIN_MAP_CONTRADICTION ||
-                 k == PR_SHARED_FS_ALIAS_UNMAPPED)) {
-                set_reason(reason, (enum placement_reason)k);
-                return false;
-            }
+    for (k = 1; k < PR_COUNT; k++) {
+        if (why.by_reason[k] != 0) {
+            set_reason(reason, (enum placement_reason)k);
+            return false;
         }
     }
+    set_reason(reason, PR_CAPACITY_UNKNOWN);
     return false;
+}
+
+/*
+ * Per-DS rejection counts into the metrics, plus a rate-limited ERROR for
+ * the two alias grades that need an operator (review finding 3).
+ */
+void placement_gate_note_rejections(const struct placement_reject_counts *why)
+{
+    static _Atomic uint64_t last_alias_err_ms;
+    uint32_t r;
+
+    if (why == NULL) {
+        return;
+    }
+    for (r = 1; r < PR_COUNT; r++) {
+        if (why->by_reason[r] != 0) {
+            atomic_fetch_add_explicit(&g_branch_metrics.placement_rejections_total[r],
+                                      why->by_reason[r], memory_order_relaxed);
+        }
+    }
+    if (why->by_reason[PR_DOMAIN_MAP_CONTRADICTION] != 0 ||
+        why->by_reason[PR_SHARED_FS_ALIAS_UNMAPPED] != 0) {
+        uint64_t now = ds_cache_mono_ms();
+        uint64_t last = atomic_load_explicit(&last_alias_err_ms, memory_order_relaxed);
+
+        if (now - last >= 60000ULL &&
+            atomic_compare_exchange_strong(&last_alias_err_ms, &last, now)) {
+            MDS_LOG_ERROR(LOG_COMP_FSAL,
+                "placement: %u DS excluded as DOMAIN_MAP_CONTRADICTION and %u as "
+                "SHARED_FS_ALIAS_UNMAPPED -- declare ds_capacity_domain.<id> for "
+                "every export of a shared filesystem (config show placement_ds.<id>)",
+                (unsigned)why->by_reason[PR_DOMAIN_MAP_CONTRADICTION],
+                (unsigned)why->by_reason[PR_SHARED_FS_ALIAS_UNMAPPED]);
+        }
+    }
 }
 
 /* Alias diagnostics: a counter plus a rate-limited WARN (one per pair per 60 s). */
@@ -543,10 +568,10 @@ void placement_gate_note_alias_suspected(uint32_t a, uint32_t b)
     uint64_t now = ds_cache_mono_ms();
     uint64_t last = atomic_load_explicit(&last_warn_ms, memory_order_relaxed);
 
-    atomic_fetch_add_explicit(&g_branch_metrics.placement_alias_suspected_total,
-                              1, memory_order_relaxed);
     if (now - last >= 60000ULL &&
         atomic_compare_exchange_strong(&last_warn_ms, &last, now)) {
+        atomic_fetch_add_explicit(&g_branch_metrics.placement_alias_suspected_total,
+                                  1, memory_order_relaxed);
         MDS_LOG_WARN(LOG_COMP_FSAL,
             "placement: ds %u and ds %u report the same filesystem id "
             "behind different host names; declare ds_capacity_domain for "
@@ -827,6 +852,15 @@ bool placement_token_valid(const struct placement_token *tok, uint32_t ds_id,
     if (now_mono_ms < tok->minted_mono_ms) {
         return false;
     }
+    if (g.initialised) {
+        uint32_t cur = atomic_load_explicit(&g.snapshot_gen, memory_order_acquire);
+
+        /* One publish may race the create; two mean the token predates the
+         * previous snapshot -- the caller re-admits. */
+        if (cur - tok->snapshot_gen > 1) {
+            return false;
+        }
+    }
     return (now_mono_ms - tok->minted_mono_ms) <= PLACEMENT_TOKEN_MAX_AGE_MS;
 }
 
@@ -867,6 +901,13 @@ enum mds_status placement_gate_admit_create(uint32_t ds_id, enum placement_purpo
         }
         mint_token(tok, ds_id, p, now);
         return MDS_OK;
+    }
+    if (g.cache != NULL && !ds_cache_is_online(g.cache, ds_id)) {
+        /* Admin state is read live: a DS set OFFLINE between two
+         * publishes must not receive a new object (review finding 2). */
+        note_refusal(PR_DS_OFFLINE);
+        set_reason(reason, PR_DS_OFFLINE);
+        return MDS_ERR_NOSPC;
     }
     placement_gate_ctx(&ctx, now);
     ref = (struct cap_view_ref *)ctx.view_ref;
