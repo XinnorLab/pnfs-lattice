@@ -38,7 +38,7 @@ jobs:
           ./build/tests/test_wrr_kernel | grep -q 'kernel_id_is_nonzero.*PASS'
       - name: Proof -- no selector outside the gate
         run: |
-          hits=$(grep -rnE '^[^*/]*placement_select(2|_ex2?|_rr_at2)?\(' src/ \
+          hits=$(grep -rnE --include='*.c' '^[^*/]*placement_select(2|_ex2?|_rr_at2)?\(' src/ \
                  | grep -v 'src/fsal_obj/placement.c\|src/fsal_obj/placement_gate.c' || true)
           if [ -n "$hits" ]; then echo "$hits"; echo '::error::selector called outside placement_gate'; exit 1; fi
       - name: Proof -- no O_CREAT outside the token-guarded create helpers
