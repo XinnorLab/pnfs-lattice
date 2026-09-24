@@ -542,6 +542,12 @@ static bool parse_record(const struct jdoc *d, int obj, struct rec *r,
         set_detail(rep, "ds %u: quality invalid", r->ds_id);
         return false;
     }
+    /* the schema allows a null incarnation only on an UNKNOWN record:
+     * the connector knows its binding but could not observe the share */
+    if (r->valid && r->target_incarnation[0] == '\0') {
+        set_detail(rep, "ds %u: VALID record without target_incarnation", r->ds_id);
+        return false;
+    }
     if (!tok_u64(d, tok_get(d, obj, "remaining_ttl_ms"), &r->remaining_ttl_ms) ||
         r->remaining_ttl_ms > DC_TTL_MAX_MS) {
         set_detail(rep, "ds %u: remaining_ttl_ms invalid", r->ds_id);
@@ -611,11 +617,15 @@ static bool parse_record(const struct jdoc *d, int obj, struct rec *r,
 static bool pin_matches(const struct ds_connector_pin *p, const struct rec *r,
                         const char *instance)
 {
+    /* an unobserved incarnation (null on an UNKNOWN record) is not compared:
+     * the source was unreadable, the binding itself did not change */
+    bool unobserved = (r->target_incarnation[0] == '\0');
+
     return strcmp(p->instance, instance) == 0 &&
            p->binding_generation == (uint32_t)r->binding_generation &&
            strcmp(p->datastore_id, r->datastore_id) == 0 &&
            strcmp(p->target_id, r->target_id) == 0 &&
-           strcmp(p->target_incarnation, r->target_incarnation) == 0 &&
+           (unobserved || strcmp(p->target_incarnation, r->target_incarnation) == 0) &&
            strcmp(p->access_scope, r->access_scope) == 0;
 }
 
@@ -1004,7 +1014,13 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
 
                 if (r.binding_generation > p->binding_generation) {
                     rebound = true;
-                    pin_set(&new_pins[r.ds_id], &r, upd[i].id);
+                    if (r.target_incarnation[0] == '\0') {
+                        /* rebind announced by an unobserved record: drop
+                         * the old pin, the next VALID record pins */
+                        memset(&new_pins[r.ds_id], 0, sizeof(new_pins[r.ds_id]));
+                    } else {
+                        pin_set(&new_pins[r.ds_id], &r, upd[i].id);
+                    }
                 } else if (!pin_matches(p, &r, upd[i].id)) {
                     rep->rejected_binding++;
                     set_detail(rep, "ds %u: BINDING_MISMATCH (gen %llu vs pinned %u, %s/%s/%s)",
@@ -1013,10 +1029,10 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
                                r.target_id, r.target_incarnation);
                     continue;
                 }
-            } else {
+            } else if (r.target_incarnation[0] != '\0') {
                 pin_set(&new_pins[r.ds_id], &r, upd[i].id);
             }
-            /* accepted */
+            /* accepted (an unobserved record with no pin yet pins nothing) */
             rep->accepted++;
             if (row == NULL) {
                 continue;

@@ -151,8 +151,15 @@ endpoint path names the same share).  The first accepted tuple
 target_incarnation, access scope)` is pinned per DS; a later record must
 repeat it or carry a higher `binding_generation` (rebind: the DS is
 UNKNOWN for that batch); anything else is `BINDING_MISMATCH` and that DS
-has no record.  The profile digest is deliberately **not** part of the
-pin: it is checked on every batch (pin key and batch-wide consistency),
+has no record.  A `quality = UNKNOWN` record may carry
+`target_incarnation: null` — the connector could not read its source and
+knows the configured binding but not the share's incarnation; it is
+compared on the rest of the tuple, accepted as UNKNOWN
+(`ASSESSMENT_UNKNOWN` with the connector's reason codes, e.g.
+`SOURCE_UNAVAILABLE`), and it neither creates nor changes a pin (a higher
+generation clears the pin; the next VALID record pins).  A VALID record
+with a null incarnation is a shape error.  The profile digest is
+deliberately **not** part of the pin: it is checked on every batch (pin key and batch-wide consistency),
 and a connector profile reload must not strand every DS in
 `BINDING_MISMATCH` until a process restart.  Records for unknown DS ids
 are ignored; a DS id that appears more than once in a batch has no

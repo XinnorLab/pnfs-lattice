@@ -230,7 +230,7 @@ static void test_profile_digest_pin_and_consistency(void)
 {
     struct placement_assessment_view v; struct ds_connector_report rep;
     reg_init(); st_init("sha256:p", NULL);
-    const char *other = rec(1, 1, "s", "null", "192.168.64.71", "/mnt/data", 2049, "NEW_ALLOCATION",
+    const char *other = rec(1, 1, "s", "\"i\"", "192.168.64.71", "/mnt/data", 2049, "NEW_ALLOCATION",
                             "cluster-default", "VALID", 15000, "sha256:q", "true", 1000000, "null");
     char recs[8192]; snprintf(recs, sizeof(recs), "%s,%s", rec_ok(0), other);
     ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", recs), &v, &rep), DC_OK);
@@ -317,7 +317,7 @@ static void test_unknown_duplicate_failed_and_shape(void)
 {
     struct placement_assessment_view v; struct ds_connector_report rep;
     reg_init(); st_init(NULL, NULL);
-    const char *unknown = rec(7, 1, "s", "null", "h", "/x", 2049, "NEW_ALLOCATION", "cluster-default",
+    const char *unknown = rec(7, 1, "s", "\"i\"", "h", "/x", 2049, "NEW_ALLOCATION", "cluster-default",
                               "VALID", 15000, "sha256:p", "true", 1000000, "null");
     ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", unknown), &v, &rep), DC_OK);
     ASSERT_EQ(rep.unknown_ds, 1u);
@@ -870,25 +870,80 @@ static void test_unicode_escapes_in_strings(void)
      * NUL as a record shape error */
     const char *bad_json[] = { "\\u12", "\\x41", "tail\\" };
     for (unsigned i = 0; i < sizeof(bad_json) / sizeof(bad_json[0]); i++) {
-        const char *r = rec(1, 1, bad_json[i], "null", "192.168.64.71", "/mnt/data", 2049,
+        const char *r = rec(1, 1, bad_json[i], "\"i\"", "192.168.64.71", "/mnt/data", 2049,
                             "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
         ASSERT_EQ(apply(batch("rt-1", "e1", 3 + i, "2026-09-24T10:00:03Z", "c", "COMPLETE", r), &v, &rep), DC_JSON);
         ASSERT_EQ(ST.pins[1].pinned, false);
     }
     const char *bad_shape[] = { "\\ud83d", "\\ude00", "\\u0000", "\\ud83d\\u0041" };
     for (unsigned i = 0; i < sizeof(bad_shape) / sizeof(bad_shape[0]); i++) {
-        const char *r = rec(1, 1, bad_shape[i], "null", "192.168.64.71", "/mnt/data", 2049,
+        const char *r = rec(1, 1, bad_shape[i], "\"i\"", "192.168.64.71", "/mnt/data", 2049,
                             "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
         ASSERT_EQ(apply(batch("rt-1", "e1", 6 + i, "2026-09-24T10:00:03Z", "c", "COMPLETE", r), &v, &rep), DC_OK);
         ASSERT_EQ(rep.rejected_shape, 1u);
         ASSERT_EQ(ST.pins[1].pinned, false);
     }
     /* the ordinary escapes decode too */
-    const char *esc = rec(1, 1, "a\\/b\\\"c\\\\d", "null", "192.168.64.71", "/mnt/data", 2049,
+    const char *esc = rec(1, 1, "a\\/b\\\"c\\\\d", "\"i\"", "192.168.64.71", "/mnt/data", 2049,
                           "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
     ASSERT_EQ(apply(batch("rt-1", "e1", 20, "2026-09-24T10:00:20Z", "c", "COMPLETE", esc), &v, &rep), DC_OK);
     ASSERT_EQ(rep.accepted, 1u);
     ASSERT_EQ(strcmp(ST.pins[1].target_id, "a/b\"c\\d"), 0);
+}
+
+static void test_unobserved_incarnation_on_unknown_records(void)
+{
+    struct placement_assessment_view v; struct ds_connector_report rep;
+    reg_init(); st_init(NULL, NULL);
+    /* the source is down before the first VALID record: UNKNOWN + null
+     * incarnation is accepted, the row is present and invalid, nothing pins */
+    const char *down = rec(0, 2, "mnt/data", "null", "192.168.64.51", "/mnt/data", 2049,
+                           "NEW_ALLOCATION", "cluster-default", "UNKNOWN", 15000, "sha256:p", "false", 0, "null");
+    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", down), &v, &rep), DC_OK);
+    ASSERT_EQ(rep.accepted, 1u);
+    ASSERT_EQ(rep.rejected_binding, 0u);
+    ASSERT_EQ(v.rows[0].present, true);
+    ASSERT_EQ(v.rows[0].valid, false);
+    ASSERT_EQ(ST.pins[0].pinned, false);
+    /* the source comes back: the VALID record pins */
+    ASSERT_EQ(apply(batch("rt-1", "e1", 2, "2026-09-24T10:00:02Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
+    ASSERT_EQ(ST.pins[0].pinned, true);
+    ASSERT_EQ(strcmp(ST.pins[0].target_incarnation, "mnt/data:0:u"), 0);
+    /* the source goes down again (the stand: xinas-agent stopped): the
+     * unobserved record matches the pin on the rest of the tuple -- UNKNOWN,
+     * not BINDING_MISMATCH, and the pin keeps its incarnation */
+    ASSERT_EQ(apply(batch("rt-1", "e1", 3, "2026-09-24T10:00:03Z", "c", "COMPLETE", down), &v, &rep), DC_OK);
+    ASSERT_EQ(rep.accepted, 1u);
+    ASSERT_EQ(rep.rejected_binding, 0u);
+    ASSERT_EQ(v.rows[0].present, true);
+    ASSERT_EQ(v.rows[0].valid, false);
+    ASSERT_EQ(strcmp(ST.pins[0].target_incarnation, "mnt/data:0:u"), 0);
+    /* ... but the rest of the tuple is still checked */
+    const char *other = rec(0, 2, "other-share", "null", "192.168.64.51", "/mnt/data", 2049,
+                            "NEW_ALLOCATION", "cluster-default", "UNKNOWN", 15000, "sha256:p", "false", 0, "null");
+    ASSERT_EQ(apply(batch("rt-1", "e1", 4, "2026-09-24T10:00:04Z", "c", "COMPLETE", other), &v, &rep), DC_OK);
+    ASSERT_EQ(rep.rejected_binding, 1u);
+    ASSERT_TRUE(strstr(rep.detail, "BINDING_MISMATCH") != NULL);
+    /* a VALID record must carry the incarnation */
+    const char *valid_null = rec(0, 2, "mnt/data", "null", "192.168.64.51", "/mnt/data", 2049,
+                                 "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
+    ASSERT_EQ(apply(batch("rt-1", "e1", 5, "2026-09-24T10:00:05Z", "c", "COMPLETE", valid_null), &v, &rep), DC_OK);
+    ASSERT_EQ(rep.rejected_shape, 1u);
+    ASSERT_EQ(v.rows[0].present, false);
+    /* a rebind announced while the source is down clears the pin; the next
+     * VALID record with the new generation pins */
+    const char *rebind_down = rec(0, 3, "mnt/data", "null", "192.168.64.51", "/mnt/data", 2049,
+                                  "NEW_ALLOCATION", "cluster-default", "UNKNOWN", 15000, "sha256:p", "false", 0, "null");
+    ASSERT_EQ(apply(batch("rt-1", "e1", 6, "2026-09-24T10:00:06Z", "c", "COMPLETE", rebind_down), &v, &rep), DC_OK);
+    ASSERT_EQ(rep.rebound, 1u);
+    ASSERT_EQ(ST.pins[0].pinned, false);
+    const char *rebound_valid = rec(0, 3, "mnt/data", "\"mnt/data:0:NEW\"", "192.168.64.51", "/mnt/data", 2049,
+                                    "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
+    ASSERT_EQ(apply(batch("rt-1", "e1", 7, "2026-09-24T10:00:07Z", "c", "COMPLETE", rebound_valid), &v, &rep), DC_OK);
+    ASSERT_EQ(rep.accepted, 1u);
+    ASSERT_EQ(ST.pins[0].binding_generation, 3u);
+    ASSERT_EQ(strcmp(ST.pins[0].target_incarnation, "mnt/data:0:NEW"), 0);
+    ASSERT_EQ(v.rows[0].valid, true);
 }
 
 static void test_contract_version_shapes(void)
@@ -968,6 +1023,7 @@ int main(void)
     RUN_TEST(test_deep_nesting_is_bounded_and_skipped_without_recursion);
     RUN_TEST(test_unicode_escapes_in_strings);
     RUN_TEST(test_contract_version_shapes);
+    RUN_TEST(test_unobserved_incarnation_on_unknown_records);
     RUN_TEST(test_http_get_streamed_oversize_and_short_body);
     printf("%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
