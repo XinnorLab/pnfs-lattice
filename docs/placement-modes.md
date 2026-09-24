@@ -201,7 +201,9 @@ the connector's side.
 - `mds-admin config show --mds-host <cluster_bind_addr> --mds-port <grpc_port>`
   (the transport listens on the bind address, not loopback):
   `placement_mode`, `placement_mode_effective`,
-  `placement_config_generation`, `placement_kernel_id`, the thresholds,
+  `placement_config_generation`, `placement_kernel_id`,
+  `placement_build = wrr=<0|1> connector=<0|1> prealloc=<0|1>` (the build
+  facts `verify` compares across MDS), the thresholds,
   `ds_capacity_domain.<id>`, in `smart` `placement_readiness`,
   `placement_connector_config_digest`, `placement_connector_profile_digest`,
   `placement_connector_last_detail`, and one `placement_ds.<id> = domain=…
@@ -211,6 +213,10 @@ the connector's side.
 - Metrics: `pnfs_mds_placement_mode{mode}`,
   `pnfs_mds_placement_eligible_ds`,
   `pnfs_mds_placement_rejections_total{reason}`,
+  `pnfs_mds_placement_admit_seconds` (histogram, 100 µs … +Inf with
+  `_sum`/`_count`: time in the gate per selection or create admission,
+  observed in every mode — legacy included — so a legacy-vs-smart
+  comparison measures the gate alone),
   `pnfs_mds_placement_alias_suspected_total`, plus the upstream
   `pnfs_mds_placement_degraded_total` when a layout shrank.
 - Connector: `pnfs_mds_connector_batches_accepted_total`,

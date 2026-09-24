@@ -22,6 +22,8 @@
 #include "test_helpers.h"
 #include "cluster_transport.h"
 #include "placement_gate.h"
+#include "placement_modes.h"
+#include "wrr.h"
 #include "ds_cache.h"
 #include "mds_catalogue.h"
 #include "rename_2pc.h"
@@ -1906,6 +1908,13 @@ static void test_config_show_placement_rows(void)
     ASSERT_TRUE(strstr(text, "placement_mode_effective = fill\n") != NULL);
     ASSERT_TRUE(strstr(text, "placement_config_generation = 0000000000000000000000000000000000000000000000000000000000000007\n") != NULL);
     ASSERT_TRUE(strstr(text, "placement_kernel_id = 58494e01\n") != NULL);
+    {
+        char build_row[96];
+        (void)snprintf(build_row, sizeof(build_row),
+                       "placement_build = wrr=%d connector=%d prealloc=%d\n",
+                       mds_wrr_kernel_id() != 0 ? 1 : 0, PM_BUILD_CONNECTOR, PM_BUILD_PREALLOC);
+        ASSERT_TRUE(strstr(text, build_row) != NULL);
+    }
     ASSERT_TRUE(strstr(text, "ds_capacity_domain.1 = xi/fs-1\n") != NULL);
     ASSERT_TRUE(strstr(text, "placement_ds.1 = domain=xi/fs-1 state=ONLINE capacity_age_ms=") != NULL);
     ASSERT_TRUE(strstr(text, "avail=500 total=1000 weight=") != NULL);

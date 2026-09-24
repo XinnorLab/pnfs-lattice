@@ -69,6 +69,20 @@ enum placement_shrink {
 #define PM_DEFAULT_CONN_ACCESS_SCOPE "cluster-default"
 #define PM_CONN_SCOPE                "NEW_ALLOCATION"
 #define PM_DIGEST_MAX                128
+
+/* Build facts behind the `placement_build` config-show row (design
+ * section 9): the connector client and the enterprise prealloc module are
+ * compile-time options; the kernel identity is reported at run time. */
+#ifdef ENABLE_DS_CONNECTOR
+#define PM_BUILD_CONNECTOR 1
+#else
+#define PM_BUILD_CONNECTOR 0
+#endif
+#ifdef ENABLE_DS_PREALLOC
+#define PM_BUILD_PREALLOC 1
+#else
+#define PM_BUILD_PREALLOC 0
+#endif
 #define PM_SCOPE_MAX                 64
 
 /* Bounded reason vocabulary of the gate (metrics labels, logs, config show). */

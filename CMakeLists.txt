@@ -174,6 +174,10 @@ if(ENABLE_DS_CONNECTOR)
 else()
     message(STATUS "ds_connector: disabled (placement_mode = smart refused at startup)")
 endif()
+if(ENABLE_DS_PREALLOC)
+    # visible to every TU: `placement_build = … prealloc=1` in config show
+    add_compile_definitions(ENABLE_DS_PREALLOC=1)
+endif()
 
 # Optional codegen opt-ins for measurement runs (both intentionally
 # OFF: neither belongs in a portable default build).

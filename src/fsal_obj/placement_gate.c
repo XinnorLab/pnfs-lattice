@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdatomic.h>
+#include <time.h>
 
 #include "placement_gate.h"
 #include "placement.h"
@@ -1036,13 +1037,21 @@ static void note_refusal(enum placement_reason why)
     }
 }
 
-enum mds_status placement_select_gated(bool legacy_policy_enabled,
-                                       enum mds_placement_policy legacy_policy,
-                                       const struct mds_ds_info *ds_list, uint32_t n,
-                                       uint32_t *stripe_count, uint32_t mirror_count,
-                                       uint32_t stripe_unit, uint64_t rr_key,
-                                       struct mds_ds_map_entry *entries,
-                                       enum placement_reason *reason)
+static uint64_t gate_mono_ns(void)
+{
+    struct timespec ts;
+
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static enum mds_status select_gated_impl(bool legacy_policy_enabled,
+                                         enum mds_placement_policy legacy_policy,
+                                         const struct mds_ds_info *ds_list, uint32_t n,
+                                         uint32_t *stripe_count, uint32_t mirror_count,
+                                         uint32_t stripe_unit, uint64_t rr_key,
+                                         struct mds_ds_map_entry *entries,
+                                         enum placement_reason *reason)
 {
     struct placement_ctx ctx;
     enum mds_status st;
@@ -1074,6 +1083,25 @@ enum mds_status placement_select_gated(bool legacy_policy_enabled,
     if (reason != NULL) {
         *reason = why;
     }
+    return st;
+}
+
+/* Every mode is timed, legacy included, so a legacy-vs-smart comparison of
+ * `pnfs_mds_placement_admit_seconds` measures the gate and nothing else. */
+enum mds_status placement_select_gated(bool legacy_policy_enabled,
+                                       enum mds_placement_policy legacy_policy,
+                                       const struct mds_ds_info *ds_list, uint32_t n,
+                                       uint32_t *stripe_count, uint32_t mirror_count,
+                                       uint32_t stripe_unit, uint64_t rr_key,
+                                       struct mds_ds_map_entry *entries,
+                                       enum placement_reason *reason)
+{
+    uint64_t t0 = gate_mono_ns();
+    enum mds_status st = select_gated_impl(legacy_policy_enabled, legacy_policy, ds_list, n,
+                                           stripe_count, mirror_count, stripe_unit, rr_key,
+                                           entries, reason);
+
+    mds_histogram_observe(&g_branch_metrics.placement_admit_hist, gate_mono_ns() - t0);
     return st;
 }
 
@@ -1114,9 +1142,9 @@ static void mint_token(struct placement_token *tok, uint32_t ds_id,
     tok->snapshot_gen = atomic_load_explicit(&g.snapshot_gen, memory_order_acquire);
 }
 
-enum mds_status placement_gate_admit_create(uint32_t ds_id, enum placement_purpose p,
-                                            struct placement_token *tok,
-                                            enum placement_reason *reason)
+static enum mds_status admit_create_impl(uint32_t ds_id, enum placement_purpose p,
+                                         struct placement_token *tok,
+                                         enum placement_reason *reason)
 {
     struct placement_ctx ctx;
     struct cap_view_ref *ref;
@@ -1167,6 +1195,17 @@ enum mds_status placement_gate_admit_create(uint32_t ds_id, enum placement_purpo
     }
     mint_token(tok, ds_id, p, now);
     return MDS_OK;
+}
+
+enum mds_status placement_gate_admit_create(uint32_t ds_id, enum placement_purpose p,
+                                            struct placement_token *tok,
+                                            enum placement_reason *reason)
+{
+    uint64_t t0 = gate_mono_ns();
+    enum mds_status st = admit_create_impl(ds_id, p, tok, reason);
+
+    mds_histogram_observe(&g_branch_metrics.placement_admit_hist, gate_mono_ns() - t0);
+    return st;
 }
 
 /* -----------------------------------------------------------------------

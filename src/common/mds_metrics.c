@@ -618,6 +618,21 @@ int mds_metrics_prometheus_v2(const struct mds_metrics_snapshot *snap,
             }
             base += extra;
         }
+        /* gate latency: one observation per selection or create admission */
+        extra = snprintf(buf + base, cap - (size_t)base,
+            "# HELP pnfs_mds_placement_admit_seconds Time in the placement gate per "
+            "selection or create admission, every mode.\n");
+        if (extra < 0 || ((size_t)base + (size_t)extra) >= cap) {
+            return -1;
+        }
+        base += extra;
+        extra = mds_histogram_render(&branch->placement_admit_hist,
+                                     "pnfs_mds_placement_admit_seconds",
+                                     buf + base, cap - (size_t)base);
+        if (extra < 0) {
+            return -1;
+        }
+        base += extra;
         /* connector client */
         extra = snprintf(buf + base, cap - (size_t)base,
             "# HELP pnfs_mds_connector_batches_accepted_total Connector batches accepted.\n"

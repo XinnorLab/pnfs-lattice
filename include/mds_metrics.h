@@ -15,6 +15,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "mds_histogram.h"
 
 /* Live counters (written by hot paths, read by snapshot). */
 struct mds_metrics {
@@ -179,6 +180,9 @@ struct mds_branch_metrics {
     _Atomic uint64_t connector_last_success_mono_ms;   /**< gauge source; 0 = never */
     _Atomic uint64_t connector_covered_ds;             /**< gauge */
     _Atomic uint64_t connector_reachable;              /**< gauge 0/1 */
+    /** Time in the placement gate per selection / create admission, every
+     *  mode (legacy included) -- `pnfs_mds_placement_admit_seconds`. */
+    struct mds_histogram placement_admit_hist;
 
     /*
      * IO_ADVISE accounting (RFC 7862 S15.5).  io_advise_total

@@ -1004,6 +1004,34 @@ static void test_singleton_smart_init_and_readiness(void)
     mds_catalogue_close(cat);
 }
 
+static void test_admit_histogram_counts_every_selection(void)
+{
+    uint64_t c0 = atomic_load(&g_branch_metrics.placement_admit_hist.count);
+    struct mds_ds_info ds[1]; mk_ds(&ds[0], 0, DS_ONLINE, "ds-host");
+    struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why;
+    /* legacy (gate not initialised) is observed too: the perf row compares
+     * like with like */
+    ASSERT_EQ(placement_gate_mode(), PM_LEGACY);
+    ASSERT_EQ(placement_select_gated(false, PLACEMENT_RR, ds, 1, &sc, 1, 65536, 0, &e, &why), MDS_OK);
+    ASSERT_TRUE(atomic_load(&g_branch_metrics.placement_admit_hist.count) == c0 + 1);
+    struct mds_config cfg = fill_cfg();
+    struct mds_catalogue *cat = NULL;
+    struct ds_cache *cache = cache_with_ds(&cat, 0);
+    ASSERT_TRUE(cache != NULL);
+    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
+    struct ds_capacity_obs half = { 1000, 500, 1, ds_cache_mono_ms(), 0 };
+    ASSERT_EQ(ds_cache_set_capacity_obs(cache, 0, &half), 0);
+    placement_gate_publish_capacity();
+    sc = 1;
+    ASSERT_EQ(placement_select_gated(true, PLACEMENT_WEIGHTED_RR, ds, 1, &sc, 1, 65536, 0, &e, &why), MDS_OK);
+    struct placement_token tok;
+    ASSERT_EQ(placement_gate_admit_create(0, PP_NEW_OBJECT, &tok, &why), MDS_OK);
+    ASSERT_TRUE(atomic_load(&g_branch_metrics.placement_admit_hist.count) == c0 + 3);
+    placement_gate_destroy();
+    ds_cache_destroy(cache);
+    mds_catalogue_close(cat);
+}
+
 static void test_select_gated_legacy_path(void)
 {
     struct mds_ds_info ds[2];
@@ -1117,6 +1145,7 @@ int main(void)
     RUN_TEST(test_singleton_publishes_capacity_from_cache);
     RUN_TEST(test_singleton_smart_init_and_readiness);
     RUN_TEST(test_select_gated_legacy_path);
+    RUN_TEST(test_admit_histogram_counts_every_selection);
     RUN_TEST(test_select_gated_legacy_rr_at2_branch);
     RUN_TEST(test_registry_view_drives_n_and_aliases_with_a_filtered_list);
     RUN_TEST(test_ds_admitted_reason_uses_domain_level_verdict);

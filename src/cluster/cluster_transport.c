@@ -6659,6 +6659,8 @@ static void render_cfg_placement(const struct mds_config *cfg,
                cfg->placement_config_generation[0] != '\0'
                    ? cfg->placement_config_generation : "-");
     RENDER_KEY("placement_kernel_id", "%08x", (unsigned)mds_wrr_kernel_id());
+    RENDER_KEY("placement_build", "wrr=%d connector=%d prealloc=%d",
+               mds_wrr_kernel_id() != 0 ? 1 : 0, PM_BUILD_CONNECTOR, PM_BUILD_PREALLOC);
     if (cfg->placement_mode_set) {
         RENDER_KEY("placement_capacity_max_age_ms", "%u",
                    (unsigned)cfg->placement_capacity_max_age_ms);
