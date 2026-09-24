@@ -93,8 +93,10 @@ the legacy keys behave exactly as documented above.
 - `fill`/`smart` require `ds_capacity_poll_ms > 0` (`RANGE`).
 Connector client keys (`smart` only; the connector is a prerequisite of the
 mode, `ds_connector_enabled` is derived from it and an explicit
-contradiction is `PLACEMENT_MODE_CONFLICT`):
-- `ds_connector_socket` — absolute path of the per-MDS `lattice-ds-connector` Unix socket.  Default: `/run/lattice-ds-connector/connector.sock`.
+contradiction is `PLACEMENT_MODE_CONFLICT` — including
+`ds_connector_enabled = true` in a file with no `placement_mode`, which
+names no mode to serve):
+- `ds_connector_socket` — absolute path of the per-MDS `lattice-ds-connector` Unix socket, shorter than 108 bytes (`sun_path`; `RANGE` otherwise).  Default: `/run/lattice-ds-connector/connector.sock`.
 - `ds_connector_poll_ms` — poll interval (200..10000).  Default: 1000.
 - `ds_connector_request_deadline_ms` — connect + read deadline per poll (50..poll).  Default: 500.
 - `ds_connector_expected_contract_major` — accepted `contract_version` major.  Default: 1.

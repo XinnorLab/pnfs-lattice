@@ -732,6 +732,36 @@ static void test_smart_connector_domain_and_map_mismatch(void)
     ASSERT_TRUE(out[0].weight == placement_weight(80, 1000000, 2, NULL));   /* N still counts the alias */
 }
 
+static void test_smart_alias_with_an_unbound_sibling(void)
+{
+    struct mds_ds_info ds[2];
+    reset_smart();
+    /* ds0 and ds1 export the same filesystem from one host; only ds0 has a
+     * connector record (domain ctrl/fs-1), ds1 is not bound yet */
+    mk_ds(&ds[0], 0, DS_ONLINE, "xi");
+    mk_ds(&ds[1], 1, DS_ONLINE, "xi");
+    add_row(0, "xi", 1000, 800, 7, 1000000);
+    add_row(1, "xi", 1000, 800, 7, 1000000);
+    add_assess(0, true, true, 1000000, 15000, "ctrl/fs-1");
+    struct placement_ctx c = smart_ctx();
+    struct placement_candidate out[2]; struct placement_reject_counts why;
+    /* the declared side stays a candidate; the undeclared alias is excluded */
+    ASSERT_EQ(placement_candidates(&c, ds, 2, out, &why), 1u);
+    ASSERT_EQ(out[0].ds_id, 0u);
+    ASSERT_EQ(why.by_reason[PR_SHARED_FS_ALIAS_UNMAPPED], 1u);
+    ASSERT_TRUE(out[0].weight == placement_weight(80, 1000000, 1, NULL));   /* N = 1: the alias is not a member */
+    /* an operator map for the sibling that agrees makes both members */
+    snprintf(DOM[1], PM_DOMAIN_ID_MAX, "ctrl/fs-1");
+    add_assess(1, true, true, 1000000, 15000, "ctrl/fs-1");
+    ASSERT_EQ(placement_candidates(&c, ds, 2, out, &why), 2u);
+    ASSERT_TRUE(out[0].weight == placement_weight(80, 1000000, 2, NULL));
+    /* two DIFFERENT declared domains on one filesystem contradict the map */
+    A.count = 1;
+    snprintf(DOM[1], PM_DOMAIN_ID_MAX, "ctrl/fs-9");
+    ASSERT_EQ(placement_candidates(&c, ds, 2, out, &why), 0u);
+    ASSERT_EQ(why.by_reason[PR_DOMAIN_MAP_CONTRADICTION], 2u);
+}
+
 static void test_smart_manual_base_weight(void)
 {
     struct mds_ds_info ds[2];
@@ -1097,6 +1127,7 @@ int main(void)
     RUN_TEST(test_smart_degraded_ppm_is_picked_less);
     RUN_TEST(test_smart_connector_domain_and_map_mismatch);
     RUN_TEST(test_smart_manual_base_weight);
+    RUN_TEST(test_smart_alias_with_an_unbound_sibling);
     RUN_TEST(test_select_gated_fill_path_uses_the_gate);
     RUN_TEST(test_rr_is_cyclic_over_the_gated_list);
     RUN_TEST(test_rr_ignores_capacity);

@@ -33,30 +33,65 @@ struct jdoc {
     int n;
 };
 
-/* Index just past the subtree rooted at i. */
+/*
+ * Bracket depth bound, checked in one linear pass before jsmn sees the
+ * text.  jsmn closes a container by walking parent links up from the LAST
+ * token, so a deeply nested value costs O(depth^2): 400 000 levels (800 KiB
+ * of a 4 MiB body) held the poll thread for four minutes.  The contract
+ * nests six levels; 64 leaves room for any sane extension.
+ */
+#define DC_JSON_DEPTH_MAX 64
+
+static bool json_depth_ok(const char *s, size_t len, int max_depth)
+{
+    int depth = 0;
+    bool in_str = false;
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        char c = s[i];
+
+        if (in_str) {
+            if (c == '\\') {
+                i++;              /* skip the escaped char (\" included) */
+            } else if (c == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_str = true;
+        } else if (c == '[' || c == '{') {
+            if (++depth > max_depth) {
+                return false;
+            }
+        } else if (c == ']' || c == '}') {
+            if (depth > 0) {
+                depth--;
+            }
+        }
+    }
+    return true;
+}
+
+/*
+ * Index just past the subtree rooted at i.  Iterative: jsmn emits tokens
+ * in document order, so every descendant of i starts before i ends.  A
+ * recursive walk would let a deeply nested value (millions of levels fit
+ * in 4 MiB) overflow the poll thread's stack (review finding B-2).
+ */
 static int tok_skip(const struct jdoc *d, int i)
 {
-    int j = i + 1;
-    int k;
+    int j;
 
     if (i < 0 || i >= d->n) {
         return d->n;
     }
-    switch (d->t[i].type) {
-    case JSMN_OBJECT:
-        for (k = 0; k < d->t[i].size; k++) {
-            j = j + 1;            /* key -> its value */
-            j = tok_skip(d, j);   /* skip the value subtree */
-        }
-        return j;
-    case JSMN_ARRAY:
-        for (k = 0; k < d->t[i].size; k++) {
-            j = tok_skip(d, j);
-        }
-        return j;
-    default:
-        return i + 1;
+    j = i + 1;
+    while (j < d->n && d->t[j].start < d->t[i].end) {
+        j++;
     }
+    return j;
 }
 
 static bool tok_is(const struct jdoc *d, int i, jsmntype_t type)
@@ -106,21 +141,123 @@ static bool tok_str_eq(const struct jdoc *d, int i, const char *s)
            memcmp(tok_ptr(d, i), s, l) == 0;
 }
 
-/* Copy a plain string (no escapes accepted) into buf; false when absent,
- * not a string, empty, escaped or too long. */
+static int hexval(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Append a code point as UTF-8; false when it does not fit. */
+static bool utf8_put(char *buf, size_t cap, size_t *o, uint32_t cp)
+{
+    unsigned char tmp[4];
+    size_t n;
+
+    if (cp < 0x80) {
+        tmp[0] = (unsigned char)cp; n = 1;
+    } else if (cp < 0x800) {
+        tmp[0] = (unsigned char)(0xC0 | (cp >> 6));
+        tmp[1] = (unsigned char)(0x80 | (cp & 0x3F)); n = 2;
+    } else if (cp < 0x10000) {
+        tmp[0] = (unsigned char)(0xE0 | (cp >> 12));
+        tmp[1] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+        tmp[2] = (unsigned char)(0x80 | (cp & 0x3F)); n = 3;
+    } else {
+        tmp[0] = (unsigned char)(0xF0 | (cp >> 18));
+        tmp[1] = (unsigned char)(0x80 | ((cp >> 12) & 0x3F));
+        tmp[2] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+        tmp[3] = (unsigned char)(0x80 | (cp & 0x3F)); n = 4;
+    }
+    if (*o + n >= cap) {
+        return false;
+    }
+    memcpy(buf + *o, tmp, n);
+    *o += n;
+    return true;
+}
+
+/* Copy a JSON string into buf, decoding the standard escapes (including
+ * \uXXXX with surrogate pairs -- json.dumps emits every non-ASCII char
+ * that way).  False when absent, not a string, empty, malformed or too
+ * long for buf. */
 static bool tok_copy(const struct jdoc *d, int i, char *buf, size_t cap)
 {
+    const char *s;
     size_t l;
+    size_t k = 0;
+    size_t o = 0;
 
-    if (!tok_is(d, i, JSMN_STRING)) {
+    if (!tok_is(d, i, JSMN_STRING) || cap == 0) {
         return false;
     }
+    s = tok_ptr(d, i);
     l = tok_len(d, i);
-    if (l == 0 || l >= cap || memchr(tok_ptr(d, i), '\\', l) != NULL) {
+    if (l == 0) {
         return false;
     }
-    memcpy(buf, tok_ptr(d, i), l);
-    buf[l] = '\0';
+    while (k < l) {
+        char c = s[k];
+
+        if (c != '\\') {
+            if (o + 1 >= cap) {
+                return false;
+            }
+            buf[o++] = c;
+            k++;
+            continue;
+        }
+        if (k + 1 >= l) {
+            return false;
+        }
+        k++;
+        switch (s[k]) {
+        case '"': case '\\': case '/':
+            if (o + 1 >= cap) return false;
+            buf[o++] = s[k]; k++; break;
+        case 'n': if (o + 1 >= cap) return false; buf[o++] = '\n'; k++; break;
+        case 't': if (o + 1 >= cap) return false; buf[o++] = '\t'; k++; break;
+        case 'r': if (o + 1 >= cap) return false; buf[o++] = '\r'; k++; break;
+        case 'b': if (o + 1 >= cap) return false; buf[o++] = '\b'; k++; break;
+        case 'f': if (o + 1 >= cap) return false; buf[o++] = '\f'; k++; break;
+        case 'u': {
+            uint32_t cp = 0;
+            int q;
+
+            if (k + 5 > l) return false;
+            for (q = 1; q <= 4; q++) {
+                int h = hexval(s[k + q]);
+                if (h < 0) return false;
+                cp = (cp << 4) | (uint32_t)h;
+            }
+            k += 5;
+            if (cp >= 0xD800 && cp <= 0xDBFF) {
+                uint32_t lo = 0;
+
+                if (k + 6 > l || s[k] != '\\' || s[k + 1] != 'u') return false;
+                for (q = 2; q <= 5; q++) {
+                    int h = hexval(s[k + q]);
+                    if (h < 0) return false;
+                    lo = (lo << 4) | (uint32_t)h;
+                }
+                if (lo < 0xDC00 || lo > 0xDFFF) return false;
+                cp = 0x10000 + (((cp - 0xD800) << 10) | (lo - 0xDC00));
+                k += 6;
+            } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                return false;
+            }
+            if (cp == 0 || !utf8_put(buf, cap, &o, cp)) return false;
+            break;
+        }
+        default:
+            return false;
+        }
+    }
+    if (o == 0) {
+        return false;
+    }
+    buf[o] = '\0';
     return true;
 }
 
@@ -257,7 +394,11 @@ bool ds_connector_endpoint_matches(const struct ds_connector_registry_ds *ds,
     if (el == 0 || export_path[0] != '/') {
         return false;
     }
-    if (strcmp(ds->export_path, export_path) == 0) {
+    /* "/mnt/data/" names the same share as "/mnt/data" */
+    while (el > 1 && export_path[el - 1] == '/') {
+        el--;
+    }
+    if (strlen(ds->export_path) == el && strncmp(ds->export_path, export_path, el) == 0) {
         return true;
     }
     /* the registered directory lies under the exported share */
@@ -463,6 +604,10 @@ static bool parse_record(const struct jdoc *d, int obj, struct rec *r,
     return true;
 }
 
+/* The pin excludes profile.digest on purpose: the digest is checked on
+ * every batch (pin key + batch-wide consistency), and a connector profile
+ * reload must not strand the DS in BINDING_MISMATCH until a process
+ * restart (review finding B-6). */
 static bool pin_matches(const struct ds_connector_pin *p, const struct rec *r,
                         const char *instance)
 {
@@ -471,7 +616,6 @@ static bool pin_matches(const struct ds_connector_pin *p, const struct rec *r,
            strcmp(p->datastore_id, r->datastore_id) == 0 &&
            strcmp(p->target_id, r->target_id) == 0 &&
            strcmp(p->target_incarnation, r->target_incarnation) == 0 &&
-           strcmp(p->profile_digest, r->profile_digest) == 0 &&
            strcmp(p->access_scope, r->access_scope) == 0;
 }
 
@@ -543,6 +687,11 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
 
     /* --- tokenize ------------------------------------------------------- */
     jsmn_init(&parser);
+    if (!json_depth_ok(text, len, DC_JSON_DEPTH_MAX)) {
+        drop = DC_JSON;
+        set_detail(rep, "nesting deeper than %d", DC_JSON_DEPTH_MAX);
+        goto out_drop;
+    }
     ntok = jsmn_parse(&parser, text, len, NULL, 0);
     if (ntok <= 0 || ntok > 2000000) {
         rep->drop = DC_JSON;
@@ -583,11 +732,13 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
 
         for (k = 0; k < l && p[k] != '.'; k++) {
             if (!isdigit((unsigned char)p[k])) {
+                major = UINT64_MAX;   /* "1x" is not a version */
                 break;
             }
             major = major * 10 + (uint64_t)(p[k] - '0');
         }
-        if (k == 0 || major != st->cfg.contract_major) {
+        if (k == 0 || k >= l || p[k] != '.' || (k > 1 && p[0] == '0') ||
+            major != st->cfg.contract_major) {
             drop = DC_CONTRACT_MAJOR;
             set_detail(rep, "contract_version %.*s, expected major %u",
                        (int)l, p, (unsigned)st->cfg.contract_major);
@@ -684,11 +835,15 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
                 for (k = 0; k < DC_INSTANCES_MAX; k++) {
                     const struct ds_connector_instance_seq *line = &st->inst[k];
 
+                    /* The connector re-serves its current snapshot on
+                     * every GET and bumps `sequence` only on a new
+                     * collection, so an EQUAL sequence is "unchanged";
+                     * only a LOWER one is a replay (review finding B-1). */
                     if (line->used && strcmp(line->id, upd[i].id) == 0 &&
                         strcmp(line->epoch, upd[i].epoch) == 0 &&
-                        seq <= line->sequence) {
+                        seq < line->sequence) {
                         drop = DC_REPLAY;
-                        set_detail(rep, "instance %s: sequence %llu <= %llu",
+                        set_detail(rep, "instance %s: sequence %llu < %llu",
                                    upd[i].id, (unsigned long long)seq,
                                    (unsigned long long)line->sequence);
                         goto out_drop;
@@ -697,12 +852,76 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
             }
             j = tok_skip(&d, io);
         }
+        /* Every instance needs a sequence line; refuse rather than run
+         * without replay protection (review finding B-13). */
+        if (!epoch_reset) {
+            int free_slots = 0;
+            int need = 0;
+            int k;
+
+            for (k = 0; k < DC_INSTANCES_MAX; k++) {
+                if (!st->inst[k].used) {
+                    free_slots++;
+                }
+            }
+            for (i = 0; i < n_inst; i++) {
+                bool known = false;
+
+                for (k = 0; k < DC_INSTANCES_MAX; k++) {
+                    if (st->inst[k].used && strcmp(st->inst[k].id, upd[i].id) == 0) {
+                        known = true;
+                        break;
+                    }
+                }
+                if (!known) {
+                    need++;
+                }
+            }
+            if (need > free_slots) {
+                set_detail(rep, "%d new instance ids, %d sequence lines free "
+                           "(restart the connector to reset the epoch)", need, free_slots);
+                goto out_drop;
+            }
+        }
+    }
+
+    /* --- records: duplicates first, so a duplicate never pins ---------- */
+    seen = calloc(MDS_MAX_DS_NODES, sizeof(*seen));
+    if (seen == NULL) {
+        goto out_drop;
+    }
+    {
+        bool *dup = calloc(MDS_MAX_DS_NODES, sizeof(*dup));
+
+        if (dup == NULL) {
+            goto out_drop;
+        }
+        for (i = 0; i < n_inst; i++) {
+            int arr = upd[i].assessments_tok;
+            int j = arr + 1;
+            int k;
+
+            for (k = 0; k < toks[arr].size; k++) {
+                int obj = j;
+                uint64_t u;
+
+                j = tok_skip(&d, obj);
+                if (tok_is(&d, obj, JSMN_OBJECT) &&
+                    tok_u64(&d, tok_get(&d, obj, "ds_id"), &u) && u < MDS_MAX_DS_NODES) {
+                    if (seen[u]) {
+                        dup[u] = true;
+                    }
+                    seen[u] = true;
+                }
+            }
+        }
+        memcpy(seen, dup, MDS_MAX_DS_NODES * sizeof(*seen));   /* seen[] now = duplicated ids */
+        free(dup);
     }
 
     /* --- records -------------------------------------------------------- */
     new_pins = calloc(MDS_MAX_DS_NODES, sizeof(*new_pins));
-    seen = calloc(MDS_MAX_DS_NODES, sizeof(*seen));
-    if (new_pins == NULL || seen == NULL) {
+    if (new_pins == NULL) {
         goto out_drop;
     }
     if (!epoch_reset) {
@@ -747,16 +966,12 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
                 }
             }
             if (seen[r.ds_id]) {
-                /* duplicate ds inside one batch: neither record is trusted */
-                if (row != NULL) {
-                    memset(row, 0, sizeof(*row));
-                    row->ds_id = r.ds_id;
-                }
+                /* duplicate ds inside one batch: no record is trusted and
+                 * nothing is pinned (review finding B-7) */
                 rep->rejected_shape++;
-                set_detail(rep, "ds %u appears twice in the batch", r.ds_id);
+                set_detail(rep, "ds %u appears more than once in the batch", r.ds_id);
                 continue;
             }
-            seen[r.ds_id] = true;
             /* binding checks */
             if (strcmp(r.access_scope, st->cfg.access_scope) != 0) {
                 rep->rejected_binding++;
@@ -975,11 +1190,11 @@ enum mds_status ds_connector_http_get(const char *socket_path, const char *path,
         }
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) != 0 || err != 0) {
             close(fd);
-            return MDS_ERR_IO;
+            return MDS_ERR_NOTFOUND;   /* refused: nobody listens */
         }
     } else if (rc != 0) {
         close(fd);
-        return MDS_ERR_IO;
+        return MDS_ERR_NOTFOUND;       /* absent socket / refused */
     }
 
     rc = snprintf(req, sizeof(req),
@@ -999,7 +1214,7 @@ enum mds_status ds_connector_http_get(const char *socket_path, const char *path,
                 close(fd);
                 return MDS_ERR_IO;
             }
-            n = write(fd, req + off, (size_t)rc - off);
+            n = send(fd, req + off, (size_t)rc - off, MSG_NOSIGNAL);
             if (n < 0) {
                 if (errno == EAGAIN || errno == EINTR) {
                     continue;
@@ -1052,6 +1267,10 @@ enum mds_status ds_connector_http_get(const char *socket_path, const char *path,
             goto out_io;
         }
         if (n == 0) {
+            if (hdr_end != NULL && content_length >= 0 &&
+                used - (size_t)((hdr_end + 4) - buf) < (size_t)content_length) {
+                goto out_io;   /* truncated body */
+            }
             break;   /* EOF */
         }
         used += (size_t)n;
@@ -1063,6 +1282,13 @@ enum mds_status ds_connector_http_get(const char *socket_path, const char *path,
 
                 if (sscanf(buf, "HTTP/1.%*d %d", &status) != 1) {
                     goto out_io;
+                }
+                {
+                    const char *te = strcasestr(buf, "\r\ntransfer-encoding:");
+
+                    if (te != NULL && te < hdr_end) {
+                        goto out_io;   /* chunked framing is not supported */
+                    }
                 }
                 cl = strcasestr(buf, "\r\ncontent-length:");
                 if (cl != NULL && cl < hdr_end) {
@@ -1188,7 +1414,9 @@ static void note_poll_error(enum ds_connector_poll_error e, enum ds_connector_dr
     g_dc.facts.last_drop = d;
     g_dc.facts.last_batch_valid = false;
     (void)snprintf(g_dc.facts.last_detail, sizeof(g_dc.facts.last_detail), "%s", detail);
-    if (e == DCP_CONNECT || e == DCP_TIMEOUT) {
+    {
+        /* One rule for every failure kind: reachable means an accepted
+         * batch within three intervals (review finding B-4). */
         uint64_t now = dc_now_ms();
 
         if (g_dc.facts.last_success_mono_ms == 0 ||
@@ -1230,8 +1458,12 @@ enum mds_status ds_connector_poll_once(void)
         } else if (st == MDS_ERR_INVAL) {
             (void)snprintf(detail, sizeof(detail), "unexpected HTTP status %d", status);
             note_poll_error(DCP_HTTP, DC_OK, detail);
-        } else if (status == 0 && st == MDS_ERR_IO) {
-            (void)snprintf(detail, sizeof(detail), "socket %.100s: connect/read failed or timed out",
+        } else if (st == MDS_ERR_NOTFOUND) {
+            (void)snprintf(detail, sizeof(detail), "socket %.100s: absent or refused",
+                           g_dc.socket_path);
+            note_poll_error(DCP_CONNECT, DC_OK, detail);
+        } else if (st == MDS_ERR_IO) {
+            (void)snprintf(detail, sizeof(detail), "socket %.100s: timed out or bad response",
                            g_dc.socket_path);
             note_poll_error(DCP_TIMEOUT, DC_OK, detail);
         } else {
@@ -1320,6 +1552,9 @@ int ds_connector_configure(const struct mds_config *cfg, struct ds_cache *cache)
 
     if (cfg == NULL || cfg->placement_mode != PM_SMART) {
         return -1;
+    }
+    if (atomic_load_explicit(&g_dc.running, memory_order_acquire)) {
+        return -1;   /* stop the poller first: its fields are read unlocked */
     }
     memset(&dcfg, 0, sizeof(dcfg));
     dcfg.contract_major = cfg->ds_connector_expected_contract_major;

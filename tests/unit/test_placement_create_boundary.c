@@ -302,6 +302,50 @@ static void test_admit_create_refuses_admin_offline_after_invalidate(void)
     mds_catalogue_close(cat);
 }
 
+static void test_admit_create_refuses_a_connector_denied_ds(void)
+{
+    struct mds_catalogue *cat = NULL;
+    struct ds_cache *cache = cache_with_ds(&cat, 1);
+    struct mds_config cfg;
+    struct placement_token tok;
+    struct placement_assessment_view v;
+    enum placement_reason why;
+    ASSERT_TRUE(cache != NULL);
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.placement_mode = PM_SMART;
+    cfg.placement_mode_set = true;
+    cfg.placement_capacity_max_age_ms = 120000;
+    cfg.ds_connector_poll_ms = 1000;
+    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
+    {
+        struct ds_capacity_obs half = { 1000, 500, 1, ds_cache_mono_ms(), 0 };
+        ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &half), 0);
+    }
+    placement_gate_publish_capacity();
+    /* no assessment yet: the create boundary is not ready */
+    ASSERT_EQ(placement_gate_admit_create(1, PP_NEW_OBJECT, &tok, &why), MDS_ERR_NOSPC);
+    ASSERT_EQ(why, PR_MODE_NOT_READY);
+    /* the connector denies the DS: refused, with the connector's reason */
+    memset(&v, 0, sizeof(v));
+    v.count = 1; v.batch_valid = true;
+    v.rows[0].ds_id = 1; v.rows[0].present = true; v.rows[0].valid = true; v.rows[0].allowed = false;
+    v.rows[0].multiplier_ppm = 0; v.rows[0].received_mono_ms = ds_cache_mono_ms();
+    v.rows[0].expires_mono_ms = ds_cache_mono_ms() + 15000;
+    placement_gate_publish_assessments(&v);
+    ASSERT_EQ(placement_gate_admit_create(1, PP_NEW_OBJECT, &tok, &why), MDS_ERR_NOSPC);
+    ASSERT_EQ(why, PR_CONNECTOR_DENIED);
+    ASSERT_EQ(placement_gate_admit_create(1, PP_RECREATE_MISSING, &tok, &why), MDS_ERR_NOSPC);
+    ASSERT_EQ(why, PR_CONNECTOR_DENIED);
+    /* allowed again: admitted with a valid token */
+    v.rows[0].allowed = true; v.rows[0].multiplier_ppm = 1000000;
+    placement_gate_publish_assessments(&v);
+    ASSERT_EQ(placement_gate_admit_create(1, PP_NEW_OBJECT, &tok, &why), MDS_OK);
+    ASSERT_EQ(placement_token_valid(&tok, 1, ds_cache_mono_ms()), true);
+    placement_gate_destroy();
+    ds_cache_destroy(cache);
+    mds_catalogue_close(cat);
+}
+
 static void test_token_expires_after_two_publishes(void)
 {
     struct mds_catalogue *cat = NULL;
@@ -411,6 +455,7 @@ int main(void)
     RUN_TEST(test_write_direct_does_not_create_on_a_refused_ds);
     RUN_TEST(test_admit_create_refuses_admin_offline_after_invalidate);
     RUN_TEST(test_token_expires_after_two_publishes);
+    RUN_TEST(test_admit_create_refuses_a_connector_denied_ds);
     RUN_TEST(test_batch_capture_does_not_create_on_a_refused_ds);
     printf("%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

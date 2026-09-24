@@ -1686,12 +1686,16 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
      * the dispatcher branch so the configured stripe/mirror geometry
      * applies in rr as well (design section 4, MODE-03).
      */
-    if (cfg->placement_mode_set) {
+    {
+        /* Runs in every mode: without placement_mode it only refuses a
+         * stray ds_connector_enabled = true. */
         char perr[256];
         if (placement_config_validate(cfg, perr, sizeof(perr)) != MDS_OK) {
             (void)fprintf(stderr, "ERROR: %s\n", perr);
             return MDS_ERR_INVAL;
         }
+    }
+    if (cfg->placement_mode_set) {
         cfg->placement_policy_enabled = true;
         cfg->placement_policy = (cfg->placement_mode == PM_RR)
             ? PLACEMENT_RR : PLACEMENT_WEIGHTED_RR;

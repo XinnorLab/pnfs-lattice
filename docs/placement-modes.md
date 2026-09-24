@@ -65,7 +65,7 @@ back-mount checks the declaration:
 | Observation | Result |
 |---|---|
 | one declared domain, same host string, different `f_fsid` | `DOMAIN_MAP_CONTRADICTION` — both DS excluded |
-| same host string and same `f_fsid`, no shared declared domain | `SHARED_FS_ALIAS_UNMAPPED` — both DS excluded (a proven alias must be declared) |
+| same host string and same `f_fsid`, no shared declared domain | `SHARED_FS_ALIAS_UNMAPPED` for the **undeclared** side (a proven alias must be declared); a DS whose domain the operator or, in `smart`, the connector declared keeps its place, so a sibling that is not bound yet cannot take a healthy DS out. Two *different* declared domains on one filesystem are a `DOMAIN_MAP_CONTRADICTION` for both |
 | same `f_fsid` behind different host strings, no shared domain | `ALIAS_SUSPECTED` — a rate-limited WARN and a counter; not excluded (cannot be proven from NFS) |
 
 The domain's observation is the fresh one of the lowest DS id; a fresh
@@ -119,25 +119,44 @@ keys"); the connector is a prerequisite of the mode, so
 `ds_connector_enabled` is derived and an explicit contradiction is a
 config error.
 
-A batch is accepted whole or dropped whole: `contract_version` major must
-be `ds_connector_expected_contract_major`; per connector instance the
-`(epoch, sequence)` line must advance (a replay drops the batch); a
-changed `runtime_epoch` (connector restart) resets every line and every
-binding pin; `generated_at` must not go backwards; `config_digest` must
-equal `ds_connector_expected_config_digest` when that pin is set.  Inside
+A batch is accepted whole or dropped whole: `contract_version` must be
+`<major>.<…>` with the major equal to
+`ds_connector_expected_contract_major` (`1x`, `01.0` and a bare `1` are
+not versions); per connector instance the `(epoch, sequence)` line must
+not go backwards — an **equal** sequence is the connector re-serving its
+current snapshot until the next collection and is accepted (the rows are
+re-timed from the receive instant), a **lower** one is a replay that
+drops the batch; a changed `runtime_epoch` (connector restart) resets
+every line and every binding pin; a batch that would need more sequence
+lines than the 64 the MDS keeps is refused rather than run unprotected;
+`generated_at` must not go backwards (a backwards wall-clock step on the
+connector host therefore drops batches — `OLD_GENERATED_AT`, named in
+`placement_connector_last_detail` — until the clock passes the last
+accepted instant or the connector restarts with a new `runtime_epoch`;
+`smart` fails closed meanwhile); `config_digest` must equal
+`ds_connector_expected_config_digest` when that pin is set.  The body is
+at most 4 MiB, nested at most 64 levels (checked in one linear pass before
+parsing — jsmn is quadratic on depth), and strings are decoded with the
+standard JSON escapes including `\uXXXX` surrogate pairs, so a
+`json.dumps` connector may name a share in any script.  Inside
 an accepted batch every assessment is bound before it is trusted: `scope`
 = `NEW_ALLOCATION`, `access_scope_id` = `ds_connector_access_scope`,
 `endpoint.server` = the registry host, `endpoint.port` = the registry
 port, and the registered export path equals the endpoint's or lies under
 it (`192.168.64.51:/mnt/data/pnfs-ds` inside the share `/mnt/data`);
 `profile.digest` identical across the batch and equal to
-`ds_connector_expected_profile_digest` when set.  The first accepted
-tuple `(instance, binding_generation, datastore_id, target_id,
-target_incarnation, profile digest, access scope)` is pinned per DS; a
-later record must repeat it or carry a higher `binding_generation`
-(rebind: the DS is UNKNOWN for that batch); anything else is
-`BINDING_MISMATCH` and that DS has no record.  Records for unknown DS ids
-are ignored, duplicates inside a batch reject both.
+`ds_connector_expected_profile_digest` when set (a trailing `/` on the
+endpoint path names the same share).  The first accepted tuple
+`(instance, binding_generation, datastore_id, target_id,
+target_incarnation, access scope)` is pinned per DS; a later record must
+repeat it or carry a higher `binding_generation` (rebind: the DS is
+UNKNOWN for that batch); anything else is `BINDING_MISMATCH` and that DS
+has no record.  The profile digest is deliberately **not** part of the
+pin: it is checked on every batch (pin key and batch-wide consistency),
+and a connector profile reload must not strand every DS in
+`BINDING_MISMATCH` until a process restart.  Records for unknown DS ids
+are ignored; a DS id that appears more than once in a batch has no
+trusted record and pins nothing.
 
 Candidate rule in `smart` (after the capacity gate): a fresh record
 (`received + remaining_ttl_ms` on the MDS clock) with `quality = VALID`,
@@ -156,9 +175,13 @@ placements (`NFS4ERR_NOSPC`).
 Readiness is four facts, reported by `config show` as
 `placement_readiness = mode_active=… connector_config_valid=…
 connector_reachable=… last_batch_valid=… coverage=full|partial|none
-registered_ds=… covered_ds=… eligible_ds=…` (reachable = a successful
-poll within three intervals; coverage counts DS with a fresh VALID
-record).  Partial coverage is a degraded, correct state: the MDS keeps
+registered_ds=… covered_ds=… eligible_ds=…` (reachable = an accepted
+batch within three intervals — one rule for every failure kind, whether
+the socket is absent (`CONNECT`), the request timed out or the response
+was malformed (`TIMEOUT`), the status was unexpected (`HTTP`), the
+connector answered 503 (`UNAVAILABLE`) or the batch was dropped (`DROP`);
+the `pnfs_mds_connector_reachable` gauge follows the same rule; coverage
+counts DS with a fresh VALID record).  Partial coverage is a degraded, correct state: the MDS keeps
 placing on the covered DS.  Run `lattice-ds-connector preflight
 --expect-ds 0,1` on the MDS before switching to see the same facts from
 the connector's side.

@@ -131,6 +131,10 @@ enum mds_status placement_config_validate(const struct mds_config *cfg,
         return fail(err, cap, "RANGE: null config");
     }
     if (!cfg->placement_mode_set) {
+        if (cfg->ds_connector_enabled_set && cfg->ds_connector_enabled) {
+            return fail(err, cap,
+                "PLACEMENT_MODE_CONFLICT: ds_connector_enabled = true needs placement_mode = smart");
+        }
         return MDS_OK;
     }
     if (cfg->placement_policy_set || cfg->placement_policy_enabled_set ||
@@ -205,6 +209,9 @@ enum mds_status placement_config_validate(const struct mds_config *cfg,
         }
         if (cfg->ds_connector_socket[0] != '/') {
             return fail(err, cap, "RANGE: ds_connector_socket must be an absolute path");
+        }
+        if (strlen(cfg->ds_connector_socket) >= 108) {
+            return fail(err, cap, "RANGE: ds_connector_socket must be shorter than 108 bytes (sun_path)");
         }
 #ifndef ENABLE_DS_CONNECTOR
         return fail(err, cap,

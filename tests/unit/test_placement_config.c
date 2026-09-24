@@ -132,6 +132,10 @@ static void test_smart_connector_conflicts_and_ranges(void)
         "placement_mode = smart\nds_connector_max_ds = 257\n",
         "placement_mode = smart\nds_connector_expected_contract_major = 0\n",
         "placement_mode = smart\nds_connector_socket = relative.sock\n",
+        "placement_mode = smart\nds_connector_socket = /run/lattice-ds-connector/"
+            "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789.sock\n",
+        "ds_connector_enabled = true\n",                            /* the switch alone names no mode */
+        "placement_policy_enabled = true\nds_connector_enabled = true\n",
         "placement_mode = smart\nds_connector_poll_ms = 1s\n",
         "placement_mode = smart\nds_connector_access_scope = \n",
     };
@@ -142,6 +146,16 @@ static void test_smart_connector_conflicts_and_ranges(void)
     }
     /* rr/fill ignore the connector keys other than the enabled switch */
     struct mds_config cfg; char path[128];
+    /* the longest socket path that still fits sun_path (107 bytes) */
+    ASSERT_EQ(write_tmp_ini("placement_mode = smart\nds_connector_socket = /run/lattice-ds-connector/"
+        "0123456789012345678901234567890123456789012345678901234567890123456789012345.sock\n", path), 0);
+    ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);
+    ASSERT_EQ(strlen(cfg.ds_connector_socket), 107u);
+    /* without a mode the connector switch may only be off */
+    ASSERT_EQ(write_tmp_ini("placement_policy_enabled = true\nds_connector_enabled = false\n", path), 0);
+    ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);
+    ASSERT_EQ(cfg.placement_mode, PM_LEGACY);
+    ASSERT_EQ(cfg.ds_connector_enabled, false);
     ASSERT_EQ(write_tmp_ini("placement_mode = fill\nds_connector_socket = /tmp/x.sock\nds_connector_enabled = false\n", path), 0);
     ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);
     ASSERT_EQ(cfg.ds_connector_enabled, false);

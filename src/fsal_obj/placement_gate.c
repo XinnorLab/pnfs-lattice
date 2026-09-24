@@ -283,7 +283,17 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
                     }
                 } else if (ri->obs.fsid == rj->obs.fsid) {
                     if (same_host) {
-                        unmapped = true;          /* (b) proven, undeclared */
+                        /* (b) a proven alias that shares no declared domain.
+                         * Two DIFFERENT declared domains on one filesystem
+                         * contradict the map; otherwise only the UNDECLARED
+                         * side is excluded -- a DS whose domain the operator
+                         * or the connector declared keeps it even when its
+                         * sibling has no record yet (review finding B-5). */
+                        if (rs[r_i].declared && rs[j].declared) {
+                            contradiction = true;
+                        } else if (!rs[r_i].declared) {
+                            unmapped = true;
+                        }
                     } else if (ri->ds_id < rj->ds_id) {
                         placement_gate_note_alias_suspected(ri->ds_id, rj->ds_id);   /* (c) */
                     }

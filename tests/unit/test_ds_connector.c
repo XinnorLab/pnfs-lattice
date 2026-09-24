@@ -176,7 +176,10 @@ static void test_replay_drops_the_batch_and_keeps_state(void)
     struct placement_assessment_view v; struct ds_connector_report rep;
     reg_init(); st_init(NULL, NULL);
     ASSERT_EQ(apply(batch("rt-1", "e1", 5, "2026-09-24T10:00:05Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
-    ASSERT_EQ(apply(batch("rt-1", "e1", 5, "2026-09-24T10:00:06Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_REPLAY);
+    /* the connector re-serves the same snapshot until its next collection:
+     * an equal sequence is steady state, not a replay */
+    ASSERT_EQ(apply(batch("rt-1", "e1", 5, "2026-09-24T10:00:06Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
+    ASSERT_EQ(v.batch_valid, true);
     ASSERT_EQ(apply(batch("rt-1", "e1", 4, "2026-09-24T10:00:07Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_REPLAY);
     ASSERT_EQ(v.batch_valid, false);
     ASSERT_EQ(ST.inst[0].sequence, 5u);
@@ -239,6 +242,15 @@ static void test_profile_digest_pin_and_consistency(void)
     ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", recs), &v, &rep), DC_OK);
     ASSERT_EQ(rep.accepted, 1u);
     ASSERT_EQ(rep.rejected_binding, 1u);
+    /* a connector profile reload (new digest on every record, same binding
+     * tuple) is accepted without a connector restart: the digest is not part
+     * of the pin */
+    const char *reloaded = rec(0, 2, "mnt/data", "\"mnt/data:0:u\"", "192.168.64.51", "/mnt/data", 2049,
+                               "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:q", "true", 1000000, "null");
+    ASSERT_EQ(apply(batch("rt-1", "e1", 2, "2026-09-24T10:00:02Z", "c", "COMPLETE", reloaded), &v, &rep), DC_OK);
+    ASSERT_EQ(rep.accepted, 1u);
+    ASSERT_EQ(rep.rejected_binding, 0u);
+    ASSERT_EQ(strcmp(v.profile_digest, "sha256:q"), 0);
 }
 
 static void test_endpoint_rule(void)
@@ -250,6 +262,8 @@ static void test_endpoint_rule(void)
     ds.tcp_port = 2049;
     ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data/pnfs-ds", 2049), true);   /* exact */
     ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data", 2049), true);           /* under */
+    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data/", 2049), true);          /* trailing slash */
+    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data/pnfs-ds/", 2049), true);
     ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/", 2049), true);
     ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/dat", 2049), false);           /* prefix, not a component */
     ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data/pnfs-ds/sub", 2049), false);
@@ -311,6 +325,8 @@ static void test_unknown_duplicate_failed_and_shape(void)
     ASSERT_EQ(apply(batch("rt-1", "e1", 2, "2026-09-24T10:00:02Z", "c", "COMPLETE", recs), &v, &rep), DC_OK);
     ASSERT_EQ(v.rows[0].present, false);            /* duplicate: neither trusted */
     ASSERT_TRUE(rep.rejected_shape >= 1u);
+    ASSERT_EQ(rep.accepted, 0u);
+    ASSERT_EQ(ST.pins[0].pinned, false);            /* ... and nothing is pinned */
     ASSERT_EQ(apply(batch("rt-1", "e1", 3, "2026-09-24T10:00:03Z", "c", "FAILED", rec_ok(0)), &v, &rep), DC_OK);
     ASSERT_EQ(v.rows[0].present, true);
     ASSERT_EQ(v.rows[0].valid, false);              /* FAILED snapshot -> UNKNOWN */
@@ -378,6 +394,10 @@ struct fake_srv {
     long        content_length;   /* -1 = real length */
     int         delay_ms;
     bool        silent;           /* accept, never answer */
+    bool        keep_dir;         /* stop leaves the directory for a re-serve */
+    bool        no_content_length;
+    bool        chunked;          /* advertise Transfer-Encoding: chunked */
+    long        stream_bytes;     /* after the body: that many filler bytes */
     int         listen_fd;
     pthread_t   th;
 };
@@ -407,13 +427,35 @@ static void *fake_srv_thread(void *a)
         char hdr[256];
         size_t blen = s->body ? strlen(s->body) : 0;
         long cl = (s->content_length >= 0) ? s->content_length : (long)blen;
-        int n = snprintf(hdr, sizeof(hdr),
+        int n;
+        if (s->no_content_length) {
+            n = snprintf(hdr, sizeof(hdr),
+                         "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\n%s"
+                         "Connection: close\r\n\r\n",
+                         s->status, s->status == 200 ? "OK" : "Nope",
+                         s->chunked ? "Transfer-Encoding: chunked\r\n" : "");
+        } else {
+            n = snprintf(hdr, sizeof(hdr),
                          "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\n"
                          "Content-Length: %ld\r\nConnection: close\r\n\r\n",
                          s->status, s->status == 200 ? "OK" : "Nope", cl);
+        }
         (void)write(c, hdr, (size_t)n);
         if (blen > 0) {
             (void)write(c, s->body, blen);
+        }
+        if (s->stream_bytes > 0) {
+            static char filler[65536];
+            long left = s->stream_bytes;
+            memset(filler, 'x', sizeof(filler));
+            while (left > 0) {
+                size_t chunk = left > (long)sizeof(filler) ? sizeof(filler) : (size_t)left;
+                ssize_t w = write(c, filler, chunk);
+                if (w <= 0) {
+                    break;
+                }
+                left -= w;
+            }
         }
     } else {
         usleep(3000 * 1000);
@@ -426,11 +468,15 @@ static int fake_srv_start(struct fake_srv *s, int status, const char *body)
 {
     struct sockaddr_un addr;
 
-    snprintf(s->dir, sizeof(s->dir), "/tmp/pnfs-dc-XXXXXX");
-    if (mkdtemp(s->dir) == NULL) {
-        return -1;
+    if (s->path[0] == '\0') {
+        snprintf(s->dir, sizeof(s->dir), "/tmp/pnfs-dc-XXXXXX");
+        if (mkdtemp(s->dir) == NULL) {
+            return -1;
+        }
+        snprintf(s->path, sizeof(s->path), "%s/c.sock", s->dir);
+    } else {
+        (void)unlink(s->path);   /* re-serve at a caller-chosen path */
     }
-    snprintf(s->path, sizeof(s->path), "%s/c.sock", s->dir);
     s->status = status;
     s->body = body;
     if (s->content_length == 0) {
@@ -455,7 +501,9 @@ static void fake_srv_stop(struct fake_srv *s)
     (void)pthread_join(s->th, NULL);
     close(s->listen_fd);
     (void)unlink(s->path);
-    (void)rmdir(s->dir);
+    if (!s->keep_dir) {
+        (void)rmdir(s->dir);
+    }
 }
 
 static uint64_t mono_ms(void)
@@ -504,7 +552,7 @@ static void test_http_get_timeout_and_no_socket(void)
     ASSERT_EQ(ds_connector_http_get(s.path, "/v1/assessments", 200, &body, &len, &status), MDS_ERR_IO);
     ASSERT_TRUE(mono_ms() - t0 < 1000);
     fake_srv_stop(&s);
-    ASSERT_EQ(ds_connector_http_get("/tmp/pnfs-dc-no-such/c.sock", "/v1/assessments", 200, &body, &len, &status), MDS_ERR_IO);
+    ASSERT_EQ(ds_connector_http_get("/tmp/pnfs-dc-no-such/c.sock", "/v1/assessments", 200, &body, &len, &status), MDS_ERR_NOTFOUND);
     ASSERT_EQ(ds_connector_http_get(NULL, "/x", 200, &body, &len, &status), MDS_ERR_INVAL);
 }
 
@@ -558,6 +606,8 @@ static void test_poll_once_publishes_and_readiness(void)
     struct mds_config cfg;
     struct fake_srv s;
     struct placement_readiness r;
+    char sock_dir[64];
+    char sock[100];
     ASSERT_TRUE(cache != NULL);
     memset(&cfg, 0, sizeof(cfg));
     cfg.placement_mode = PM_SMART;
@@ -574,9 +624,14 @@ static void test_poll_once_publishes_and_readiness(void)
     ASSERT_EQ(r.connector_config_valid, false);        /* not configured yet */
     ASSERT_EQ(strcmp(r.coverage, "none"), 0);
 
+    /* one socket path for the whole test: the connector is configured once
+     * and every later server re-serves at that path */
     memset(&s, 0, sizeof(s));
+    s.keep_dir = true;
     ASSERT_EQ(fake_srv_start(&s, 200, batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "cfg-d", "COMPLETE", rec_ok(0))), 0);
-    snprintf(cfg.ds_connector_socket, sizeof(cfg.ds_connector_socket), "%s", s.path);
+    snprintf(sock_dir, sizeof(sock_dir), "%s", s.dir);
+    snprintf(sock, sizeof(sock), "%s", s.path);
+    snprintf(cfg.ds_connector_socket, sizeof(cfg.ds_connector_socket), "%s", sock);
     ASSERT_EQ(ds_connector_configure(&cfg, cache), 0);
     ASSERT_EQ(ds_connector_poll_once(), MDS_OK);
     fake_srv_stop(&s);
@@ -592,32 +647,299 @@ static void test_poll_once_publishes_and_readiness(void)
     ASSERT_EQ(strcmp(r.profile_digest, "sha256:p"), 0);
     ASSERT_EQ(atomic_load(&g_branch_metrics.connector_covered_ds), 1u);
 
-    /* garbage: the batch is dropped, the previous view stays until it ages out */
-    memset(&s, 0, sizeof(s));
-    ASSERT_EQ(fake_srv_start(&s, 200, "{garbage"), 0);
-    snprintf(cfg.ds_connector_socket, sizeof(cfg.ds_connector_socket), "%s", s.path);
-    ASSERT_EQ(ds_connector_configure(&cfg, cache), 0);   /* new socket path; state reset is fine here */
+#define RESERVE(status, body_) do { \
+        memset(&s, 0, sizeof(s)); \
+        s.keep_dir = true; \
+        snprintf(s.dir, sizeof(s.dir), "%s", sock_dir); \
+        snprintf(s.path, sizeof(s.path), "%s", sock); \
+        ASSERT_EQ(fake_srv_start(&s, (status), (body_)), 0); \
+    } while (0)
+
+    /* the same snapshot re-served (equal sequence) is steady state */
+    RESERVE(200, batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "cfg-d", "COMPLETE", rec_ok(0)));
+    ASSERT_EQ(ds_connector_poll_once(), MDS_OK);
+    fake_srv_stop(&s);
+    placement_gate_readiness(&r);
+    ASSERT_EQ(r.last_batch_valid, true);
+    ASSERT_EQ(atomic_load(&g_branch_metrics.connector_batches_dropped_total[DC_REPLAY]), 0u);
+
+    /* garbage: the batch is dropped, the previous view stays until it ages
+     * out; reachable holds for 3 x poll after the last accepted batch */
+    RESERVE(200, "{garbage");
     ASSERT_EQ(ds_connector_poll_once(), MDS_ERR_INVAL);
     fake_srv_stop(&s);
     placement_gate_readiness(&r);
     ASSERT_EQ(r.last_batch_valid, false);
+    ASSERT_EQ(r.connector_reachable, true);
     ASSERT_EQ(r.covered_ds, 1u);
     ASSERT_EQ(atomic_load(&g_branch_metrics.connector_batches_dropped_total[DC_JSON]) >= 1u, true);
 
-    /* socket gone: no fallback -- reachability lapses after 3 x poll and the
-     * rows expire on their own TTL */
-    ASSERT_EQ(ds_connector_poll_once(), MDS_ERR_IO);
+    /* 503 after the grace: the gauge and the fact both drop, on the same rule */
     usleep(700 * 1000);
-    ASSERT_EQ(ds_connector_poll_once(), MDS_ERR_IO);
+    RESERVE(503, "{\"ready\":false}");
+    ASSERT_EQ(ds_connector_poll_once(), MDS_ERR_DELAY);
+    fake_srv_stop(&s);
+    placement_gate_readiness(&r);
+    ASSERT_EQ(r.connector_reachable, false);
+    ASSERT_EQ(atomic_load(&g_branch_metrics.connector_reachable), 0u);
+    ASSERT_EQ(atomic_load(&g_branch_metrics.connector_poll_errors_total[DCP_UNAVAILABLE]) >= 1u, true);
+
+    /* socket gone: no fallback -- CONNECT is counted, the rows expire on
+     * their own TTL */
+    ASSERT_EQ(ds_connector_poll_once(), MDS_ERR_NOTFOUND);
     placement_gate_readiness(&r);
     ASSERT_EQ(r.connector_reachable, false);
     ASSERT_EQ(r.covered_ds, 1u);                        /* 15 s TTL not yet over */
-    ASSERT_EQ(atomic_load(&g_branch_metrics.connector_reachable), 0u);
+    ASSERT_EQ(atomic_load(&g_branch_metrics.connector_poll_errors_total[DCP_CONNECT]) >= 1u, true);
+
+    /* a good batch restores reachability */
+    RESERVE(200, batch("rt-1", "e1", 2, "2026-09-24T10:00:02Z", "cfg-d", "COMPLETE", rec_ok(0)));
+    ASSERT_EQ(ds_connector_poll_once(), MDS_OK);
+    s.keep_dir = false;
+    fake_srv_stop(&s);
+    placement_gate_readiness(&r);
+    ASSERT_EQ(r.connector_reachable, true);
+    ASSERT_EQ(atomic_load(&g_branch_metrics.connector_reachable), 1u);
+#undef RESERVE
 
     ds_connector_stop();
     placement_gate_destroy();
     ds_cache_destroy(cache);
     mds_catalogue_close(cat);
+}
+
+static enum ds_connector_drop apply_at(const char *text, uint64_t now,
+                                       struct placement_assessment_view *v,
+                                       struct ds_connector_report *rep)
+{
+    return ds_connector_apply_batch(&ST, text, strlen(text), &REG, now, v, rep);
+}
+
+static void test_steady_state_refreshes_the_ttl(void)
+{
+    struct placement_assessment_view v; struct ds_connector_report rep;
+    reg_init(); st_init(NULL, NULL);
+    const char *b = batch("rt-1", "e1", 7, "2026-09-24T10:00:07Z", "c", "COMPLETE", rec_ok(0));
+    ASSERT_EQ(apply_at(b, 1000000, &v, &rep), DC_OK);
+    ASSERT_TRUE(v.rows[0].expires_mono_ms == 1015000ull);
+    /* ten polls later the connector still serves sequence 7: every poll is
+     * accepted and the row is re-timed from the receive instant */
+    for (int i = 1; i <= 10; i++) {
+        ASSERT_EQ(apply_at(b, 1000000ull + (uint64_t)i * 1000, &v, &rep), DC_OK);
+        ASSERT_EQ(rep.accepted, 1u);
+        ASSERT_EQ(v.batch_valid, true);
+    }
+    ASSERT_TRUE(v.rows[0].expires_mono_ms == 1025000ull);
+    ASSERT_TRUE(v.batch_received_mono_ms == 1010000ull);
+    ASSERT_EQ(ST.inst[0].sequence, 7u);
+}
+
+/* Two connector instances in one batch, each covering one DS. */
+static const char *batch2(unsigned seq1, unsigned seq2, const char *generated_at)
+{
+    snprintf(BUF, sizeof(BUF),
+        "{\"contract_version\":\"1.0\",\"runtime_epoch\":\"rt-1\",\"config_digest\":\"c\","
+        "\"generated_at\":\"%s\",\"instances\":["
+        "{\"connector_instance_id\":\"xi-01\",\"module_type\":\"xinas\",\"epoch\":\"e1\",\"sequence\":%u,"
+        "\"snapshot_status\":\"COMPLETE\",\"assessments\":[%s]},"
+        "{\"connector_instance_id\":\"xi-02\",\"module_type\":\"xinas\",\"epoch\":\"e9\",\"sequence\":%u,"
+        "\"snapshot_status\":\"COMPLETE\",\"assessments\":[%s]}]}",
+        generated_at, seq1, rec_ok(0), seq2, rec_ok(1));
+    return BUF;
+}
+
+static void test_multi_instance_batch(void)
+{
+    struct placement_assessment_view v; struct ds_connector_report rep;
+    reg_init(); st_init(NULL, NULL);
+    ASSERT_EQ(apply(batch2(3, 8, "2026-09-24T10:00:01Z"), &v, &rep), DC_OK);
+    ASSERT_EQ(rep.accepted, 2u);
+    ASSERT_EQ(v.rows[0].present, true);
+    ASSERT_EQ(v.rows[1].present, true);
+    ASSERT_EQ(strcmp(ST.pins[0].instance, "xi-01"), 0);
+    ASSERT_EQ(strcmp(ST.pins[1].instance, "xi-02"), 0);
+    /* one instance moves on, the other re-serves: accepted */
+    ASSERT_EQ(apply(batch2(4, 8, "2026-09-24T10:00:02Z"), &v, &rep), DC_OK);
+    /* one instance goes backwards: the whole batch is a replay, lines keep */
+    ASSERT_EQ(apply(batch2(4, 7, "2026-09-24T10:00:03Z"), &v, &rep), DC_REPLAY);
+    ASSERT_TRUE(strstr(rep.detail, "xi-02") != NULL);
+    int seq1 = -1, seq2 = -1;
+    for (int k = 0; k < DC_INSTANCES_MAX; k++) {
+        if (ST.inst[k].used && strcmp(ST.inst[k].id, "xi-01") == 0) seq1 = (int)ST.inst[k].sequence;
+        if (ST.inst[k].used && strcmp(ST.inst[k].id, "xi-02") == 0) seq2 = (int)ST.inst[k].sequence;
+    }
+    ASSERT_EQ(seq1, 4);
+    ASSERT_EQ(seq2, 8);
+}
+
+static void test_instance_lines_cannot_be_exhausted_silently(void)
+{
+    struct placement_assessment_view v; struct ds_connector_report rep;
+    static char big[65536];
+    size_t o;
+    int i;
+    reg_init(); st_init(NULL, NULL);
+    /* DC_INSTANCES_MAX distinct ids fill every line */
+    o = (size_t)snprintf(big, sizeof(big),
+        "{\"contract_version\":\"1.0\",\"runtime_epoch\":\"rt-1\",\"config_digest\":\"c\","
+        "\"generated_at\":\"2026-09-24T10:00:01Z\",\"instances\":[");
+    for (i = 0; i < DC_INSTANCES_MAX; i++) {
+        o += (size_t)snprintf(big + o, sizeof(big) - o,
+            "%s{\"connector_instance_id\":\"inst-%03d\",\"module_type\":\"xinas\",\"epoch\":\"e\","
+            "\"sequence\":1,\"snapshot_status\":\"COMPLETE\",\"assessments\":[]}", i ? "," : "", i);
+    }
+    o += (size_t)snprintf(big + o, sizeof(big) - o, "]}");
+    ASSERT_EQ(apply(big, &v, &rep), DC_OK);
+    /* a batch with one id nobody has a line for is refused, not run unprotected */
+    const char *extra = "{\"contract_version\":\"1.0\",\"runtime_epoch\":\"rt-1\",\"config_digest\":\"c\","
+        "\"generated_at\":\"2026-09-24T10:00:02Z\",\"instances\":["
+        "{\"connector_instance_id\":\"inst-new\",\"module_type\":\"xinas\",\"epoch\":\"e\","
+        "\"sequence\":1,\"snapshot_status\":\"COMPLETE\",\"assessments\":[]}]}";
+    ASSERT_EQ(apply(extra, &v, &rep), DC_SCHEMA);
+    ASSERT_TRUE(strstr(rep.detail, "sequence lines free") != NULL);
+    /* a known id still goes through */
+    const char *known = "{\"contract_version\":\"1.0\",\"runtime_epoch\":\"rt-1\",\"config_digest\":\"c\","
+        "\"generated_at\":\"2026-09-24T10:00:03Z\",\"instances\":["
+        "{\"connector_instance_id\":\"inst-005\",\"module_type\":\"xinas\",\"epoch\":\"e\","
+        "\"sequence\":2,\"snapshot_status\":\"COMPLETE\",\"assessments\":[]}]}";
+    ASSERT_EQ(apply(known, &v, &rep), DC_OK);
+    /* a new runtime epoch frees every line */
+    const char *fresh = "{\"contract_version\":\"1.0\",\"runtime_epoch\":\"rt-2\",\"config_digest\":\"c\","
+        "\"generated_at\":\"2026-09-24T10:00:04Z\",\"instances\":["
+        "{\"connector_instance_id\":\"inst-new\",\"module_type\":\"xinas\",\"epoch\":\"e\","
+        "\"sequence\":1,\"snapshot_status\":\"COMPLETE\",\"assessments\":[]}]}";
+    ASSERT_EQ(apply(fresh, &v, &rep), DC_OK);
+}
+
+static size_t nested_doc(char *doc, size_t depth, const char *filler)
+{
+    size_t o = (size_t)snprintf(doc, 512, "{\"contract_version\":\"1.0\",\"runtime_epoch\":\"rt-1\","
+                                "\"config_digest\":\"c\",\"generated_at\":\"2026-09-24T10:00:01Z\",\"deep\":");
+    memset(doc + o, '[', depth); o += depth;
+    o += (size_t)snprintf(doc + o, 512, "%s", filler);
+    memset(doc + o, ']', depth); o += depth;
+    o += (size_t)snprintf(doc + o, 512, ",\"instances\":[]}");
+    return o;
+}
+
+static void test_deep_nesting_is_bounded_and_skipped_without_recursion(void)
+{
+    struct placement_assessment_view v; struct ds_connector_report rep;
+    char *doc = malloc(1024 * 1024);
+    size_t o;
+    ASSERT_TRUE(doc != NULL);
+    reg_init(); st_init(NULL, NULL);
+    /* an unknown envelope key holding a 63-deep array (the envelope itself is
+     * level 1): skipped iteratively, the batch is fine */
+    o = nested_doc(doc, 63, "\"]}[{\"");
+    ASSERT_EQ(ds_connector_apply_batch(&ST, doc, o, &REG, 1000000, &v, &rep), DC_OK);
+    ASSERT_EQ(v.count, 2u);
+    /* one level more is refused before jsmn parses it */
+    o = nested_doc(doc, 64, "");
+    ASSERT_EQ(ds_connector_apply_batch(&ST, doc, o, &REG, 1000000, &v, &rep), DC_JSON);
+    ASSERT_TRUE(strstr(rep.detail, "nesting") != NULL);
+    /* 400 000 levels (jsmn is quadratic on depth: minutes) are refused in
+     * one linear pass -- the poll thread never stalls */
+    o = nested_doc(doc, 400000, "");
+    uint64_t t0 = mono_ms();
+    ASSERT_EQ(ds_connector_apply_batch(&ST, doc, o, &REG, 1000000, &v, &rep), DC_JSON);
+    ASSERT_TRUE(mono_ms() - t0 < 1000);
+    free(doc);
+}
+
+static void test_unicode_escapes_in_strings(void)
+{
+    struct placement_assessment_view v; struct ds_connector_report rep;
+    reg_init(); st_init(NULL, NULL);
+    /* json.dumps writes non-ASCII as \uXXXX: the Cyrillic share name and an
+     * emoji (surrogate pair) both decode to UTF-8 */
+    const char *cyr = rec(0, 2, "\\u0448\\u0430\\u0440\\u0430", "\"a:\\ud83d\\ude00\"", "192.168.64.51", "/mnt/data", 2049,
+                          "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
+    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", cyr), &v, &rep), DC_OK);
+    ASSERT_EQ(rep.accepted, 1u);
+    ASSERT_EQ(strcmp(ST.pins[0].target_id, "\xd1\x88\xd0\xb0\xd1\x80\xd0\xb0"), 0);
+    ASSERT_EQ(strcmp(ST.pins[0].target_incarnation, "a:\xf0\x9f\x98\x80"), 0);
+    /* the same tuple spelled raw UTF-8 matches the pin */
+    const char *raw = rec(0, 2, "\xd1\x88\xd0\xb0\xd1\x80\xd0\xb0", "\"a:\xf0\x9f\x98\x80\"", "192.168.64.51", "/mnt/data", 2049,
+                          "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
+    ASSERT_EQ(apply(batch("rt-1", "e1", 2, "2026-09-24T10:00:02Z", "c", "COMPLETE", raw), &v, &rep), DC_OK);
+    ASSERT_EQ(rep.accepted, 1u);
+    ASSERT_EQ(rep.rejected_binding, 0u);
+    /* malformed escapes never yield a partial string: jsmn (strict) rejects
+     * a bad escape as invalid JSON, the decoder rejects a lone surrogate and
+     * NUL as a record shape error */
+    const char *bad_json[] = { "\\u12", "\\x41", "tail\\" };
+    for (unsigned i = 0; i < sizeof(bad_json) / sizeof(bad_json[0]); i++) {
+        const char *r = rec(1, 1, bad_json[i], "null", "192.168.64.71", "/mnt/data", 2049,
+                            "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
+        ASSERT_EQ(apply(batch("rt-1", "e1", 3 + i, "2026-09-24T10:00:03Z", "c", "COMPLETE", r), &v, &rep), DC_JSON);
+        ASSERT_EQ(ST.pins[1].pinned, false);
+    }
+    const char *bad_shape[] = { "\\ud83d", "\\ude00", "\\u0000", "\\ud83d\\u0041" };
+    for (unsigned i = 0; i < sizeof(bad_shape) / sizeof(bad_shape[0]); i++) {
+        const char *r = rec(1, 1, bad_shape[i], "null", "192.168.64.71", "/mnt/data", 2049,
+                            "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
+        ASSERT_EQ(apply(batch("rt-1", "e1", 6 + i, "2026-09-24T10:00:03Z", "c", "COMPLETE", r), &v, &rep), DC_OK);
+        ASSERT_EQ(rep.rejected_shape, 1u);
+        ASSERT_EQ(ST.pins[1].pinned, false);
+    }
+    /* the ordinary escapes decode too */
+    const char *esc = rec(1, 1, "a\\/b\\\"c\\\\d", "null", "192.168.64.71", "/mnt/data", 2049,
+                          "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
+    ASSERT_EQ(apply(batch("rt-1", "e1", 20, "2026-09-24T10:00:20Z", "c", "COMPLETE", esc), &v, &rep), DC_OK);
+    ASSERT_EQ(rep.accepted, 1u);
+    ASSERT_EQ(strcmp(ST.pins[1].target_id, "a/b\"c\\d"), 0);
+}
+
+static void test_contract_version_shapes(void)
+{
+    struct placement_assessment_view v; struct ds_connector_report rep;
+    const char *bad[] = { "1x", "01.0", "1", "x1.0", ".0", "10.0", "" };
+    const char *good[] = { "1.0", "1.7", "1.0.3" };
+    reg_init(); st_init(NULL, NULL);
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        char doc[512];
+        snprintf(doc, sizeof(doc), "{\"contract_version\":\"%s\",\"runtime_epoch\":\"r\",\"config_digest\":\"c\","
+                 "\"generated_at\":\"2026-09-24T10:00:00Z\",\"instances\":[]}", bad[i]);
+        ASSERT_EQ(apply(doc, &v, &rep), DC_CONTRACT_MAJOR);
+    }
+    for (unsigned i = 0; i < sizeof(good) / sizeof(good[0]); i++) {
+        char doc[512];
+        snprintf(doc, sizeof(doc), "{\"contract_version\":\"%s\",\"runtime_epoch\":\"r\",\"config_digest\":\"c\","
+                 "\"generated_at\":\"2026-09-24T10:00:00Z\",\"instances\":[]}", good[i]);
+        ASSERT_EQ(apply(doc, &v, &rep), DC_OK);
+    }
+}
+
+static void test_http_get_streamed_oversize_and_short_body(void)
+{
+    struct fake_srv s; memset(&s, 0, sizeof(s));
+    char *body = NULL; size_t len = 0; int status = 0;
+    /* no Content-Length, 5 MiB streamed: capped, never buffered whole */
+    s.no_content_length = true;
+    s.stream_bytes = 5L * 1024 * 1024;
+    ASSERT_EQ(fake_srv_start(&s, 200, "{}"), 0);
+    ASSERT_EQ(ds_connector_http_get(s.path, "/v1/assessments", 3000, &body, &len, &status), MDS_ERR_IO);
+    ASSERT_TRUE(body == NULL);
+    fake_srv_stop(&s);
+    /* Content-Length larger than what arrives: bounded by the deadline */
+    memset(&s, 0, sizeof(s));
+    s.content_length = 100;
+    s.silent = false;
+    ASSERT_EQ(fake_srv_start(&s, 200, "{}"), 0);
+    uint64_t t0 = mono_ms();
+    ASSERT_EQ(ds_connector_http_get(s.path, "/v1/assessments", 200, &body, &len, &status), MDS_ERR_IO);
+    ASSERT_TRUE(mono_ms() - t0 < 1500);
+    ASSERT_TRUE(body == NULL);
+    fake_srv_stop(&s);
+    /* chunked framing is refused rather than mis-parsed */
+    memset(&s, 0, sizeof(s));
+    s.no_content_length = true;
+    s.chunked = true;
+    ASSERT_EQ(fake_srv_start(&s, 200, "2\r\n{}\r\n0\r\n\r\n"), 0);
+    ASSERT_EQ(ds_connector_http_get(s.path, "/v1/assessments", 1000, &body, &len, &status), MDS_ERR_IO);
+    ASSERT_TRUE(body == NULL);
+    fake_srv_stop(&s);
 }
 
 int main(void)
@@ -640,6 +962,13 @@ int main(void)
     RUN_TEST(test_binding_rules_in_a_batch);
     RUN_TEST(test_unknown_duplicate_failed_and_shape);
     RUN_TEST(test_json_and_size_and_schema);
+    RUN_TEST(test_steady_state_refreshes_the_ttl);
+    RUN_TEST(test_multi_instance_batch);
+    RUN_TEST(test_instance_lines_cannot_be_exhausted_silently);
+    RUN_TEST(test_deep_nesting_is_bounded_and_skipped_without_recursion);
+    RUN_TEST(test_unicode_escapes_in_strings);
+    RUN_TEST(test_contract_version_shapes);
+    RUN_TEST(test_http_get_streamed_oversize_and_short_body);
     printf("%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }
