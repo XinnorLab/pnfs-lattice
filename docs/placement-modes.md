@@ -21,9 +21,11 @@ upstream (`placement_policy`, `placement_policy_enabled`,
 rotation.  `capacity` stays a legacy `placement_policy` value (strict
 maximum) and is not one of the modes.
 
-**Status:** `rr` and `fill` are implemented (Stage A).  `smart` parses but
-is refused at startup with `PLACEMENT_MODE_UNSUPPORTED_BUILD` until the
-connector client lands (Stage B) — it is `NOT_READY`.
+**Status:** `rr`, `fill` and `smart` are implemented (Stages A and B).
+`smart` needs a binary built with `ENABLE_DS_CONNECTOR=ON` (refused with
+`PLACEMENT_MODE_UNSUPPORTED_BUILD` otherwise) and a running per-MDS
+`lattice-ds-connector`; the `lattice-placement` helper and the
+acceptance rows are Stage C.
 
 ## Keys
 
@@ -106,22 +108,86 @@ when it is absent **and** admitted.  An existing object is never blocked
 re-created — LAYOUTGET keeps answering `NFS4ERR_DELAY` for that stripe
 and a proxy write on it fails instead of creating elsewhere.
 
+## `smart`: the connector client
+
+Each MDS polls **its own** `lattice-ds-connector` over the Unix socket
+(`ds_connector_socket`, every `ds_connector_poll_ms`, deadline
+`ds_connector_request_deadline_ms`).  Placement never touches the socket:
+the poll thread validates the batch and publishes an immutable assessment
+view the gate reads.  Keys: see `config-keys.md` ("Connector client
+keys"); the connector is a prerequisite of the mode, so
+`ds_connector_enabled` is derived and an explicit contradiction is a
+config error.
+
+A batch is accepted whole or dropped whole: `contract_version` major must
+be `ds_connector_expected_contract_major`; per connector instance the
+`(epoch, sequence)` line must advance (a replay drops the batch); a
+changed `runtime_epoch` (connector restart) resets every line and every
+binding pin; `generated_at` must not go backwards; `config_digest` must
+equal `ds_connector_expected_config_digest` when that pin is set.  Inside
+an accepted batch every assessment is bound before it is trusted: `scope`
+= `NEW_ALLOCATION`, `access_scope_id` = `ds_connector_access_scope`,
+`endpoint.server` = the registry host, `endpoint.port` = the registry
+port, and the registered export path equals the endpoint's or lies under
+it (`192.168.64.51:/mnt/data/pnfs-ds` inside the share `/mnt/data`);
+`profile.digest` identical across the batch and equal to
+`ds_connector_expected_profile_digest` when set.  The first accepted
+tuple `(instance, binding_generation, datastore_id, target_id,
+target_incarnation, profile digest, access scope)` is pinned per DS; a
+later record must repeat it or carry a higher `binding_generation`
+(rebind: the DS is UNKNOWN for that batch); anything else is
+`BINDING_MISMATCH` and that DS has no record.  Records for unknown DS ids
+are ignored, duplicates inside a batch reject both.
+
+Candidate rule in `smart` (after the capacity gate): a fresh record
+(`received + remaining_ttl_ms` on the MDS clock) with `quality = VALID`,
+`allowed = true` and `multiplier_ppm > 0`; otherwise `NO_BINDING`,
+`ASSESSMENT_UNKNOWN`, `ASSESSMENT_STALE`, `CONNECTOR_DENIED` or
+`ZERO_MULTIPLIER`.  Weight = `domain_weight × multiplier_ppm / 10⁶ / N`,
+where the domain is the connector's `capacity_domain_id` (an operator
+`ds_capacity_domain.<id>` that disagrees is `DOMAIN_MAP_MISMATCH`) and
+`domain_weight` is the fill level, or a manual
+`placement_domain_weight.<domain>` when
+`placement_allow_manual_base_weights = true`.  Without any assessment
+view every DS is `MODE_NOT_READY`; a lost connector never falls back to
+`rr`/`fill` — rows expire on their TTL and the MDS refuses new
+placements (`NFS4ERR_NOSPC`).
+
+Readiness is four facts, reported by `config show` as
+`placement_readiness = mode_active=… connector_config_valid=…
+connector_reachable=… last_batch_valid=… coverage=full|partial|none
+registered_ds=… covered_ds=… eligible_ds=…` (reachable = a successful
+poll within three intervals; coverage counts DS with a fresh VALID
+record).  Partial coverage is a degraded, correct state: the MDS keeps
+placing on the covered DS.  Run `lattice-ds-connector preflight
+--expect-ds 0,1` on the MDS before switching to see the same facts from
+the connector's side.
+
 ## Observability
 
 - Startup line: `placement_mode=<mode> generation=<sha256[:12]>
   kernel=<id> shrink=<allow|strict> max_age_ms=<n> min_free=<n>` (only
   with an explicit mode).
-- `mds-admin config show [--mds-port <grpc_port>]`: `placement_mode`,
-  `placement_mode_effective`, `placement_config_generation`,
-  `placement_kernel_id`, the thresholds, `ds_capacity_domain.<id>` and one
-  `placement_ds.<id> = domain=… state=… capacity_age_ms=… avail=… total=…
-  weight=… reason=…` row per registered DS (`config show placement_ds.<id>`
-  for one row).
+- `mds-admin config show --mds-host <cluster_bind_addr> --mds-port <grpc_port>`
+  (the transport listens on the bind address, not loopback):
+  `placement_mode`, `placement_mode_effective`,
+  `placement_config_generation`, `placement_kernel_id`, the thresholds,
+  `ds_capacity_domain.<id>`, in `smart` `placement_readiness`,
+  `placement_connector_config_digest`, `placement_connector_profile_digest`,
+  `placement_connector_last_detail`, and one `placement_ds.<id> = domain=…
+  state=… capacity_age_ms=… avail=… total=… [assessment_age_ms=… quality=…
+  allowed=… ppm=… ttl_ms=…] weight=… reason=…` row per registered DS
+  (`config show placement_ds.<id>` for one row).
 - Metrics: `pnfs_mds_placement_mode{mode}`,
   `pnfs_mds_placement_eligible_ds`,
   `pnfs_mds_placement_rejections_total{reason}`,
   `pnfs_mds_placement_alias_suspected_total`, plus the upstream
   `pnfs_mds_placement_degraded_total` when a layout shrank.
+- Connector: `pnfs_mds_connector_batches_accepted_total`,
+  `pnfs_mds_connector_batches_dropped_total{reason}`,
+  `pnfs_mds_connector_poll_errors_total{code}`,
+  `pnfs_mds_connector_covered_ds`, `pnfs_mds_connector_reachable`,
+  `pnfs_mds_connector_last_success_mono_ms`.
 - `pnfs_mds_placement_rejections_total{reason}` counts every DS the gate
   rejected at every placement decision (a DS that stays full for an hour
   keeps counting), `pnfs_mds_placement_alias_suspected_total` counts
