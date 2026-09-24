@@ -731,6 +731,18 @@ struct mds_config {
     bool                  placement_allow_manual_base_weights;
     enum placement_shrink placement_stripe_shrink;
     char                  placement_config_generation[65];   /* hex sha256; "" in legacy */
+    /* Connector client (smart).  ds_connector_enabled is derived from the
+     * mode; the *_set flag only serves the contradiction check. */
+    bool                  ds_connector_enabled;
+    bool                  ds_connector_enabled_set;
+    char                  ds_connector_socket[MDS_MAX_PATH];
+    uint32_t              ds_connector_poll_ms;
+    uint32_t              ds_connector_request_deadline_ms;
+    uint32_t              ds_connector_expected_contract_major;
+    uint32_t              ds_connector_max_ds;
+    char                  ds_connector_access_scope[PM_SCOPE_MAX];
+    char                  ds_connector_expected_profile_digest[PM_DIGEST_MAX];
+    char                  ds_connector_expected_config_digest[PM_DIGEST_MAX];
 
     /*
      * Per-DS I/O limit probe interval (milliseconds).  The prober

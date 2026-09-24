@@ -1,0 +1,8 @@
+jsmn -- minimalistic JSON tokenizer, vendored for the placement DS connector
+client (src/mds/ds_connector.c).
+
+Source:  https://github.com/zserge/jsmn
+Commit:  25647e692c7906b96ffd2b05ca54c097948e879c
+Licence: MIT (header kept verbatim in jsmn.h)
+Build:   included once with JSMN_STATIC, JSMN_PARENT_LINKS and JSMN_STRICT
+         defined by the including translation unit.

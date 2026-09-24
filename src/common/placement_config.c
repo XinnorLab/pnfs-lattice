@@ -131,15 +131,48 @@ enum mds_status placement_config_validate(const struct mds_config *cfg,
                 "RANGE: placement_capacity_max_age_ms must exceed ds_capacity_poll_ms");
         }
     }
+    /* ds_connector_enabled is derived from the mode; an explicit value that
+     * contradicts it is a mistake, not a setting (design section 4). */
+    if (cfg->ds_connector_enabled_set) {
+        if (cfg->placement_mode == PM_SMART && !cfg->ds_connector_enabled) {
+            return fail(err, cap,
+                "PLACEMENT_MODE_CONFLICT: smart needs the connector; "
+                "ds_connector_enabled = false contradicts placement_mode");
+        }
+        if (cfg->placement_mode != PM_SMART && cfg->ds_connector_enabled) {
+            return fail(err, cap,
+                "PLACEMENT_MODE_CONFLICT: ds_connector_enabled = true is only "
+                "meaningful with placement_mode = smart");
+        }
+    }
     if (cfg->placement_mode == PM_SMART) {
         if (cfg->default_mirror_count > 1) {
             return fail(err, cap,
                 "MIRROR_COUNT_UNSUPPORTED: smart requires default_mirror_count = 1");
         }
+        if (cfg->ds_connector_poll_ms < PM_CONN_POLL_MS_MIN ||
+            cfg->ds_connector_poll_ms > PM_CONN_POLL_MS_MAX) {
+            return fail(err, cap,
+                "RANGE: ds_connector_poll_ms must be 200..10000");
+        }
+        if (cfg->ds_connector_request_deadline_ms < PM_CONN_DEADLINE_MS_MIN ||
+            cfg->ds_connector_request_deadline_ms > cfg->ds_connector_poll_ms) {
+            return fail(err, cap,
+                "RANGE: ds_connector_request_deadline_ms must be 50..ds_connector_poll_ms");
+        }
+        if (cfg->ds_connector_max_ds == 0 || cfg->ds_connector_max_ds > MDS_MAX_DS_NODES) {
+            return fail(err, cap, "RANGE: ds_connector_max_ds must be 1..256");
+        }
+        if (cfg->ds_connector_expected_contract_major == 0) {
+            return fail(err, cap, "RANGE: ds_connector_expected_contract_major must be >= 1");
+        }
+        if (cfg->ds_connector_socket[0] != '/') {
+            return fail(err, cap, "RANGE: ds_connector_socket must be an absolute path");
+        }
 #ifndef ENABLE_DS_CONNECTOR
         return fail(err, cap,
             "PLACEMENT_MODE_UNSUPPORTED_BUILD: smart needs a binary built "
-            "with ENABLE_DS_CONNECTOR=ON (not yet available in this build)");
+            "with ENABLE_DS_CONNECTOR=ON");
 #endif
     }
     return MDS_OK;
@@ -204,6 +237,16 @@ void placement_config_generation(const struct mds_config *cfg, char out[65])
     }
     APPEND("stripe=%u\n", (unsigned)cfg->default_stripe_count);
     APPEND("mirror=%u\n", (unsigned)cfg->default_mirror_count);
+    if (cfg->placement_mode == PM_SMART) {
+        APPEND("conn_socket=%s\n", cfg->ds_connector_socket);
+        APPEND("conn_poll=%u\n", (unsigned)cfg->ds_connector_poll_ms);
+        APPEND("conn_deadline=%u\n", (unsigned)cfg->ds_connector_request_deadline_ms);
+        APPEND("conn_major=%u\n", (unsigned)cfg->ds_connector_expected_contract_major);
+        APPEND("conn_max_ds=%u\n", (unsigned)cfg->ds_connector_max_ds);
+        APPEND("conn_scope=%s\n", cfg->ds_connector_access_scope);
+        APPEND("conn_profile=%s\n", cfg->ds_connector_expected_profile_digest);
+        APPEND("conn_config=%s\n", cfg->ds_connector_expected_config_digest);
+    }
 #undef APPEND
 
     (void)SHA256((const unsigned char *)buf, off, digest);

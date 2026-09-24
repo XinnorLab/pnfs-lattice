@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   build-test-prove:
-    name: Build, test, prove (ENABLE_WRR=ON, ENABLE_DS_PREALLOC=OFF)
+    name: Build, test, prove (ENABLE_WRR=ON, ENABLE_DS_CONNECTOR=ON, ENABLE_DS_PREALLOC=OFF)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,7 +27,7 @@ jobs:
       - name: Configure
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_TESTS=ON \
-            -DENABLE_EBPF=OFF -DENABLE_WRR=ON -DENABLE_DS_PREALLOC=OFF
+            -DENABLE_EBPF=OFF -DENABLE_WRR=ON -DENABLE_DS_PREALLOC=OFF -DENABLE_DS_CONNECTOR=ON
       - name: Build
         run: cmake --build build -j"$(nproc)"
       - name: Unit and integration tests
@@ -60,5 +60,5 @@ jobs:
       - name: Configure and build the core library
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_TESTS=OFF \
-            -DENABLE_EBPF=OFF -DENABLE_WRR=ON -DENABLE_DS_PREALLOC=ON
+            -DENABLE_EBPF=OFF -DENABLE_WRR=ON -DENABLE_DS_PREALLOC=ON -DENABLE_DS_CONNECTOR=ON
           cmake --build build -j"$(nproc)" --target pnfs_mds_core

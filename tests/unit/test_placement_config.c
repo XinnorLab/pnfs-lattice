@@ -88,11 +88,79 @@ static void test_each_mode_parses_with_defaults(void)
     }
 }
 
-static void test_smart_is_unsupported_in_this_build(void)
+static void test_smart_parses_with_connector_defaults(void)
 {
     struct mds_config cfg; char path[128];
     ASSERT_EQ(write_tmp_ini("placement_mode = smart\n", path), 0);
-    ASSERT_EQ(mds_config_load(path, &cfg), MDS_ERR_INVAL);
+    ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);   /* ENABLE_DS_CONNECTOR build */
+    ASSERT_EQ(cfg.placement_mode, PM_SMART);
+    ASSERT_EQ(cfg.ds_connector_enabled, true);
+    ASSERT_EQ(cfg.ds_connector_enabled_set, false);
+    ASSERT_EQ(strcmp(cfg.ds_connector_socket, "/run/lattice-ds-connector/connector.sock"), 0);
+    ASSERT_EQ(cfg.ds_connector_poll_ms, 1000u);
+    ASSERT_EQ(cfg.ds_connector_request_deadline_ms, 500u);
+    ASSERT_EQ(cfg.ds_connector_expected_contract_major, 1u);
+    ASSERT_EQ(cfg.ds_connector_max_ds, 256u);
+    ASSERT_EQ(strcmp(cfg.ds_connector_access_scope, "cluster-default"), 0);
+    ASSERT_EQ(cfg.ds_connector_expected_profile_digest[0], '\0');
+    ASSERT_EQ(cfg.placement_policy, PLACEMENT_WEIGHTED_RR);
+    ASSERT_EQ(strlen(cfg.placement_config_generation), 64u);
+    /* explicit, consistent values */
+    ASSERT_EQ(write_tmp_ini("placement_mode = smart\nds_connector_enabled = true\nds_connector_socket = /tmp/c.sock\nds_connector_poll_ms = 5000\nds_connector_request_deadline_ms = 4000\nds_connector_max_ds = 8\nds_connector_access_scope = lab\nds_connector_expected_profile_digest = sha256:abc\n", path), 0);
+    ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);
+    ASSERT_EQ(strcmp(cfg.ds_connector_socket, "/tmp/c.sock"), 0);
+    ASSERT_EQ(cfg.ds_connector_poll_ms, 5000u);
+    ASSERT_EQ(cfg.ds_connector_request_deadline_ms, 4000u);
+    ASSERT_EQ(cfg.ds_connector_max_ds, 8u);
+    ASSERT_EQ(strcmp(cfg.ds_connector_access_scope, "lab"), 0);
+    ASSERT_EQ(strcmp(cfg.ds_connector_expected_profile_digest, "sha256:abc"), 0);
+}
+
+static void test_smart_connector_conflicts_and_ranges(void)
+{
+    const char *bad[] = {
+        "placement_mode = smart\nds_connector_enabled = false\n",
+        "placement_mode = rr\nds_connector_enabled = true\n",
+        "placement_mode = fill\nds_connector_enabled = true\n",
+        "placement_mode = smart\ndefault_mirror_count = 2\n",
+        "placement_mode = smart\nds_capacity_poll_ms = 0\n",
+        "placement_mode = smart\nds_connector_poll_ms = 100\n",
+        "placement_mode = smart\nds_connector_poll_ms = 20000\n",
+        "placement_mode = smart\nds_connector_request_deadline_ms = 2000\n",
+        "placement_mode = smart\nds_connector_request_deadline_ms = 10\n",
+        "placement_mode = smart\nds_connector_max_ds = 0\n",
+        "placement_mode = smart\nds_connector_max_ds = 257\n",
+        "placement_mode = smart\nds_connector_expected_contract_major = 0\n",
+        "placement_mode = smart\nds_connector_socket = relative.sock\n",
+        "placement_mode = smart\nds_connector_poll_ms = 1s\n",
+        "placement_mode = smart\nds_connector_access_scope = \n",
+    };
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        struct mds_config cfg; char path[128];
+        ASSERT_EQ(write_tmp_ini(bad[i], path), 0);
+        ASSERT_EQ(mds_config_load(path, &cfg), MDS_ERR_INVAL);
+    }
+    /* rr/fill ignore the connector keys other than the enabled switch */
+    struct mds_config cfg; char path[128];
+    ASSERT_EQ(write_tmp_ini("placement_mode = fill\nds_connector_socket = /tmp/x.sock\nds_connector_enabled = false\n", path), 0);
+    ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);
+    ASSERT_EQ(cfg.ds_connector_enabled, false);
+}
+
+static void test_generation_covers_connector_keys(void)
+{
+    struct mds_config a, b; char path[128];
+    ASSERT_EQ(write_tmp_ini("placement_mode = smart\nds_connector_socket = /run/a.sock\n", path), 0);
+    ASSERT_EQ(mds_config_load(path, &a), MDS_OK);
+    ASSERT_EQ(write_tmp_ini("placement_mode = smart\nds_connector_socket = /run/b.sock\n", path), 0);
+    ASSERT_EQ(mds_config_load(path, &b), MDS_OK);
+    ASSERT_TRUE(strcmp(a.placement_config_generation, b.placement_config_generation) != 0);
+    /* in fill the connector keys are not part of the managed set */
+    ASSERT_EQ(write_tmp_ini("placement_mode = fill\nds_connector_socket = /run/a.sock\n", path), 0);
+    ASSERT_EQ(mds_config_load(path, &a), MDS_OK);
+    ASSERT_EQ(write_tmp_ini("placement_mode = fill\nds_connector_socket = /run/b.sock\n", path), 0);
+    ASSERT_EQ(mds_config_load(path, &b), MDS_OK);
+    ASSERT_EQ(strcmp(a.placement_config_generation, b.placement_config_generation), 0);
 }
 
 static void test_legacy_keys_conflict_with_mode(void)
@@ -251,7 +319,9 @@ int main(void)
     printf("test_placement_config\n");
     RUN_TEST(test_absent_key_is_legacy);
     RUN_TEST(test_each_mode_parses_with_defaults);
-    RUN_TEST(test_smart_is_unsupported_in_this_build);
+    RUN_TEST(test_smart_parses_with_connector_defaults);
+    RUN_TEST(test_smart_connector_conflicts_and_ranges);
+    RUN_TEST(test_generation_covers_connector_keys);
     RUN_TEST(test_legacy_keys_conflict_with_mode);
     RUN_TEST(test_ranges);
     RUN_TEST(test_rr_does_not_need_the_probe);

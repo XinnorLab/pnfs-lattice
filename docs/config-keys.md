@@ -91,6 +91,16 @@ the legacy keys behave exactly as documented above.
 - `placement_domain_weight.<domain>` — manual base weight of a domain (1..10000); smart only, needs the flag above (`DOMAIN_WEIGHT_FORBIDDEN` otherwise).
 - `ds_weight.<id>` is a conflict in `fill` (`PLACEMENT_MODE_CONFLICT`).
 - `fill`/`smart` require `ds_capacity_poll_ms > 0` (`RANGE`).
+Connector client keys (`smart` only; the connector is a prerequisite of the
+mode, `ds_connector_enabled` is derived from it and an explicit
+contradiction is `PLACEMENT_MODE_CONFLICT`):
+- `ds_connector_socket` — absolute path of the per-MDS `lattice-ds-connector` Unix socket.  Default: `/run/lattice-ds-connector/connector.sock`.
+- `ds_connector_poll_ms` — poll interval (200..10000).  Default: 1000.
+- `ds_connector_request_deadline_ms` — connect + read deadline per poll (50..poll).  Default: 500.
+- `ds_connector_expected_contract_major` — accepted `contract_version` major.  Default: 1.
+- `ds_connector_max_ds` — highest accepted `ds_id` count (1..256).  Default: 256.
+- `ds_connector_access_scope` — required `access_scope_id` of every assessment.  Default: `cluster-default`.
+- `ds_connector_expected_profile_digest` / `ds_connector_expected_config_digest` — optional pins; a batch or record with another digest is dropped.
 The daemon logs `placement_mode=<mode> generation=<sha256[:12]> …` at startup; `placement_config_generation` (a SHA-256 of the managed keys) is what `lattice-placement mode verify` compares across MDS.
 ## Authentication
 - `nfs_auth_mode` — `sys|krb5|krb5i|krb5p`.

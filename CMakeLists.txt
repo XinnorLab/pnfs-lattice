@@ -73,6 +73,7 @@ option(ENABLE_LAYOUT_COMMIT_AGGREGATOR "Enable LAYOUTCOMMIT aggregator module (e
 option(ENABLE_DS_GC         "Enable ds_gc module (enterprise-only)" ON)
 option(ENABLE_DS_PREALLOC   "Enable ds_prealloc module (enterprise-only)" OFF)
 option(ENABLE_WRR           "Enable wrr module (enterprise-only)" OFF)
+option(ENABLE_DS_CONNECTOR  "Enable the placement DS connector client (placement_mode = smart)" OFF)
 option(ENABLE_QUOTA         "Enable quota module (enterprise-only)" OFF)
 
 if(ENABLE_RONDB)
@@ -166,6 +167,13 @@ endif()
 # does NOT change the shipped default, and asserts guarding invariants
 # must never be relied on for control flow either way.
 option(ENABLE_RELEASE_ASSERTS "Keep assert() enabled in Release builds" ON)
+
+if(ENABLE_DS_CONNECTOR)
+    add_compile_definitions(ENABLE_DS_CONNECTOR=1)
+    message(STATUS "ds_connector: enabled (placement_mode = smart available)")
+else()
+    message(STATUS "ds_connector: disabled (placement_mode = smart refused at startup)")
+endif()
 
 # Optional codegen opt-ins for measurement runs (both intentionally
 # OFF: neither belongs in a portable default build).

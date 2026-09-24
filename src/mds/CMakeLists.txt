@@ -95,6 +95,7 @@ endif()
 
 target_include_directories(pnfs_mds_core
     PUBLIC ${PROJECT_SOURCE_DIR}/include
+    PRIVATE ${PROJECT_SOURCE_DIR}/deps
     PRIVATE ${PROJECT_SOURCE_DIR}/src/catalogue
 )
 

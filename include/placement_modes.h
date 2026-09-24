@@ -48,6 +48,29 @@ enum placement_shrink {
 #define PM_WEIGHT_SCALE             65536u
 #define PM_MAX_DOMAINS              256   /* == MDS_MAX_DS_NODES; asserted in placement_config.c */
 
+/* Connector client (placement_mode = smart), design section 7. */
+#define PM_KEY_CONN_ENABLED          "ds_connector_enabled"
+#define PM_KEY_CONN_SOCKET           "ds_connector_socket"
+#define PM_KEY_CONN_POLL_MS          "ds_connector_poll_ms"
+#define PM_KEY_CONN_DEADLINE_MS      "ds_connector_request_deadline_ms"
+#define PM_KEY_CONN_CONTRACT_MAJOR   "ds_connector_expected_contract_major"
+#define PM_KEY_CONN_MAX_DS           "ds_connector_max_ds"
+#define PM_KEY_CONN_ACCESS_SCOPE     "ds_connector_access_scope"
+#define PM_KEY_CONN_PROFILE_DIGEST   "ds_connector_expected_profile_digest"
+#define PM_KEY_CONN_CONFIG_DIGEST    "ds_connector_expected_config_digest"
+#define PM_DEFAULT_CONN_SOCKET       "/run/lattice-ds-connector/connector.sock"
+#define PM_DEFAULT_CONN_POLL_MS      1000u
+#define PM_CONN_POLL_MS_MIN          200u
+#define PM_CONN_POLL_MS_MAX          10000u
+#define PM_DEFAULT_CONN_DEADLINE_MS  500u
+#define PM_CONN_DEADLINE_MS_MIN      50u
+#define PM_DEFAULT_CONN_CONTRACT_MAJOR 1u
+#define PM_DEFAULT_CONN_MAX_DS       256u
+#define PM_DEFAULT_CONN_ACCESS_SCOPE "cluster-default"
+#define PM_CONN_SCOPE                "NEW_ALLOCATION"
+#define PM_DIGEST_MAX                128
+#define PM_SCOPE_MAX                 64
+
 /* Bounded reason vocabulary of the gate (metrics labels, logs, config show). */
 enum placement_reason {
     PR_NONE = 0,

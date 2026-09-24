@@ -320,6 +320,14 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
     cfg->placement_mode = PM_LEGACY;
     cfg->placement_capacity_max_age_ms = PM_DEFAULT_CAP_MAX_AGE_MS;
     cfg->placement_stripe_shrink = PM_SHRINK_ALLOW;
+    (void)snprintf(cfg->ds_connector_socket, sizeof(cfg->ds_connector_socket),
+                   "%s", PM_DEFAULT_CONN_SOCKET);
+    cfg->ds_connector_poll_ms = PM_DEFAULT_CONN_POLL_MS;
+    cfg->ds_connector_request_deadline_ms = PM_DEFAULT_CONN_DEADLINE_MS;
+    cfg->ds_connector_expected_contract_major = PM_DEFAULT_CONN_CONTRACT_MAJOR;
+    cfg->ds_connector_max_ds = PM_DEFAULT_CONN_MAX_DS;
+    (void)snprintf(cfg->ds_connector_access_scope, sizeof(cfg->ds_connector_access_scope),
+                   "%s", PM_DEFAULT_CONN_ACCESS_SCOPE);
 
     /* Per-DS I/O limit (FSINFO) probe interval (ms).  60s by
      * default; 0 disables and restores the legacy 1 MiB wire
@@ -1383,6 +1391,63 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
         } else if (strcmp(key, PM_KEY_ALLOW_MANUAL) == 0) {
             cfg->placement_allow_manual_base_weights =
                 (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+        } else if (strcmp(key, PM_KEY_CONN_ENABLED) == 0) {
+            cfg->ds_connector_enabled =
+                (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+            cfg->ds_connector_enabled_set = true;
+        } else if (strcmp(key, PM_KEY_CONN_SOCKET) == 0) {
+            if (val[0] != '/' || strlen(val) >= sizeof(cfg->ds_connector_socket)) {
+                (void)fprintf(stderr,
+                    "ERROR: %s must be an absolute path shorter than %zu\n",
+                    key, sizeof(cfg->ds_connector_socket));
+                (void)fclose(fp);
+                return MDS_ERR_INVAL;
+            }
+            (void)snprintf(cfg->ds_connector_socket, sizeof(cfg->ds_connector_socket),
+                           "%s", val);
+        } else if (strcmp(key, PM_KEY_CONN_POLL_MS) == 0 ||
+                   strcmp(key, PM_KEY_CONN_DEADLINE_MS) == 0 ||
+                   strcmp(key, PM_KEY_CONN_CONTRACT_MAJOR) == 0 ||
+                   strcmp(key, PM_KEY_CONN_MAX_DS) == 0) {
+            uint64_t v = 0;
+            if (!parse_u64_strict(val, &v) || v > UINT32_MAX) {
+                (void)fprintf(stderr,
+                    "ERROR: %s='%s' is not a non-negative integer\n", key, val);
+                (void)fclose(fp);
+                return MDS_ERR_INVAL;
+            }
+            if (strcmp(key, PM_KEY_CONN_POLL_MS) == 0) {
+                cfg->ds_connector_poll_ms = (uint32_t)v;
+            } else if (strcmp(key, PM_KEY_CONN_DEADLINE_MS) == 0) {
+                cfg->ds_connector_request_deadline_ms = (uint32_t)v;
+            } else if (strcmp(key, PM_KEY_CONN_CONTRACT_MAJOR) == 0) {
+                cfg->ds_connector_expected_contract_major = (uint32_t)v;
+            } else {
+                cfg->ds_connector_max_ds = (uint32_t)v;
+            }
+        } else if (strcmp(key, PM_KEY_CONN_ACCESS_SCOPE) == 0 ||
+                   strcmp(key, PM_KEY_CONN_PROFILE_DIGEST) == 0 ||
+                   strcmp(key, PM_KEY_CONN_CONFIG_DIGEST) == 0) {
+            char *dst;
+            size_t dcap;
+            if (strcmp(key, PM_KEY_CONN_ACCESS_SCOPE) == 0) {
+                dst = cfg->ds_connector_access_scope;
+                dcap = sizeof(cfg->ds_connector_access_scope);
+            } else if (strcmp(key, PM_KEY_CONN_PROFILE_DIGEST) == 0) {
+                dst = cfg->ds_connector_expected_profile_digest;
+                dcap = sizeof(cfg->ds_connector_expected_profile_digest);
+            } else {
+                dst = cfg->ds_connector_expected_config_digest;
+                dcap = sizeof(cfg->ds_connector_expected_config_digest);
+            }
+            if (val[0] == '\0' || strlen(val) >= dcap) {
+                (void)fprintf(stderr,
+                    "ERROR: %s must be a non-empty string shorter than %zu\n",
+                    key, dcap);
+                (void)fclose(fp);
+                return MDS_ERR_INVAL;
+            }
+            (void)snprintf(dst, dcap, "%s", val);
         } else if (strcmp(key, PM_KEY_SHRINK) == 0) {
             if (strcmp(val, "allow") == 0) {
                 cfg->placement_stripe_shrink = PM_SHRINK_ALLOW;
@@ -1630,6 +1695,8 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
         cfg->placement_policy_enabled = true;
         cfg->placement_policy = (cfg->placement_mode == PM_RR)
             ? PLACEMENT_RR : PLACEMENT_WEIGHTED_RR;
+        /* The connector is a prerequisite of smart, not a separate switch. */
+        cfg->ds_connector_enabled = (cfg->placement_mode == PM_SMART);
         placement_config_generation(cfg, cfg->placement_config_generation);
     }
 
