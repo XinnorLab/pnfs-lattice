@@ -966,10 +966,12 @@ int placement_gate_init(const struct mds_config *cfg, struct ds_cache *cache)
     placement_gate_publish_capacity();
     MDS_LOG_INFO(LOG_COMP_FSAL,
         "placement_mode=%s generation=%.12s kernel=%08x shrink=%s "
-        "max_age_ms=%u min_free=%llu",
+        "max_age_ms=%u min_free=%llu connector=%s poll_ms=%u",
         placement_mode_name(g.mode), g.generation,
         (unsigned)mds_wrr_kernel_id(), placement_shrink_name(g.shrink),
-        (unsigned)g.max_age_ms, (unsigned long long)g.min_free);
+        (unsigned)g.max_age_ms, (unsigned long long)g.min_free,
+        (g.mode == PM_SMART) ? cfg->ds_connector_socket : "off",
+        (g.mode == PM_SMART) ? (unsigned)g.poll_ms : 0u);
     return 0;
 }
 

@@ -48,6 +48,7 @@
 #include "ds_cache.h"
 #include "ds_capacity.h"
 #include "placement_gate.h"
+#include "ds_connector.h"
 #include "ds_io_limits.h"
 #include "inode_cache.h"
 #include "parent_touch.h"
@@ -1066,6 +1067,17 @@ if (s_pt != NULL) {
 				"placement gate init failed (placement_mode=%s); "
 				"refusing to start",
 				placement_mode_name(cfg.placement_mode));
+			exit_code = EXIT_FAILURE;
+			goto cleanup;
+		}
+		/* smart: the per-MDS connector client feeds the gate.  Every
+		 * DS is UNKNOWN until its first fresh assessment; a missing
+		 * socket is a readiness fact, never a fallback (MODE-10). */
+		if (cfg.placement_mode == PM_SMART &&
+		    ds_connector_start(&cfg, ds_cache) != 0) {
+			MDS_LOG_ERROR(LOG_COMP_MDS,
+				"ds_connector_start failed (socket %s); refusing to start",
+				cfg.ds_connector_socket);
 			exit_code = EXIT_FAILURE;
 			goto cleanup;
 		}
@@ -2231,6 +2243,8 @@ cleanup:
 	 * writes into.  ds_capacity_stop joins the worker thread. */
 	ds_capacity_stop(ds_cap);
 	ds_cap = NULL;
+	/* Stop the connector poller before the gate it publishes into. */
+	ds_connector_stop();
 	placement_gate_destroy();
 	session_table_destroy(session_tbl);
 	open_state_table_destroy(ot);

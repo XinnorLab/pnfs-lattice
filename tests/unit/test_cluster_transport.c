@@ -1919,6 +1919,25 @@ static void test_config_show_placement_rows(void)
     ASSERT_TRUE(text != NULL && strncmp(text, "placement_ds.1 = ", 17) == 0);
     free(text);
 
+    /* smart: the readiness facts and the assessment columns appear */
+    placement_gate_destroy();
+    cfg.placement_mode = PM_SMART;
+    cfg.ds_connector_poll_ms = 1000;
+    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
+    {
+        struct ds_capacity_obs half = { 1000, 500, 9, ds_cache_mono_ms(), 0 };
+        ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &half), 0);
+    }
+    placement_gate_publish_capacity();
+    text = NULL;
+    st = cluster_transport_request_config_show("127.0.0.1", port, NULL, &text);
+    ASSERT_EQ(st, MDS_OK);
+    ASSERT_TRUE(text != NULL);
+    ASSERT_TRUE(strstr(text, "placement_readiness = mode_active=1 connector_config_valid=0 connector_reachable=0 last_batch_valid=0 coverage=none registered_ds=1 covered_ds=0 eligible_ds=0\n") != NULL);
+    ASSERT_TRUE(strstr(text, "placement_ds.1 = domain=xi/fs-1 state=ONLINE capacity_age_ms=") != NULL);
+    ASSERT_TRUE(strstr(text, "assessment_age_ms=none quality=NONE allowed=0 ppm=0 ttl_ms=0 weight=0 reason=MODE_NOT_READY\n") != NULL);
+    free(text);
+
     cluster_transport_server_stop(srv);
     placement_gate_destroy();
     ds_cache_destroy(cache);

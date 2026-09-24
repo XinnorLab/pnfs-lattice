@@ -923,6 +923,57 @@ static void test_singleton_publishes_capacity_from_cache(void)
     mds_catalogue_close(cat);
 }
 
+static void test_singleton_smart_init_and_readiness(void)
+{
+    struct mds_config cfg = fill_cfg();
+    cfg.placement_mode = PM_SMART;
+    cfg.ds_connector_poll_ms = 1000;
+    ASSERT_EQ(placement_gate_init(&cfg, NULL), -1);          /* smart needs the cache */
+    struct mds_catalogue *cat = NULL;
+    struct ds_cache *cache = cache_with_ds(&cat, 0);
+    ASSERT_TRUE(cache != NULL);
+    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
+    ASSERT_EQ(placement_gate_mode(), PM_SMART);
+    struct placement_readiness r;
+    placement_gate_readiness(&r);
+    ASSERT_EQ(r.mode_active, true);
+    ASSERT_EQ(r.connector_config_valid, false);
+    ASSERT_EQ(r.connector_reachable, false);
+    ASSERT_EQ(r.registered_ds, 1u);
+    ASSERT_EQ(r.covered_ds, 0u);
+    ASSERT_EQ(strcmp(r.coverage, "none"), 0);
+    /* no assessments published: every candidate check is NOT_READY */
+    struct mds_ds_info ds[1]; mk_ds(&ds[0], 0, DS_ONLINE, "ds-host");
+    struct ds_capacity_obs half = { 1000, 500, 1, ds_cache_mono_ms(), 0 };
+    ASSERT_EQ(ds_cache_set_capacity_obs(cache, 0, &half), 0);
+    placement_gate_publish_capacity();
+    struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why;
+    ASSERT_EQ(placement_select_gated(true, PLACEMENT_WEIGHTED_RR, ds, 1, &sc, 1, 65536, 0, &e, &why), MDS_ERR_NOSPC);
+    ASSERT_EQ(why, PR_MODE_NOT_READY);
+    /* a published view with a fresh VALID row makes the DS eligible */
+    struct placement_assessment_view v; memset(&v, 0, sizeof(v));
+    v.count = 1; v.batch_valid = true;
+    v.rows[0].ds_id = 0; v.rows[0].present = true; v.rows[0].valid = true; v.rows[0].allowed = true;
+    v.rows[0].multiplier_ppm = 1000000; v.rows[0].received_mono_ms = ds_cache_mono_ms();
+    v.rows[0].expires_mono_ms = ds_cache_mono_ms() + 15000;
+    placement_gate_publish_assessments(&v);
+    placement_gate_readiness(&r);
+    ASSERT_EQ(r.covered_ds, 1u);
+    ASSERT_EQ(r.eligible_ds, 1u);
+    ASSERT_EQ(strcmp(r.coverage, "full"), 0);
+    ASSERT_EQ(placement_select_gated(true, PLACEMENT_WEIGHTED_RR, ds, 1, &sc, 1, 65536, 0, &e, &why), MDS_OK);
+    ASSERT_EQ(e.ds_id, 0u);
+    struct placement_ds_status st;
+    ASSERT_EQ(placement_gate_ds_status(0, &st), true);
+    ASSERT_EQ(st.assessed, true);
+    ASSERT_EQ(st.assessment_valid, true);
+    ASSERT_EQ(st.assessment_ppm, 1000000u);
+    ASSERT_TRUE(st.assessment_ttl_ms > 10000);
+    placement_gate_destroy();
+    ds_cache_destroy(cache);
+    mds_catalogue_close(cat);
+}
+
 static void test_select_gated_legacy_path(void)
 {
     struct mds_ds_info ds[2];
@@ -1034,6 +1085,7 @@ int main(void)
     RUN_TEST(test_singleton_fill_needs_cache_and_kernel);
     RUN_TEST(test_singleton_rr_needs_no_cache);
     RUN_TEST(test_singleton_publishes_capacity_from_cache);
+    RUN_TEST(test_singleton_smart_init_and_readiness);
     RUN_TEST(test_select_gated_legacy_path);
     RUN_TEST(test_select_gated_legacy_rr_at2_branch);
     RUN_TEST(test_registry_view_drives_n_and_aliases_with_a_filtered_list);
