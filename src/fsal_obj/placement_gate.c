@@ -21,7 +21,7 @@
 #include "mds_log.h"
 #include "wrr.h"
 
-_Static_assert(PR_COUNT <= 16, "placement_rejections_total[16] must hold every reason");
+_Static_assert(PR_COUNT <= 32, "placement_rejections_total[32] must hold every reason");
 
 /* -----------------------------------------------------------------------
  * Weight
@@ -117,8 +117,43 @@ static bool row_fresh(const struct placement_ctx *ctx,
 struct row_scratch {
     char domain[PM_DOMAIN_ID_MAX];
     bool declared;
-    bool observed;   /* has an fsid and a total: usable for alias checks */
+    bool observed;       /* has an fsid and a total: usable for alias checks */
+    bool map_mismatch;   /* smart: operator map disagrees with the connector */
 };
+
+static const struct placement_assessment_row *
+assess_row(const struct placement_assessment_view *v, uint32_t ds_id)
+{
+    uint32_t i;
+
+    if (v == NULL) {
+        return NULL;
+    }
+    for (i = 0; i < v->count; i++) {
+        if (v->rows[i].ds_id == ds_id) {
+            return &v->rows[i];
+        }
+    }
+    return NULL;
+}
+
+/* Manual base weight for a domain (smart, placement_allow_manual_base_weights). */
+static bool manual_domain_weight(const struct placement_ctx *ctx, const char *domain,
+                                 uint32_t *out)
+{
+    uint32_t i;
+
+    if (ctx->domain_weight_id == NULL || ctx->domain_weight == NULL) {
+        return false;
+    }
+    for (i = 0; i < ctx->domain_weight_count; i++) {
+        if (strcmp(ctx->domain_weight_id[i], domain) == 0) {
+            *out = ctx->domain_weight[i];
+            return true;
+        }
+    }
+    return false;
+}
 
 static uint32_t domain_weight_of(uint64_t avail, uint64_t total)
 {
@@ -178,6 +213,22 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
         rs[j].declared = declared_domain(ctx, cap->rows[j].ds_id);
         rs[j].observed = (cap->rows[j].obs.observed_mono_ms != 0 &&
                           cap->rows[j].obs.total_bytes != 0);
+        rs[j].map_mismatch = false;
+        if (ctx->mode == PM_SMART) {
+            /* The connector knows the filesystem: its capacity_domain_id is
+             * the domain; an operator map that disagrees is a mismatch
+             * (design section 4).  No connector domain -> the DS's own. */
+            const struct placement_assessment_row *ar =
+                assess_row(ctx->assess, cap->rows[j].ds_id);
+
+            if (ar != NULL && ar->present && ar->domain[0] != '\0') {
+                if (rs[j].declared && strcmp(rs[j].domain, ar->domain) != 0) {
+                    rs[j].map_mismatch = true;
+                }
+                (void)snprintf(rs[j].domain, PM_DOMAIN_ID_MAX, "%s", ar->domain);
+                rs[j].declared = true;   /* a connector domain counts as declared */
+            }
+        }
     }
 
     for (i = 0; i < n; i++) {
@@ -192,6 +243,7 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
         uint64_t avail;
         uint64_t total;
         uint32_t domain_weight;
+        uint32_t ppm;
         uint64_t weight;
         bool ovf = false;
 
@@ -246,6 +298,10 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
             count_reason(why, PR_SHARED_FS_ALIAS_UNMAPPED);
             continue;
         }
+        if (rs[r_i].map_mismatch) {
+            count_reason(why, PR_DOMAIN_MAP_MISMATCH);
+            continue;
+        }
 
         /* Domain aggregation over ALL registered members (any state): N,
          * the canonical (lowest id, fresh) observation, the conservative
@@ -288,7 +344,37 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
             continue;
         }
         domain_weight = domain_weight_of(avail, total);
-        weight = placement_weight(domain_weight, 1000000u, n_aliases, &ovf);
+        ppm = 1000000u;
+        if (ctx->mode == PM_SMART) {
+            const struct placement_assessment_row *ar = assess_row(ctx->assess, ds_list[i].ds_id);
+            uint32_t manual = 0;
+
+            if (ar == NULL || !ar->present) {
+                count_reason(why, PR_NO_BINDING);
+                continue;
+            }
+            if (!ar->valid) {
+                count_reason(why, PR_ASSESSMENT_UNKNOWN);
+                continue;
+            }
+            if (ctx->now_mono_ms >= ar->expires_mono_ms) {
+                count_reason(why, PR_ASSESSMENT_STALE);
+                continue;
+            }
+            if (!ar->allowed) {
+                count_reason(why, PR_CONNECTOR_DENIED);
+                continue;
+            }
+            if (ar->multiplier_ppm == 0) {
+                count_reason(why, PR_ZERO_MULTIPLIER);
+                continue;
+            }
+            ppm = ar->multiplier_ppm;
+            if (manual_domain_weight(ctx, rs[r_i].domain, &manual)) {
+                domain_weight = manual;
+            }
+        }
+        weight = placement_weight(domain_weight, ppm, n_aliases, &ovf);
         if (weight == 0 || ovf) {
             count_reason(why, PR_WEIGHT_OVERFLOW);
             continue;
@@ -1108,6 +1194,7 @@ bool placement_gate_ds_status(uint32_t ds_id, struct placement_ds_status *out)
     }
     memset(out, 0, sizeof(*out));
     out->capacity_age_ms = UINT64_MAX;
+    out->assessment_age_ms = UINT64_MAX;
     out->reason = PR_DS_OFFLINE;
     placement_gate_ctx(&ctx, ds_cache_mono_ms());
     ref = (struct cap_view_ref *)ctx.view_ref;
@@ -1136,6 +1223,27 @@ bool placement_gate_ds_status(uint32_t ds_id, struct placement_ds_status *out)
         return false;
     }
     domain_for(&ctx, ds_id, out->domain);
+    if (ctx.mode == PM_SMART) {
+        const struct placement_assessment_row *ar = assess_row(ctx.assess, ds_id);
+
+        if (ar != NULL && ar->present) {
+            out->assessed = true;
+            out->assessment_valid = ar->valid;
+            out->assessment_allowed = ar->allowed;
+            out->assessment_ppm = ar->multiplier_ppm;
+            if (ctx.now_mono_ms >= ar->received_mono_ms) {
+                out->assessment_age_ms = ctx.now_mono_ms - ar->received_mono_ms;
+            }
+            out->assessment_ttl_ms = (ctx.now_mono_ms < ar->expires_mono_ms)
+                ? ar->expires_mono_ms - ctx.now_mono_ms : 0;
+            if (ar->reason_count > 0) {
+                memcpy(out->assessment_reason, ar->reasons[0], PA_REASON_LEN);
+            }
+            if (ar->domain[0] != '\0') {
+                (void)snprintf(out->domain, PM_DOMAIN_ID_MAX, "%s", ar->domain);
+            }
+        }
+    }
     cands = calloc(ref->n_infos, sizeof(*cands));
     if (cands != NULL) {
         n_c = placement_candidates(&ctx, ref->infos, ref->n_infos, cands, NULL);

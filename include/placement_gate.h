@@ -203,6 +203,14 @@ struct placement_ds_status {
     uint64_t total_bytes;
     uint64_t weight;            /* 0 when not a candidate */
     enum placement_reason reason;
+    /* smart */
+    bool     assessed;          /* a record exists */
+    bool     assessment_valid;
+    bool     assessment_allowed;
+    uint32_t assessment_ppm;
+    uint64_t assessment_age_ms; /* UINT64_MAX when none */
+    uint64_t assessment_ttl_ms; /* remaining, 0 when expired/none */
+    char     assessment_reason[PA_REASON_LEN];
 };
 
 /* DS ids in the published view (0 in rr/legacy or before the first publish). */

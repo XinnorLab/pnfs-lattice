@@ -589,6 +589,174 @@ static void test_admit_counts_per_ds_reasons(void)
     ASSERT_EQ(atomic_load(&g_branch_metrics.placement_rejections_total[PR_CAPACITY_STALE]), stale_before + 1);
 }
 
+/* -----------------------------------------------------------------------
+ * smart (Stage B): assessment view, connector domains, manual weights
+ * ----------------------------------------------------------------------- */
+
+static struct placement_assessment_view A;
+static char DWID[PM_MAX_DOMAINS][PM_DOMAIN_ID_MAX];
+static uint32_t DW[PM_MAX_DOMAINS];
+
+static void add_assess(uint32_t id, bool valid, bool allowed, uint32_t ppm, uint64_t ttl_ms,
+                       const char *domain)
+{
+    struct placement_assessment_row *r = &A.rows[A.count++];
+    memset(r, 0, sizeof(*r));
+    r->ds_id = id;
+    r->present = true;
+    r->valid = valid;
+    r->allowed = allowed;
+    r->multiplier_ppm = ppm;
+    r->received_mono_ms = 1000000 - 1000;
+    r->expires_mono_ms = 1000000 - 1000 + ttl_ms;
+    if (domain != NULL) snprintf(r->domain, PM_DOMAIN_ID_MAX, "%s", domain);
+    A.batch_valid = true;
+}
+
+static struct placement_ctx smart_ctx(void)
+{
+    struct placement_ctx c = ctx_for(PM_SMART);
+    c.assess = &A;
+    return c;
+}
+
+static void reset_smart(void)
+{
+    reset();
+    memset(&A, 0, sizeof(A));
+    memset(DWID, 0, sizeof(DWID));
+    memset(DW, 0, sizeof(DW));
+}
+
+static void test_smart_healthy_row_is_a_candidate(void)
+{
+    struct mds_ds_info ds[1];
+    reset_smart();
+    mk_ds(&ds[0], 0, DS_ONLINE, "h");
+    add_row(0, "h", 1000, 500, 1, 1000000);
+    add_assess(0, true, true, 1000000, 15000, NULL);
+    struct placement_ctx c = smart_ctx();
+    struct placement_candidate out[1];
+    ASSERT_EQ(placement_candidates(&c, ds, 1, out, NULL), 1u);
+    ASSERT_TRUE(out[0].weight == placement_weight(50, 1000000, 1, NULL));
+    A.rows[0].multiplier_ppm = 250000;
+    ASSERT_EQ(placement_candidates(&c, ds, 1, out, NULL), 1u);
+    ASSERT_TRUE(out[0].weight == placement_weight(50, 250000, 1, NULL));
+}
+
+static void test_smart_reasons(void)
+{
+    struct mds_ds_info ds[5];
+    reset_smart();
+    for (uint32_t i = 0; i < 5; i++) { mk_ds(&ds[i], i, DS_ONLINE, "h"); add_row(i, "h", 1000, 500, 10 + i, 1000000); }
+    /* ds0: no record; ds1: UNKNOWN; ds2: expired; ds3: denied; ds4: ppm 0 */
+    add_assess(1, false, true, 1000000, 15000, NULL);
+    add_assess(2, true, true, 1000000, 500, NULL);      /* received at -1000, ttl 500 -> expired */
+    add_assess(3, true, false, 1000000, 15000, NULL);
+    add_assess(4, true, true, 0, 15000, NULL);
+    struct placement_ctx c = smart_ctx();
+    struct placement_candidate out[5]; struct placement_reject_counts why;
+    ASSERT_EQ(placement_candidates(&c, ds, 5, out, &why), 0u);
+    ASSERT_EQ(why.by_reason[PR_NO_BINDING], 1u);
+    ASSERT_EQ(why.by_reason[PR_ASSESSMENT_UNKNOWN], 1u);
+    ASSERT_EQ(why.by_reason[PR_ASSESSMENT_STALE], 1u);
+    ASSERT_EQ(why.by_reason[PR_CONNECTOR_DENIED], 1u);
+    ASSERT_EQ(why.by_reason[PR_ZERO_MULTIPLIER], 1u);
+    /* capacity comes first: a full domain is CAPACITY_FULL even with a fine assessment */
+    reset_smart();
+    mk_ds(&ds[0], 0, DS_ONLINE, "h");
+    add_row(0, "h", 1000, 0, 1, 1000000);
+    add_assess(0, true, true, 1000000, 15000, NULL);
+    ASSERT_EQ(placement_candidates(&c, ds, 1, out, &why), 0u);
+    ASSERT_EQ(why.by_reason[PR_CAPACITY_FULL], 1u);
+    /* per-DS verdict agrees */
+    enum placement_reason r;
+    ASSERT_EQ(placement_ds_admitted(&c, ds, 1, 0, &r), false);
+    ASSERT_EQ(r, PR_CAPACITY_FULL);
+}
+
+static void test_smart_without_view_is_not_ready(void)
+{
+    struct mds_ds_info ds[1];
+    reset_smart();
+    mk_ds(&ds[0], 0, DS_ONLINE, "h");
+    add_row(0, "h", 1000, 500, 1, 1000000);
+    struct placement_ctx c = smart_ctx();
+    c.assess = NULL;
+    struct placement_candidate out[1]; struct placement_reject_counts why;
+    ASSERT_EQ(placement_candidates(&c, ds, 1, out, &why), 0u);
+    ASSERT_EQ(why.by_reason[PR_MODE_NOT_READY], 1u);
+}
+
+static void test_smart_degraded_ppm_is_picked_less(void)
+{
+    struct mds_ds_info ds[2];
+    reset_smart();
+    mk_ds(&ds[0], 0, DS_ONLINE, "a"); mk_ds(&ds[1], 1, DS_ONLINE, "b");
+    add_row(0, "a", 1000, 500, 1, 1000000); add_row(1, "b", 1000, 500, 2, 1000000);
+    add_assess(0, true, true, 1000000, 15000, NULL);
+    add_assess(1, true, true, 250000, 15000, NULL);
+    struct placement_ctx c = smart_ctx();
+    mds_wrr_test_seed(777);
+    uint32_t hits1 = 0;
+    for (int i = 0; i < 100000; i++) {
+        struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why;
+        ASSERT_EQ(placement_admit(&c, ds, 2, &sc, 1, 0, &e, &why), MDS_OK);
+        if (e.ds_id == 1) hits1++;
+    }
+    ASSERT_TRUE(hits1 > 18000 && hits1 < 22000);   /* 1 : 4 */
+}
+
+static void test_smart_connector_domain_and_map_mismatch(void)
+{
+    struct mds_ds_info ds[3];
+    reset_smart();
+    for (uint32_t i = 0; i < 3; i++) { mk_ds(&ds[i], i, DS_ONLINE, "xi"); add_row(i, "xi", 1000, 800, 7 + (i == 2), 1000000); }
+    /* the connector says ds0 and ds1 share filesystem fs-1 */
+    add_assess(0, true, true, 1000000, 15000, "ctrl/fs-1");
+    add_assess(1, true, true, 1000000, 15000, "ctrl/fs-1");
+    add_assess(2, true, true, 1000000, 15000, "ctrl/fs-2");
+    struct placement_ctx c = smart_ctx();
+    struct placement_candidate out[3]; struct placement_reject_counts why;
+    ASSERT_EQ(placement_candidates(&c, ds, 3, out, &why), 3u);
+    ASSERT_TRUE(out[0].weight == placement_weight(80, 1000000, 2, NULL));
+    ASSERT_TRUE(out[2].weight == placement_weight(80, 1000000, 1, NULL));
+    ASSERT_EQ(strcmp(out[0].domain, "ctrl/fs-1"), 0);
+    /* an operator map that agrees is fine; one that disagrees excludes the DS */
+    snprintf(DOM[0], PM_DOMAIN_ID_MAX, "ctrl/fs-1");
+    snprintf(DOM[1], PM_DOMAIN_ID_MAX, "ctrl/fs-1");
+    ASSERT_EQ(placement_candidates(&c, ds, 3, out, &why), 3u);
+    snprintf(DOM[1], PM_DOMAIN_ID_MAX, "somewhere-else");
+    ASSERT_EQ(placement_candidates(&c, ds, 3, out, &why), 2u);
+    ASSERT_EQ(why.by_reason[PR_DOMAIN_MAP_MISMATCH], 1u);
+    ASSERT_TRUE(out[0].weight == placement_weight(80, 1000000, 2, NULL));   /* N still counts the alias */
+}
+
+static void test_smart_manual_base_weight(void)
+{
+    struct mds_ds_info ds[2];
+    reset_smart();
+    mk_ds(&ds[0], 0, DS_ONLINE, "a"); mk_ds(&ds[1], 1, DS_ONLINE, "b");
+    add_row(0, "a", 1000, 500, 1, 1000000); add_row(1, "b", 1000, 500, 2, 1000000);
+    add_assess(0, true, true, 1000000, 15000, "d-a");
+    add_assess(1, true, true, 1000000, 15000, "d-b");
+    snprintf(DWID[0], PM_DOMAIN_ID_MAX, "d-a"); DW[0] = 300;
+    struct placement_ctx c = smart_ctx();
+    struct placement_candidate out[2];
+    ASSERT_EQ(placement_candidates(&c, ds, 2, out, NULL), 2u);
+    ASSERT_TRUE(out[0].weight == placement_weight(50, 1000000, 1, NULL));   /* no manual weights in the ctx */
+    c.domain_weight_id = (const char (*)[PM_DOMAIN_ID_MAX])DWID;
+    c.domain_weight = DW;
+    c.domain_weight_count = 1;
+    ASSERT_EQ(placement_candidates(&c, ds, 2, out, NULL), 2u);
+    ASSERT_TRUE(out[0].weight == placement_weight(300, 1000000, 1, NULL));
+    ASSERT_TRUE(out[1].weight == placement_weight(50, 1000000, 1, NULL));
+    /* fill ignores manual weights (config forbids them anyway) */
+    c.mode = PM_FILL;
+    ASSERT_EQ(placement_candidates(&c, ds, 2, out, NULL), 2u);
+    ASSERT_TRUE(out[0].weight == placement_weight(50, 1000000, 1, NULL));
+}
+
 static void test_reason_names_are_bounded(void)
 {
     for (int r = 0; r < PR_COUNT; r++) {
@@ -871,6 +1039,12 @@ int main(void)
     RUN_TEST(test_registry_view_drives_n_and_aliases_with_a_filtered_list);
     RUN_TEST(test_ds_admitted_reason_uses_domain_level_verdict);
     RUN_TEST(test_admit_counts_per_ds_reasons);
+    RUN_TEST(test_smart_healthy_row_is_a_candidate);
+    RUN_TEST(test_smart_reasons);
+    RUN_TEST(test_smart_without_view_is_not_ready);
+    RUN_TEST(test_smart_degraded_ppm_is_picked_less);
+    RUN_TEST(test_smart_connector_domain_and_map_mismatch);
+    RUN_TEST(test_smart_manual_base_weight);
     RUN_TEST(test_select_gated_fill_path_uses_the_gate);
     RUN_TEST(test_rr_is_cyclic_over_the_gated_list);
     RUN_TEST(test_rr_ignores_capacity);

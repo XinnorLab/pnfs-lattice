@@ -6675,6 +6675,25 @@ static void render_cfg_placement(const struct mds_config *cfg,
             }
         }
     }
+    if (placement_gate_mode() == PM_SMART) {
+        struct placement_readiness rd;
+
+        placement_gate_readiness(&rd);
+        RENDER_KEY("placement_readiness",
+                   "mode_active=%d connector_config_valid=%d connector_reachable=%d "
+                   "last_batch_valid=%d coverage=%s registered_ds=%u covered_ds=%u "
+                   "eligible_ds=%u",
+                   rd.mode_active ? 1 : 0, rd.connector_config_valid ? 1 : 0,
+                   rd.connector_reachable ? 1 : 0, rd.last_batch_valid ? 1 : 0,
+                   rd.coverage, (unsigned)rd.registered_ds,
+                   (unsigned)rd.covered_ds, (unsigned)rd.eligible_ds);
+        RENDER_KEY("placement_connector_config_digest", "%s",
+                   rd.config_digest[0] != '\0' ? rd.config_digest : "-");
+        RENDER_KEY("placement_connector_profile_digest", "%s",
+                   rd.profile_digest[0] != '\0' ? rd.profile_digest : "-");
+        RENDER_KEY("placement_connector_last_detail", "%s",
+                   rd.last_detail[0] != '\0' ? rd.last_detail : "-");
+    }
     {
         uint32_t ids[MDS_MAX_DS_NODES];
         uint32_t n = placement_gate_ds_ids(ids, MDS_MAX_DS_NODES);
@@ -6682,6 +6701,7 @@ static void render_cfg_placement(const struct mds_config *cfg,
             struct placement_ds_status ps;
             char keybuf[40];
             char age[24];
+            char aage[24];
 
             if (!placement_gate_ds_status(ids[i], &ps)) {
                 continue;
@@ -6692,18 +6712,43 @@ static void render_cfg_placement(const struct mds_config *cfg,
                 (void)snprintf(age, sizeof(age), "%llu",
                                (unsigned long long)ps.capacity_age_ms);
             }
+            if (ps.assessment_age_ms == UINT64_MAX) {
+                (void)snprintf(aage, sizeof(aage), "none");
+            } else {
+                (void)snprintf(aage, sizeof(aage), "%llu",
+                               (unsigned long long)ps.assessment_age_ms);
+            }
             (void)snprintf(keybuf, sizeof(keybuf), "placement_ds.%u",
                            (unsigned)ids[i]);
-            RENDER_KEY(keybuf,
-                       "domain=%s state=%s capacity_age_ms=%s avail=%llu "
-                       "total=%llu weight=%llu reason=%s",
-                       ps.domain,
-                       (ps.state == DS_ONLINE) ? "ONLINE" : "OFFLINE",
-                       age,
-                       (unsigned long long)ps.avail_bytes,
-                       (unsigned long long)ps.total_bytes,
-                       (unsigned long long)ps.weight,
-                       placement_reason_name(ps.reason));
+            if (placement_gate_mode() == PM_SMART) {
+                RENDER_KEY(keybuf,
+                           "domain=%s state=%s capacity_age_ms=%s avail=%llu "
+                           "total=%llu assessment_age_ms=%s quality=%s allowed=%d "
+                           "ppm=%u ttl_ms=%llu weight=%llu reason=%s",
+                           ps.domain,
+                           (ps.state == DS_ONLINE) ? "ONLINE" : "OFFLINE",
+                           age,
+                           (unsigned long long)ps.avail_bytes,
+                           (unsigned long long)ps.total_bytes,
+                           aage,
+                           !ps.assessed ? "NONE" : (ps.assessment_valid ? "VALID" : "UNKNOWN"),
+                           ps.assessment_allowed ? 1 : 0,
+                           (unsigned)ps.assessment_ppm,
+                           (unsigned long long)ps.assessment_ttl_ms,
+                           (unsigned long long)ps.weight,
+                           placement_reason_name(ps.reason));
+            } else {
+                RENDER_KEY(keybuf,
+                           "domain=%s state=%s capacity_age_ms=%s avail=%llu "
+                           "total=%llu weight=%llu reason=%s",
+                           ps.domain,
+                           (ps.state == DS_ONLINE) ? "ONLINE" : "OFFLINE",
+                           age,
+                           (unsigned long long)ps.avail_bytes,
+                           (unsigned long long)ps.total_bytes,
+                           (unsigned long long)ps.weight,
+                           placement_reason_name(ps.reason));
+            }
         }
     }
     *offp = off;

@@ -89,6 +89,7 @@ enum placement_reason {
     PR_INSUFFICIENT_ELIGIBLE_DS,
     PR_MODE_NOT_READY,
     PR_WEIGHT_OVERFLOW,
+    PR_DOMAIN_MAP_MISMATCH,   /* smart: declared domain != the connector's */
     PR_COUNT
 };
 

@@ -56,6 +56,7 @@ static const char *const reason_names[PR_COUNT] = {
     [PR_INSUFFICIENT_ELIGIBLE_DS] = "INSUFFICIENT_ELIGIBLE_DS",
     [PR_MODE_NOT_READY]           = "MODE_NOT_READY",
     [PR_WEIGHT_OVERFLOW]          = "WEIGHT_OVERFLOW",
+    [PR_DOMAIN_MAP_MISMATCH]      = "DOMAIN_MAP_MISMATCH",
 };
 
 const char *placement_reason_name(enum placement_reason r)
