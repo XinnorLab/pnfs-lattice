@@ -618,6 +618,57 @@ int mds_metrics_prometheus_v2(const struct mds_metrics_snapshot *snap,
             }
             base += extra;
         }
+        /* connector client */
+        extra = snprintf(buf + base, cap - (size_t)base,
+            "# HELP pnfs_mds_connector_batches_accepted_total Connector batches accepted.\n"
+            "# TYPE pnfs_mds_connector_batches_accepted_total counter\n"
+            "pnfs_mds_connector_batches_accepted_total %lu\n"
+            "# HELP pnfs_mds_connector_covered_ds Registered DS with a fresh VALID assessment.\n"
+            "# TYPE pnfs_mds_connector_covered_ds gauge\n"
+            "pnfs_mds_connector_covered_ds %lu\n"
+            "# HELP pnfs_mds_connector_reachable 1 when the last poll within 3 intervals succeeded.\n"
+            "# TYPE pnfs_mds_connector_reachable gauge\n"
+            "pnfs_mds_connector_reachable %lu\n"
+            "# HELP pnfs_mds_connector_last_success_mono_ms Monotonic ms of the last accepted batch (0 = never).\n"
+            "# TYPE pnfs_mds_connector_last_success_mono_ms gauge\n"
+            "pnfs_mds_connector_last_success_mono_ms %lu\n"
+            "# HELP pnfs_mds_connector_poll_errors_total Connector polls that produced no accepted batch, by code.\n"
+            "# TYPE pnfs_mds_connector_poll_errors_total counter\n",
+            (unsigned long)atomic_load((_Atomic uint64_t *)&branch->connector_batches_accepted_total),
+            (unsigned long)atomic_load((_Atomic uint64_t *)&branch->connector_covered_ds),
+            (unsigned long)atomic_load((_Atomic uint64_t *)&branch->connector_reachable),
+            (unsigned long)atomic_load((_Atomic uint64_t *)&branch->connector_last_success_mono_ms));
+        if (extra < 0 || ((size_t)base + (size_t)extra) >= cap) {
+            return -1;
+        }
+        base += extra;
+        for (int e = 1; e < DCP_COUNT && e < 8; e++) {
+            extra = snprintf(buf + base, cap - (size_t)base,
+                "pnfs_mds_connector_poll_errors_total{code=\"%s\"} %lu\n",
+                ds_connector_poll_error_name((enum ds_connector_poll_error)e),
+                (unsigned long)atomic_load((_Atomic uint64_t *)&branch->connector_poll_errors_total[e]));
+            if (extra < 0 || ((size_t)base + (size_t)extra) >= cap) {
+                return -1;
+            }
+            base += extra;
+        }
+        extra = snprintf(buf + base, cap - (size_t)base,
+            "# HELP pnfs_mds_connector_batches_dropped_total Connector batches dropped whole, by reason.\n"
+            "# TYPE pnfs_mds_connector_batches_dropped_total counter\n");
+        if (extra < 0 || ((size_t)base + (size_t)extra) >= cap) {
+            return -1;
+        }
+        base += extra;
+        for (int r = 1; r < DC_COUNT && r < 8; r++) {
+            extra = snprintf(buf + base, cap - (size_t)base,
+                "pnfs_mds_connector_batches_dropped_total{reason=\"%s\"} %lu\n",
+                ds_connector_drop_name((enum ds_connector_drop)r),
+                (unsigned long)atomic_load((_Atomic uint64_t *)&branch->connector_batches_dropped_total[r]));
+            if (extra < 0 || ((size_t)base + (size_t)extra) >= cap) {
+                return -1;
+            }
+            base += extra;
+        }
     }
 
     extra = snprintf(buf + base, cap - (size_t)base,

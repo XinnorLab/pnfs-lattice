@@ -175,25 +175,6 @@ static bool tok_is_null(const struct jdoc *d, int i)
  * Public helpers
  * ----------------------------------------------------------------------- */
 
-static const char *const drop_names[DC_COUNT] = {
-    [DC_OK] = "OK",
-    [DC_JSON] = "JSON",
-    [DC_SCHEMA] = "SCHEMA",
-    [DC_CONTRACT_MAJOR] = "CONTRACT_MAJOR",
-    [DC_REPLAY] = "REPLAY",
-    [DC_OLD_GENERATED_AT] = "OLD_GENERATED_AT",
-    [DC_CONFIG_DIGEST] = "CONFIG_DIGEST",
-    [DC_TOO_LARGE] = "TOO_LARGE",
-};
-
-const char *ds_connector_drop_name(enum ds_connector_drop d)
-{
-    if ((unsigned)d >= DC_COUNT || drop_names[d] == NULL) {
-        return "UNKNOWN";
-    }
-    return drop_names[d];
-}
-
 uint64_t ds_connector_iso8601_ms(const char *s, size_t len)
 {
     struct tm tm;
@@ -902,4 +883,519 @@ out_drop:
     }
     rep->drop = drop;
     return drop;
+}
+
+/* =======================================================================
+ * I/O half: Unix-socket HTTP client, poll thread, publication
+ * ======================================================================= */
+
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <stdatomic.h>
+
+#include "ds_cache.h"
+#include "mds_metrics.h"
+
+#define DC_HEADERS_MAX (64u * 1024u)
+
+static uint64_t dc_now_ms(void)
+{
+    return ds_cache_mono_ms();
+}
+
+static int wait_fd(int fd, short events, uint64_t deadline_ms)
+{
+    uint64_t now = dc_now_ms();
+    struct pollfd pfd;
+    int rc;
+
+    if (now >= deadline_ms) {
+        return 0;
+    }
+    pfd.fd = fd;
+    pfd.events = events;
+    pfd.revents = 0;
+    rc = poll(&pfd, 1, (int)(deadline_ms - now));
+    return rc;
+}
+
+enum mds_status ds_connector_http_get(const char *socket_path, const char *path,
+                                      uint32_t deadline_ms, char **body, size_t *len,
+                                      int *http_status)
+{
+    struct sockaddr_un addr;
+    char req[512];
+    char *buf = NULL;
+    size_t cap = 0;
+    size_t used = 0;
+    uint64_t deadline;
+    int fd;
+    int rc;
+    enum mds_status st = MDS_ERR_IO;
+    char *hdr_end = NULL;
+    long content_length = -1;
+    int status = 0;
+
+    if (body != NULL) {
+        *body = NULL;
+    }
+    if (len != NULL) {
+        *len = 0;
+    }
+    if (http_status != NULL) {
+        *http_status = 0;
+    }
+    if (socket_path == NULL || path == NULL || body == NULL || len == NULL ||
+        strlen(socket_path) >= sizeof(addr.sun_path)) {
+        return MDS_ERR_INVAL;
+    }
+    deadline = dc_now_ms() + deadline_ms;
+
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0) {
+        return MDS_ERR_IO;
+    }
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    (void)snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
+    rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (rc != 0 && errno == EINPROGRESS) {
+        int err = 0;
+        socklen_t elen = sizeof(err);
+
+        if (wait_fd(fd, POLLOUT, deadline) <= 0) {
+            close(fd);
+            return MDS_ERR_IO;
+        }
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) != 0 || err != 0) {
+            close(fd);
+            return MDS_ERR_IO;
+        }
+    } else if (rc != 0) {
+        close(fd);
+        return MDS_ERR_IO;
+    }
+
+    rc = snprintf(req, sizeof(req),
+                  "GET %s HTTP/1.1\r\nHost: connector\r\nAccept: application/json\r\n"
+                  "Connection: close\r\n\r\n", path);
+    if (rc < 0 || (size_t)rc >= sizeof(req)) {
+        close(fd);
+        return MDS_ERR_INVAL;
+    }
+    {
+        size_t off = 0;
+
+        while (off < (size_t)rc) {
+            ssize_t n;
+
+            if (wait_fd(fd, POLLOUT, deadline) <= 0) {
+                close(fd);
+                return MDS_ERR_IO;
+            }
+            n = write(fd, req + off, (size_t)rc - off);
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EINTR) {
+                    continue;
+                }
+                close(fd);
+                return MDS_ERR_IO;
+            }
+            off += (size_t)n;
+        }
+    }
+
+    /* Read until EOF or Content-Length satisfied, within the deadline. */
+    cap = 16 * 1024;
+    buf = malloc(cap);
+    if (buf == NULL) {
+        close(fd);
+        return MDS_ERR_NOMEM;
+    }
+    for (;;) {
+        ssize_t n;
+        size_t body_have;
+
+        if (used + 1 >= cap) {
+            size_t ncap = cap * 2;
+            char *nb;
+
+            if (ncap > DC_BATCH_MAX + DC_HEADERS_MAX) {
+                ncap = DC_BATCH_MAX + DC_HEADERS_MAX;
+                if (used + 1 >= ncap) {
+                    goto out_io;   /* oversize response */
+                }
+            }
+            nb = realloc(buf, ncap);
+            if (nb == NULL) {
+                st = MDS_ERR_NOMEM;
+                goto out;
+            }
+            buf = nb;
+            cap = ncap;
+        }
+        rc = wait_fd(fd, POLLIN, deadline);
+        if (rc <= 0) {
+            goto out_io;   /* timeout */
+        }
+        n = read(fd, buf + used, cap - used - 1);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EINTR) {
+                continue;
+            }
+            goto out_io;
+        }
+        if (n == 0) {
+            break;   /* EOF */
+        }
+        used += (size_t)n;
+        buf[used] = '\0';
+        if (hdr_end == NULL) {
+            hdr_end = strstr(buf, "\r\n\r\n");
+            if (hdr_end != NULL) {
+                const char *cl;
+
+                if (sscanf(buf, "HTTP/1.%*d %d", &status) != 1) {
+                    goto out_io;
+                }
+                cl = strcasestr(buf, "\r\ncontent-length:");
+                if (cl != NULL && cl < hdr_end) {
+                    content_length = strtol(cl + 17, NULL, 10);
+                    if (content_length < 0 || (size_t)content_length > DC_BATCH_MAX) {
+                        goto out_io;
+                    }
+                }
+            } else if (used > DC_HEADERS_MAX) {
+                goto out_io;
+            }
+        }
+        if (hdr_end != NULL && content_length >= 0) {
+            body_have = used - (size_t)((hdr_end + 4) - buf);
+            if (body_have >= (size_t)content_length) {
+                break;
+            }
+        }
+    }
+    if (hdr_end == NULL) {
+        goto out_io;
+    }
+    if (http_status != NULL) {
+        *http_status = status;
+    }
+    {
+        size_t body_off = (size_t)((hdr_end + 4) - buf);
+        size_t body_len = used - body_off;
+
+        if (content_length >= 0 && (size_t)content_length < body_len) {
+            body_len = (size_t)content_length;
+        }
+        if (status == 200) {
+            char *b = malloc(body_len + 1);
+
+            if (b == NULL) {
+                st = MDS_ERR_NOMEM;
+                goto out;
+            }
+            memcpy(b, buf + body_off, body_len);
+            b[body_len] = '\0';
+            *body = b;
+            *len = body_len;
+            st = MDS_OK;
+        } else if (status == 503) {
+            st = MDS_ERR_DELAY;
+        } else {
+            st = MDS_ERR_INVAL;
+        }
+    }
+    goto out;
+
+out_io:
+    st = MDS_ERR_IO;
+out:
+    free(buf);
+    close(fd);
+    return st;
+}
+
+/* -----------------------------------------------------------------------
+ * Poll loop
+ * ----------------------------------------------------------------------- */
+
+static struct {
+    bool                     configured;
+    _Atomic bool             running;
+    pthread_t                thread;
+    int                      stop_pipe[2];
+    char                     socket_path[MDS_MAX_PATH];
+    uint32_t                 poll_ms;
+    uint32_t                 deadline_ms;
+    struct ds_cache         *cache;
+    pthread_mutex_t          lock;
+    struct ds_connector_state st;
+    struct placement_connector_facts facts;
+} g_dc = { .stop_pipe = { -1, -1 }, .lock = PTHREAD_MUTEX_INITIALIZER };
+
+static void registry_from_cache(struct ds_connector_registry *reg)
+{
+    struct ds_capacity_view_row *rows;
+    uint32_t n;
+    uint32_t i;
+
+    memset(reg, 0, sizeof(*reg));
+    if (g_dc.cache == NULL) {
+        return;
+    }
+    rows = calloc(MDS_MAX_DS_NODES, sizeof(*rows));
+    if (rows == NULL) {
+        return;
+    }
+    n = ds_cache_capacity_view(g_dc.cache, rows, MDS_MAX_DS_NODES);
+    for (i = 0; i < n && reg->count < MDS_MAX_DS_NODES; i++) {
+        struct mds_ds_info info;
+        struct ds_connector_registry_ds *d = &reg->ds[reg->count];
+
+        if (ds_cache_get(g_dc.cache, rows[i].ds_id, &info) != MDS_OK) {
+            continue;
+        }
+        d->ds_id = info.ds_id;
+        memcpy(d->host, info.host, sizeof(d->host));
+        memcpy(d->export_path, info.export_path, sizeof(d->export_path));
+        d->tcp_port = info.tcp_port != 0 ? info.tcp_port : info.port;
+        reg->count++;
+    }
+    free(rows);
+}
+
+static void note_poll_error(enum ds_connector_poll_error e, enum ds_connector_drop d,
+                            const char *detail)
+{
+    if ((unsigned)e < 8) {
+        atomic_fetch_add_explicit(&g_branch_metrics.connector_poll_errors_total[e], 1,
+                                  memory_order_relaxed);
+    }
+    if (e == DCP_DROP && (unsigned)d < 8) {
+        atomic_fetch_add_explicit(&g_branch_metrics.connector_batches_dropped_total[d], 1,
+                                  memory_order_relaxed);
+    }
+    pthread_mutex_lock(&g_dc.lock);
+    g_dc.facts.last_error = e;
+    g_dc.facts.last_drop = d;
+    g_dc.facts.last_batch_valid = false;
+    (void)snprintf(g_dc.facts.last_detail, sizeof(g_dc.facts.last_detail), "%s", detail);
+    if (e == DCP_CONNECT || e == DCP_TIMEOUT) {
+        uint64_t now = dc_now_ms();
+
+        if (g_dc.facts.last_success_mono_ms == 0 ||
+            now - g_dc.facts.last_success_mono_ms > 3ULL * g_dc.poll_ms) {
+            g_dc.facts.reachable = false;
+        }
+    }
+    placement_gate_set_connector_facts(&g_dc.facts);
+    atomic_store_explicit(&g_branch_metrics.connector_reachable,
+                          g_dc.facts.reachable ? 1 : 0, memory_order_relaxed);
+    pthread_mutex_unlock(&g_dc.lock);
+}
+
+enum mds_status ds_connector_poll_once(void)
+{
+    char *body = NULL;
+    size_t len = 0;
+    int status = 0;
+    enum mds_status st;
+    struct ds_connector_registry *reg;
+    struct placement_assessment_view *view;
+    struct ds_connector_report rep;
+    enum ds_connector_drop drop;
+    uint64_t now;
+    uint32_t covered = 0;
+    uint32_t i;
+
+    if (!g_dc.configured) {
+        return MDS_ERR_INVAL;
+    }
+    st = ds_connector_http_get(g_dc.socket_path, "/v1/assessments", g_dc.deadline_ms,
+                               &body, &len, &status);
+    if (st != MDS_OK) {
+        char detail[160];
+
+        if (st == MDS_ERR_DELAY) {
+            (void)snprintf(detail, sizeof(detail), "connector not ready (503)");
+            note_poll_error(DCP_UNAVAILABLE, DC_OK, detail);
+        } else if (st == MDS_ERR_INVAL) {
+            (void)snprintf(detail, sizeof(detail), "unexpected HTTP status %d", status);
+            note_poll_error(DCP_HTTP, DC_OK, detail);
+        } else if (status == 0 && st == MDS_ERR_IO) {
+            (void)snprintf(detail, sizeof(detail), "socket %.100s: connect/read failed or timed out",
+                           g_dc.socket_path);
+            note_poll_error(DCP_TIMEOUT, DC_OK, detail);
+        } else {
+            (void)snprintf(detail, sizeof(detail), "transport failure (%d)", (int)st);
+            note_poll_error(DCP_CONNECT, DC_OK, detail);
+        }
+        free(body);
+        return st;
+    }
+    reg = calloc(1, sizeof(*reg));
+    view = calloc(1, sizeof(*view));
+    if (reg == NULL || view == NULL) {
+        free(reg);
+        free(view);
+        free(body);
+        return MDS_ERR_NOMEM;
+    }
+    registry_from_cache(reg);
+    now = dc_now_ms();
+    pthread_mutex_lock(&g_dc.lock);
+    drop = ds_connector_apply_batch(&g_dc.st, body, len, reg, now, view, &rep);
+    pthread_mutex_unlock(&g_dc.lock);
+    free(body);
+    if (drop != DC_OK) {
+        note_poll_error(DCP_DROP, drop, rep.detail);
+        free(reg);
+        free(view);
+        return MDS_ERR_INVAL;
+    }
+    placement_gate_publish_assessments(view);
+    for (i = 0; i < view->count; i++) {
+        if (view->rows[i].present && view->rows[i].valid) {
+            covered++;
+        }
+    }
+    atomic_fetch_add_explicit(&g_branch_metrics.connector_batches_accepted_total, 1,
+                              memory_order_relaxed);
+    atomic_store_explicit(&g_branch_metrics.connector_covered_ds, covered, memory_order_relaxed);
+    atomic_store_explicit(&g_branch_metrics.connector_last_success_mono_ms, now,
+                          memory_order_relaxed);
+    atomic_store_explicit(&g_branch_metrics.connector_reachable, 1, memory_order_relaxed);
+    pthread_mutex_lock(&g_dc.lock);
+    g_dc.facts.reachable = true;
+    g_dc.facts.last_batch_valid = true;
+    g_dc.facts.last_success_mono_ms = now;
+    g_dc.facts.last_error = DCP_NONE;
+    g_dc.facts.last_drop = DC_OK;
+    if (rep.rejected_binding != 0 || rep.rejected_shape != 0) {
+        (void)snprintf(g_dc.facts.last_detail, sizeof(g_dc.facts.last_detail),
+                       "accepted %u, rejected %u (%.100s)", rep.accepted,
+                       rep.rejected_binding + rep.rejected_shape, rep.detail);
+    } else {
+        (void)snprintf(g_dc.facts.last_detail, sizeof(g_dc.facts.last_detail),
+                       "accepted %u", rep.accepted);
+    }
+    placement_gate_set_connector_facts(&g_dc.facts);
+    pthread_mutex_unlock(&g_dc.lock);
+    free(reg);
+    free(view);
+    return MDS_OK;
+}
+
+static void *dc_thread(void *arg)
+{
+    sigset_t mask;
+
+    (void)arg;
+    sigfillset(&mask);
+    pthread_sigmask(SIG_BLOCK, &mask, NULL);
+    (void)ds_connector_poll_once();
+    while (atomic_load_explicit(&g_dc.running, memory_order_acquire)) {
+        struct pollfd pfd = { .fd = g_dc.stop_pipe[0], .events = POLLIN, .revents = 0 };
+        int pr = poll(&pfd, 1, (int)g_dc.poll_ms);
+
+        if (pr > 0 || !atomic_load_explicit(&g_dc.running, memory_order_acquire)) {
+            break;
+        }
+        (void)ds_connector_poll_once();
+    }
+    return NULL;
+}
+
+int ds_connector_configure(const struct mds_config *cfg, struct ds_cache *cache)
+{
+    struct ds_connector_cfg dcfg;
+
+    if (cfg == NULL || cfg->placement_mode != PM_SMART) {
+        return -1;
+    }
+    memset(&dcfg, 0, sizeof(dcfg));
+    dcfg.contract_major = cfg->ds_connector_expected_contract_major;
+    dcfg.max_ds = cfg->ds_connector_max_ds;
+    (void)snprintf(dcfg.access_scope, sizeof(dcfg.access_scope), "%s", cfg->ds_connector_access_scope);
+    (void)snprintf(dcfg.expected_profile_digest, sizeof(dcfg.expected_profile_digest), "%s",
+                   cfg->ds_connector_expected_profile_digest);
+    (void)snprintf(dcfg.expected_config_digest, sizeof(dcfg.expected_config_digest), "%s",
+                   cfg->ds_connector_expected_config_digest);
+    pthread_mutex_lock(&g_dc.lock);
+    ds_connector_state_init(&g_dc.st, &dcfg);
+    (void)snprintf(g_dc.socket_path, sizeof(g_dc.socket_path), "%s", cfg->ds_connector_socket);
+    g_dc.poll_ms = cfg->ds_connector_poll_ms;
+    g_dc.deadline_ms = cfg->ds_connector_request_deadline_ms;
+    g_dc.cache = cache;
+    memset(&g_dc.facts, 0, sizeof(g_dc.facts));
+    g_dc.facts.config_valid = true;
+    g_dc.configured = true;
+    placement_gate_set_connector_facts(&g_dc.facts);
+    pthread_mutex_unlock(&g_dc.lock);
+    return 0;
+}
+
+int ds_connector_start(const struct mds_config *cfg, struct ds_cache *cache)
+{
+    if (ds_connector_configure(cfg, cache) != 0) {
+        return -1;
+    }
+    if (atomic_load_explicit(&g_dc.running, memory_order_acquire)) {
+        return 0;
+    }
+    if (pipe(g_dc.stop_pipe) != 0) {
+        return -1;
+    }
+    atomic_store_explicit(&g_dc.running, true, memory_order_release);
+    if (pthread_create(&g_dc.thread, NULL, dc_thread, NULL) != 0) {
+        atomic_store_explicit(&g_dc.running, false, memory_order_release);
+        close(g_dc.stop_pipe[0]);
+        close(g_dc.stop_pipe[1]);
+        g_dc.stop_pipe[0] = -1;
+        g_dc.stop_pipe[1] = -1;
+        return -1;
+    }
+    MDS_LOG_INFO(LOG_COMP_MDS,
+        "ds_connector: polling %s every %u ms (deadline %u ms, contract major %u)",
+        g_dc.socket_path, (unsigned)g_dc.poll_ms, (unsigned)g_dc.deadline_ms,
+        (unsigned)g_dc.st.cfg.contract_major);
+    return 0;
+}
+
+void ds_connector_stop(void)
+{
+    if (!atomic_load_explicit(&g_dc.running, memory_order_acquire)) {
+        g_dc.configured = false;
+        return;
+    }
+    atomic_store_explicit(&g_dc.running, false, memory_order_release);
+    if (g_dc.stop_pipe[1] >= 0) {
+        (void)write(g_dc.stop_pipe[1], "x", 1);
+    }
+    (void)pthread_join(g_dc.thread, NULL);
+    if (g_dc.stop_pipe[0] >= 0) {
+        close(g_dc.stop_pipe[0]);
+        close(g_dc.stop_pipe[1]);
+        g_dc.stop_pipe[0] = -1;
+        g_dc.stop_pipe[1] = -1;
+    }
+    g_dc.configured = false;
+}
+
+void ds_connector_facts(struct placement_connector_facts *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&g_dc.lock);
+    *out = g_dc.facts;
+    pthread_mutex_unlock(&g_dc.lock);
 }

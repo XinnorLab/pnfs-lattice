@@ -172,6 +172,13 @@ struct mds_branch_metrics {
     _Atomic uint64_t placement_eligible_ds;          /**< gauge: candidates at the last admit */
     _Atomic uint64_t placement_alias_suspected_total;
     _Atomic uint64_t placement_mode_gauge;           /**< enum placement_mode of the gate (0 = legacy) */
+    /* Connector client (smart). */
+    _Atomic uint64_t connector_poll_errors_total[8];   /**< by enum ds_connector_poll_error */
+    _Atomic uint64_t connector_batches_dropped_total[8]; /**< by enum ds_connector_drop */
+    _Atomic uint64_t connector_batches_accepted_total;
+    _Atomic uint64_t connector_last_success_mono_ms;   /**< gauge source; 0 = never */
+    _Atomic uint64_t connector_covered_ds;             /**< gauge */
+    _Atomic uint64_t connector_reachable;              /**< gauge 0/1 */
 
     /*
      * IO_ADVISE accounting (RFC 7862 S15.5).  io_advise_total

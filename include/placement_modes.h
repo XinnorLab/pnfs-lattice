@@ -93,6 +93,32 @@ enum placement_reason {
 };
 
 const char *placement_reason_name(enum placement_reason r);
+
+/* Why a connector batch was dropped whole (ds_connector.c); metrics label set. */
+enum ds_connector_drop {
+    DC_OK = 0,
+    DC_JSON,              /* not parseable */
+    DC_SCHEMA,            /* envelope/instance shape */
+    DC_CONTRACT_MAJOR,
+    DC_REPLAY,            /* an instance's sequence did not advance */
+    DC_OLD_GENERATED_AT,
+    DC_CONFIG_DIGEST,
+    DC_TOO_LARGE,
+    DC_COUNT
+};
+const char *ds_connector_drop_name(enum ds_connector_drop d);
+
+/* Transport-level poll outcomes (metrics label set). */
+enum ds_connector_poll_error {
+    DCP_NONE = 0,
+    DCP_CONNECT,          /* socket absent / refused */
+    DCP_TIMEOUT,
+    DCP_HTTP,             /* non-200 status or unparsable response */
+    DCP_UNAVAILABLE,      /* 503: the connector is not ready */
+    DCP_DROP,             /* the batch was dropped (see the drop counters) */
+    DCP_COUNT
+};
+const char *ds_connector_poll_error_name(enum ds_connector_poll_error e);
 const char *placement_mode_name(enum placement_mode m);     /* "legacy"|"rr"|"fill"|"smart" */
 const char *placement_shrink_name(enum placement_shrink s); /* "allow"|"strict" */
 

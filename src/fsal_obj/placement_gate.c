@@ -605,11 +605,31 @@ static struct {
     char                  domain_of[MDS_MAX_DS_NODES][PM_DOMAIN_ID_MAX];
     char                  generation[65];
     struct ds_cache      *cache;
-    pthread_rwlock_t      lock;     /* guards cur */
+    pthread_rwlock_t      lock;     /* guards cur and cur_assess */
     struct cap_view_ref  *cur;
+    struct assess_view_ref *cur_assess;
+    struct placement_connector_facts conn;
+    uint32_t              poll_ms;
+    char                  domain_weight_id[PM_MAX_DOMAINS][PM_DOMAIN_ID_MAX];
+    uint32_t              domain_weight[PM_MAX_DOMAINS];
+    uint32_t              domain_weight_count;
+    bool                  allow_manual_weights;
     _Atomic uint32_t      rr_counter;
     _Atomic uint32_t      snapshot_gen;
 } g;
+
+struct assess_view_ref {
+    _Atomic uint32_t refs;
+    struct placement_assessment_view view;
+};
+
+static void assess_unref(struct assess_view_ref *ref)
+{
+    if (ref != NULL &&
+        atomic_fetch_sub_explicit(&ref->refs, 1, memory_order_acq_rel) == 1) {
+        free(ref);
+    }
+}
 
 static void view_unref(struct cap_view_ref *ref)
 {
@@ -683,26 +703,134 @@ void placement_gate_ctx(struct placement_ctx *out, uint64_t now_mono_ms)
     out->min_free_bytes = g.min_free;
     out->domain_of = (const char (*)[PM_DOMAIN_ID_MAX])g.domain_of;
     out->rr_counter = &g.rr_counter;
+    if (g.allow_manual_weights && g.domain_weight_count > 0) {
+        out->domain_weight_id = (const char (*)[PM_DOMAIN_ID_MAX])g.domain_weight_id;
+        out->domain_weight = g.domain_weight;
+        out->domain_weight_count = g.domain_weight_count;
+    }
     if (g.mode == PM_FILL || g.mode == PM_SMART) {
+        struct assess_view_ref *aref = NULL;
+
         pthread_rwlock_rdlock(&g.lock);
         ref = g.cur;
         if (ref != NULL) {
             atomic_fetch_add_explicit(&ref->refs, 1, memory_order_acq_rel);
         }
+        if (g.mode == PM_SMART) {
+            aref = g.cur_assess;
+            if (aref != NULL) {
+                atomic_fetch_add_explicit(&aref->refs, 1, memory_order_acq_rel);
+            }
+        }
         pthread_rwlock_unlock(&g.lock);
         out->cap = (ref != NULL) ? &ref->view : NULL;
         out->view_ref = ref;
+        out->assess = (aref != NULL) ? &aref->view : NULL;
+        out->assess_ref = aref;
     }
 }
 
 void placement_gate_ctx_release(struct placement_ctx *ctx)
 {
-    if (ctx == NULL || ctx->view_ref == NULL) {
+    if (ctx == NULL) {
         return;
     }
-    view_unref((struct cap_view_ref *)ctx->view_ref);
-    ctx->view_ref = NULL;
-    ctx->cap = NULL;
+    if (ctx->view_ref != NULL) {
+        view_unref((struct cap_view_ref *)ctx->view_ref);
+        ctx->view_ref = NULL;
+        ctx->cap = NULL;
+    }
+    if (ctx->assess_ref != NULL) {
+        assess_unref((struct assess_view_ref *)ctx->assess_ref);
+        ctx->assess_ref = NULL;
+        ctx->assess = NULL;
+    }
+}
+
+void placement_gate_publish_assessments(const struct placement_assessment_view *view)
+{
+    struct assess_view_ref *fresh;
+    struct assess_view_ref *old;
+
+    if (!g.initialised || view == NULL) {
+        return;
+    }
+    fresh = calloc(1, sizeof(*fresh));
+    if (fresh == NULL) {
+        return;
+    }
+    atomic_store_explicit(&fresh->refs, 1, memory_order_relaxed);
+    fresh->view = *view;
+    pthread_rwlock_wrlock(&g.lock);
+    old = g.cur_assess;
+    g.cur_assess = fresh;
+    pthread_rwlock_unlock(&g.lock);
+    atomic_fetch_add_explicit(&g.snapshot_gen, 1, memory_order_release);
+    assess_unref(old);
+}
+
+void placement_gate_set_connector_facts(const struct placement_connector_facts *f)
+{
+    if (!g.initialised || f == NULL) {
+        return;
+    }
+    pthread_rwlock_wrlock(&g.lock);
+    g.conn = *f;
+    pthread_rwlock_unlock(&g.lock);
+}
+
+void placement_gate_readiness(struct placement_readiness *out)
+{
+    struct placement_ctx ctx;
+    uint64_t now = ds_cache_mono_ms();
+
+    if (out == NULL) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    (void)snprintf(out->coverage, sizeof(out->coverage), "n/a");
+    if (!g.initialised || g.mode != PM_SMART) {
+        return;
+    }
+    out->mode_active = true;
+    pthread_rwlock_rdlock(&g.lock);
+    out->connector_config_valid = g.conn.config_valid;
+    out->connector_reachable = g.conn.reachable &&
+        (g.conn.last_success_mono_ms != 0) &&
+        (now - g.conn.last_success_mono_ms) <= 3ULL * g.poll_ms;
+    out->last_batch_valid = g.conn.last_batch_valid;
+    out->last_success_mono_ms = g.conn.last_success_mono_ms;
+    memcpy(out->last_detail, g.conn.last_detail, sizeof(out->last_detail));
+    pthread_rwlock_unlock(&g.lock);
+    placement_gate_ctx(&ctx, now);
+    if (ctx.cap != NULL) {
+        out->registered_ds = ctx.cap->count;
+    }
+    if (ctx.assess != NULL) {
+        uint32_t i;
+
+        memcpy(out->config_digest, ctx.assess->config_digest, sizeof(out->config_digest));
+        memcpy(out->profile_digest, ctx.assess->profile_digest, sizeof(out->profile_digest));
+        for (i = 0; i < ctx.assess->count; i++) {
+            const struct placement_assessment_row *r = &ctx.assess->rows[i];
+
+            if (!r->present || !r->valid || now >= r->expires_mono_ms) {
+                continue;
+            }
+            out->covered_ds++;
+            if (r->allowed && r->multiplier_ppm > 0) {
+                out->eligible_ds++;
+            }
+        }
+    }
+    placement_gate_ctx_release(&ctx);
+    if (out->registered_ds == 0 || out->covered_ds == 0) {
+        (void)snprintf(out->coverage, sizeof(out->coverage), "none");
+    } else if (out->covered_ds >= out->registered_ds) {
+        (void)snprintf(out->coverage, sizeof(out->coverage), "full");
+    } else {
+        (void)snprintf(out->coverage, sizeof(out->coverage), "partial");
+    }
 }
 
 int placement_gate_init(const struct mds_config *cfg, struct ds_cache *cache)
@@ -722,6 +850,14 @@ int placement_gate_init(const struct mds_config *cfg, struct ds_cache *cache)
     memcpy(g.generation, cfg->placement_config_generation, sizeof(g.generation));
     g.generation[64] = '\0';
     g.cache = cache;
+    g.poll_ms = cfg->ds_connector_poll_ms ? cfg->ds_connector_poll_ms : 1000;
+    g.allow_manual_weights = cfg->placement_allow_manual_base_weights;
+    g.domain_weight_count = cfg->placement_domain_weight_count;
+    if (g.domain_weight_count > PM_MAX_DOMAINS) {
+        g.domain_weight_count = PM_MAX_DOMAINS;
+    }
+    memcpy(g.domain_weight_id, cfg->placement_domain_weight_id, sizeof(g.domain_weight_id));
+    memcpy(g.domain_weight, cfg->placement_domain_weight, sizeof(g.domain_weight));
     if ((g.mode == PM_FILL || g.mode == PM_SMART) && mds_wrr_kernel_id() == 0) {
         MDS_LOG_ERROR(LOG_COMP_FSAL,
             "placement: mode %s needs the XinnorLab wrr kernel; this binary "
@@ -758,11 +894,18 @@ void placement_gate_destroy(void)
     if (!g.initialised) {
         return;
     }
-    pthread_rwlock_wrlock(&g.lock);
-    old = g.cur;
-    g.cur = NULL;
-    pthread_rwlock_unlock(&g.lock);
-    view_unref(old);
+    {
+        struct assess_view_ref *aold;
+
+        pthread_rwlock_wrlock(&g.lock);
+        old = g.cur;
+        g.cur = NULL;
+        aold = g.cur_assess;
+        g.cur_assess = NULL;
+        pthread_rwlock_unlock(&g.lock);
+        view_unref(old);
+        assess_unref(aold);
+    }
     pthread_rwlock_destroy(&g.lock);
     g.initialised = false;
     g.cache = NULL;

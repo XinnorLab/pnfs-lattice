@@ -11,6 +11,8 @@
 
 #include "pnfs_mds.h"
 #include "ds_connector.h"
+#include "mds_metrics.h"
+#include <stdatomic.h>
 
 static int tests_run;
 static int tests_passed;
@@ -352,9 +354,280 @@ static void test_iso8601(void)
     ASSERT_EQ(ds_connector_iso8601_ms("2026-13-24T10:00:00Z", 20), 0u);
 }
 
+/* -----------------------------------------------------------------------
+ * I/O half: a fake connector on a Unix socket
+ * ----------------------------------------------------------------------- */
+
+#include <unistd.h>
+#include <pthread.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <time.h>
+#include "ds_cache.h"
+#include "mds_catalogue.h"
+#include "placement_gate.h"
+
+struct mds_catalogue *catalogue_memdb_open(void);
+
+struct fake_srv {
+    char        dir[64];
+    char        path[100];
+    int         status;
+    const char *body;
+    long        content_length;   /* -1 = real length */
+    int         delay_ms;
+    bool        silent;           /* accept, never answer */
+    int         listen_fd;
+    pthread_t   th;
+};
+
+static void *fake_srv_thread(void *a)
+{
+    struct fake_srv *s = a;
+    struct pollfd pfd = { .fd = s->listen_fd, .events = POLLIN, .revents = 0 };
+    int c;
+    char req[2048];
+
+    if (poll(&pfd, 1, 5000) <= 0) {
+        return NULL;
+    }
+    c = accept(s->listen_fd, NULL, NULL);
+    if (c < 0) {
+        return NULL;
+    }
+    pfd.fd = c;
+    if (poll(&pfd, 1, 1000) > 0) {
+        (void)read(c, req, sizeof(req));
+    }
+    if (s->delay_ms > 0) {
+        usleep((useconds_t)s->delay_ms * 1000);
+    }
+    if (!s->silent) {
+        char hdr[256];
+        size_t blen = s->body ? strlen(s->body) : 0;
+        long cl = (s->content_length >= 0) ? s->content_length : (long)blen;
+        int n = snprintf(hdr, sizeof(hdr),
+                         "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\n"
+                         "Content-Length: %ld\r\nConnection: close\r\n\r\n",
+                         s->status, s->status == 200 ? "OK" : "Nope", cl);
+        (void)write(c, hdr, (size_t)n);
+        if (blen > 0) {
+            (void)write(c, s->body, blen);
+        }
+    } else {
+        usleep(3000 * 1000);
+    }
+    close(c);
+    return NULL;
+}
+
+static int fake_srv_start(struct fake_srv *s, int status, const char *body)
+{
+    struct sockaddr_un addr;
+
+    snprintf(s->dir, sizeof(s->dir), "/tmp/pnfs-dc-XXXXXX");
+    if (mkdtemp(s->dir) == NULL) {
+        return -1;
+    }
+    snprintf(s->path, sizeof(s->path), "%s/c.sock", s->dir);
+    s->status = status;
+    s->body = body;
+    if (s->content_length == 0) {
+        s->content_length = -1;
+    }
+    s->listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s->listen_fd < 0) {
+        return -1;
+    }
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", s->path);
+    if (bind(s->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(s->listen_fd, 4) != 0) {
+        return -1;
+    }
+    return pthread_create(&s->th, NULL, fake_srv_thread, s);
+}
+
+static void fake_srv_stop(struct fake_srv *s)
+{
+    (void)pthread_join(s->th, NULL);
+    close(s->listen_fd);
+    (void)unlink(s->path);
+    (void)rmdir(s->dir);
+}
+
+static uint64_t mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+static void test_http_get_200_body(void)
+{
+    struct fake_srv s; memset(&s, 0, sizeof(s));
+    char *body = NULL; size_t len = 0; int status = 0;
+    ASSERT_EQ(fake_srv_start(&s, 200, "{\"hello\":1}"), 0);
+    ASSERT_EQ(ds_connector_http_get(s.path, "/v1/assessments", 1000, &body, &len, &status), MDS_OK);
+    ASSERT_EQ(status, 200);
+    ASSERT_EQ(len, 11u);
+    ASSERT_EQ(strcmp(body, "{\"hello\":1}"), 0);
+    free(body);
+    fake_srv_stop(&s);
+}
+
+static void test_http_get_503_and_other_statuses(void)
+{
+    struct fake_srv s; memset(&s, 0, sizeof(s));
+    char *body = NULL; size_t len = 0; int status = 0;
+    ASSERT_EQ(fake_srv_start(&s, 503, "{\"ready\":false}"), 0);
+    ASSERT_EQ(ds_connector_http_get(s.path, "/v1/assessments", 1000, &body, &len, &status), MDS_ERR_DELAY);
+    ASSERT_EQ(status, 503);
+    ASSERT_TRUE(body == NULL);
+    fake_srv_stop(&s);
+    memset(&s, 0, sizeof(s));
+    ASSERT_EQ(fake_srv_start(&s, 404, "{}"), 0);
+    ASSERT_EQ(ds_connector_http_get(s.path, "/v1/assessments", 1000, &body, &len, &status), MDS_ERR_INVAL);
+    ASSERT_EQ(status, 404);
+    fake_srv_stop(&s);
+}
+
+static void test_http_get_timeout_and_no_socket(void)
+{
+    struct fake_srv s; memset(&s, 0, sizeof(s));
+    char *body = NULL; size_t len = 0; int status = 0;
+    s.silent = true;
+    ASSERT_EQ(fake_srv_start(&s, 200, "{}"), 0);
+    uint64_t t0 = mono_ms();
+    ASSERT_EQ(ds_connector_http_get(s.path, "/v1/assessments", 200, &body, &len, &status), MDS_ERR_IO);
+    ASSERT_TRUE(mono_ms() - t0 < 1000);
+    fake_srv_stop(&s);
+    ASSERT_EQ(ds_connector_http_get("/tmp/pnfs-dc-no-such/c.sock", "/v1/assessments", 200, &body, &len, &status), MDS_ERR_IO);
+    ASSERT_EQ(ds_connector_http_get(NULL, "/x", 200, &body, &len, &status), MDS_ERR_INVAL);
+}
+
+static void test_http_get_oversize(void)
+{
+    struct fake_srv s; memset(&s, 0, sizeof(s));
+    char *body = NULL; size_t len = 0; int status = 0;
+    s.content_length = 5L * 1024 * 1024;
+    ASSERT_EQ(fake_srv_start(&s, 200, "{}"), 0);
+    ASSERT_EQ(ds_connector_http_get(s.path, "/v1/assessments", 1000, &body, &len, &status), MDS_ERR_IO);
+    ASSERT_TRUE(body == NULL);
+    fake_srv_stop(&s);
+}
+
+static struct ds_cache *cache_two_ds(struct mds_catalogue **cat_out)
+{
+    struct mds_catalogue *cat = catalogue_memdb_open();
+    struct ds_cache *c = NULL;
+    const char *hosts[2] = { "192.168.64.51", "192.168.64.71" };
+    uint32_t i;
+
+    if (cat == NULL) {
+        return NULL;
+    }
+    for (i = 0; i < 2; i++) {
+        struct mds_cat_txn *txn = NULL;
+        struct mds_ds_info info;
+        memset(&info, 0, sizeof(info));
+        info.ds_id = i;
+        info.state = DS_ONLINE;
+        info.port = 2049;
+        info.tcp_port = 2049;
+        snprintf(info.host, sizeof(info.host), "%s", hosts[i]);
+        snprintf(info.export_path, sizeof(info.export_path), "/mnt/data/pnfs-ds");
+        if (mds_cat_txn_begin(cat, MDS_CAT_TXN_WRITE, &txn) != MDS_OK ||
+            mds_cat_ds_put(cat, txn, &info) != MDS_OK || mds_cat_txn_commit(txn) != MDS_OK) {
+            return NULL;
+        }
+    }
+    if (ds_cache_create(cat, &c) != 0) {
+        return NULL;
+    }
+    *cat_out = cat;
+    return c;
+}
+
+static void test_poll_once_publishes_and_readiness(void)
+{
+    struct mds_catalogue *cat = NULL;
+    struct ds_cache *cache = cache_two_ds(&cat);
+    struct mds_config cfg;
+    struct fake_srv s;
+    struct placement_readiness r;
+    ASSERT_TRUE(cache != NULL);
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.placement_mode = PM_SMART;
+    cfg.placement_mode_set = true;
+    cfg.placement_capacity_max_age_ms = 120000;
+    cfg.ds_connector_poll_ms = 200;
+    cfg.ds_connector_request_deadline_ms = 150;
+    cfg.ds_connector_expected_contract_major = 1;
+    cfg.ds_connector_max_ds = 256;
+    snprintf(cfg.ds_connector_access_scope, sizeof(cfg.ds_connector_access_scope), "cluster-default");
+    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
+    placement_gate_readiness(&r);
+    ASSERT_EQ(r.mode_active, true);
+    ASSERT_EQ(r.connector_config_valid, false);        /* not configured yet */
+    ASSERT_EQ(strcmp(r.coverage, "none"), 0);
+
+    memset(&s, 0, sizeof(s));
+    ASSERT_EQ(fake_srv_start(&s, 200, batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "cfg-d", "COMPLETE", rec_ok(0))), 0);
+    snprintf(cfg.ds_connector_socket, sizeof(cfg.ds_connector_socket), "%s", s.path);
+    ASSERT_EQ(ds_connector_configure(&cfg, cache), 0);
+    ASSERT_EQ(ds_connector_poll_once(), MDS_OK);
+    fake_srv_stop(&s);
+    placement_gate_readiness(&r);
+    ASSERT_EQ(r.connector_config_valid, true);
+    ASSERT_EQ(r.connector_reachable, true);
+    ASSERT_EQ(r.last_batch_valid, true);
+    ASSERT_EQ(r.registered_ds, 2u);
+    ASSERT_EQ(r.covered_ds, 1u);
+    ASSERT_EQ(r.eligible_ds, 1u);
+    ASSERT_EQ(strcmp(r.coverage, "partial"), 0);
+    ASSERT_EQ(strcmp(r.config_digest, "cfg-d"), 0);
+    ASSERT_EQ(strcmp(r.profile_digest, "sha256:p"), 0);
+    ASSERT_EQ(atomic_load(&g_branch_metrics.connector_covered_ds), 1u);
+
+    /* garbage: the batch is dropped, the previous view stays until it ages out */
+    memset(&s, 0, sizeof(s));
+    ASSERT_EQ(fake_srv_start(&s, 200, "{garbage"), 0);
+    snprintf(cfg.ds_connector_socket, sizeof(cfg.ds_connector_socket), "%s", s.path);
+    ASSERT_EQ(ds_connector_configure(&cfg, cache), 0);   /* new socket path; state reset is fine here */
+    ASSERT_EQ(ds_connector_poll_once(), MDS_ERR_INVAL);
+    fake_srv_stop(&s);
+    placement_gate_readiness(&r);
+    ASSERT_EQ(r.last_batch_valid, false);
+    ASSERT_EQ(r.covered_ds, 1u);
+    ASSERT_EQ(atomic_load(&g_branch_metrics.connector_batches_dropped_total[DC_JSON]) >= 1u, true);
+
+    /* socket gone: no fallback -- reachability lapses after 3 x poll and the
+     * rows expire on their own TTL */
+    ASSERT_EQ(ds_connector_poll_once(), MDS_ERR_IO);
+    usleep(700 * 1000);
+    ASSERT_EQ(ds_connector_poll_once(), MDS_ERR_IO);
+    placement_gate_readiness(&r);
+    ASSERT_EQ(r.connector_reachable, false);
+    ASSERT_EQ(r.covered_ds, 1u);                        /* 15 s TTL not yet over */
+    ASSERT_EQ(atomic_load(&g_branch_metrics.connector_reachable), 0u);
+
+    ds_connector_stop();
+    placement_gate_destroy();
+    ds_cache_destroy(cache);
+    mds_catalogue_close(cat);
+}
+
 int main(void)
 {
     printf("test_ds_connector\n");
+    RUN_TEST(test_http_get_200_body);
+    RUN_TEST(test_http_get_503_and_other_statuses);
+    RUN_TEST(test_http_get_timeout_and_no_socket);
+    RUN_TEST(test_http_get_oversize);
+    RUN_TEST(test_poll_once_publishes_and_readiness);
     RUN_TEST(test_iso8601);
     RUN_TEST(test_endpoint_rule);
     RUN_TEST(test_healthy_batch_is_accepted);

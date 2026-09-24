@@ -76,17 +76,7 @@ struct ds_connector_state {
     uint64_t last_generated_at_ms;   /* 0 = none yet */
 };
 
-enum ds_connector_drop {
-    DC_OK = 0,
-    DC_JSON,              /* not parseable */
-    DC_SCHEMA,            /* envelope/instance shape */
-    DC_CONTRACT_MAJOR,
-    DC_REPLAY,            /* an instance's sequence did not advance */
-    DC_OLD_GENERATED_AT,
-    DC_CONFIG_DIGEST,
-    DC_TOO_LARGE,
-    DC_COUNT
-};
+/* enum ds_connector_drop and ds_connector_drop_name() live in placement_modes.h. */
 
 struct ds_connector_report {
     enum ds_connector_drop drop;
@@ -114,8 +104,6 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
                                                 struct placement_assessment_view *out,
                                                 struct ds_connector_report *rep);
 
-const char *ds_connector_drop_name(enum ds_connector_drop d);
-
 /* "YYYY-MM-DDTHH:MM:SS[.fff]Z" -> milliseconds since the epoch; 0 on error. */
 uint64_t ds_connector_iso8601_ms(const char *s, size_t len);
 
@@ -124,5 +112,29 @@ uint64_t ds_connector_iso8601_ms(const char *s, size_t len);
 bool ds_connector_endpoint_matches(const struct ds_connector_registry_ds *ds,
                                    const char *server, const char *export_path,
                                    uint32_t port);
+
+/* -----------------------------------------------------------------------
+ * I/O half
+ * ----------------------------------------------------------------------- */
+
+struct ds_cache;
+
+/*
+ * One HTTP/1.1 GET over the Unix socket.  MDS_OK with a malloc'd body on
+ * 200; MDS_ERR_DELAY on 503 (connector not ready); MDS_ERR_INVAL on any
+ * other status; MDS_ERR_IO on connect failure, timeout, oversize or an
+ * unparsable response.  The deadline covers connect + the full read.
+ */
+enum mds_status ds_connector_http_get(const char *socket_path, const char *path,
+                                      uint32_t deadline_ms, char **body, size_t *len,
+                                      int *http_status);
+
+/* Configure without a thread (tests); start = configure + thread. */
+int  ds_connector_configure(const struct mds_config *cfg, struct ds_cache *cache);
+int  ds_connector_start(const struct mds_config *cfg, struct ds_cache *cache);
+void ds_connector_stop(void);
+/* One synchronous poll: GET, validate, publish, update the facts. */
+enum mds_status ds_connector_poll_once(void);
+void ds_connector_facts(struct placement_connector_facts *out);
 
 #endif /* DS_CONNECTOR_H */

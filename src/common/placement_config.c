@@ -66,6 +66,42 @@ const char *placement_reason_name(enum placement_reason r)
     return reason_names[r];
 }
 
+static const char *const drop_names[DC_COUNT] = {
+    [DC_OK] = "OK",
+    [DC_JSON] = "JSON",
+    [DC_SCHEMA] = "SCHEMA",
+    [DC_CONTRACT_MAJOR] = "CONTRACT_MAJOR",
+    [DC_REPLAY] = "REPLAY",
+    [DC_OLD_GENERATED_AT] = "OLD_GENERATED_AT",
+    [DC_CONFIG_DIGEST] = "CONFIG_DIGEST",
+    [DC_TOO_LARGE] = "TOO_LARGE",
+};
+
+const char *ds_connector_drop_name(enum ds_connector_drop d)
+{
+    if ((unsigned)d >= DC_COUNT || drop_names[d] == NULL) {
+        return "UNKNOWN";
+    }
+    return drop_names[d];
+}
+
+static const char *const poll_error_names[DCP_COUNT] = {
+    [DCP_NONE] = "NONE",
+    [DCP_CONNECT] = "CONNECT",
+    [DCP_TIMEOUT] = "TIMEOUT",
+    [DCP_HTTP] = "HTTP",
+    [DCP_UNAVAILABLE] = "UNAVAILABLE",
+    [DCP_DROP] = "DROP",
+};
+
+const char *ds_connector_poll_error_name(enum ds_connector_poll_error e)
+{
+    if ((unsigned)e >= DCP_COUNT || poll_error_names[e] == NULL) {
+        return "UNKNOWN";
+    }
+    return poll_error_names[e];
+}
+
 const char *placement_shrink_name(enum placement_shrink s)
 {
     return (s == PM_SHRINK_STRICT) ? "strict" : "allow";

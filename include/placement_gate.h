@@ -74,8 +74,13 @@ struct placement_ctx {
     const struct placement_capacity_view   *cap;      /* NULL in rr/legacy */
     const struct placement_assessment_view *assess;   /* NULL until Stage B */
     _Atomic uint32_t     *rr_counter;                 /* shared rr cursor; NULL = rr_key only */
-    /* Singleton bookkeeping: the view reference held by this ctx. */
+    /* Manual base weights (smart, placement_allow_manual_base_weights). */
+    const char          (*domain_weight_id)[PM_DOMAIN_ID_MAX];
+    const uint32_t       *domain_weight;
+    uint32_t              domain_weight_count;
+    /* Singleton bookkeeping: the view references held by this ctx. */
     void                 *view_ref;
+    void                 *assess_ref;
 };
 
 struct placement_candidate {
@@ -136,6 +141,36 @@ void placement_gate_note_rejections(const struct placement_reject_counts *why);
 /* -----------------------------------------------------------------------
  * Process singleton (Task 5) -- declared here, implemented alongside.
  * ----------------------------------------------------------------------- */
+
+/* Connector-side facts the poll thread reports (smart). */
+struct placement_connector_facts {
+    bool     config_valid;
+    bool     reachable;              /* a successful poll within 3 x poll_ms */
+    bool     last_batch_valid;
+    uint64_t last_success_mono_ms;   /* 0 = never */
+    enum ds_connector_poll_error last_error;
+    enum ds_connector_drop last_drop;
+    char     last_detail[160];
+};
+void placement_gate_publish_assessments(const struct placement_assessment_view *view);
+void placement_gate_set_connector_facts(const struct placement_connector_facts *f);
+
+/* The four readiness facts + coverage (design section 7, review finding 4). */
+struct placement_readiness {
+    bool     mode_active;              /* effective mode is smart */
+    bool     connector_config_valid;
+    bool     connector_reachable;
+    bool     last_batch_valid;
+    uint32_t registered_ds;
+    uint32_t covered_ds;               /* fresh valid records */
+    uint32_t eligible_ds;              /* covered and allowed with ppm > 0 */
+    char     coverage[8];              /* "full" | "partial" | "none" | "n/a" */
+    uint64_t last_success_mono_ms;
+    char     config_digest[PM_DIGEST_MAX];
+    char     profile_digest[PM_DIGEST_MAX];
+    char     last_detail[160];
+};
+void placement_gate_readiness(struct placement_readiness *out);
 
 int  placement_gate_init(const struct mds_config *cfg, struct ds_cache *cache);
 void placement_gate_destroy(void);
