@@ -65,6 +65,7 @@ add_executable(test_placement_policy unit/test_placement_policy.c)
 add_executable(test_wrr_kernel      unit/test_wrr_kernel.c)
 add_executable(test_placement_gate  unit/test_placement_gate.c)
 add_executable(test_placement_create_boundary unit/test_placement_create_boundary.c)
+add_executable(test_ds_connector    unit/test_ds_connector.c)
 add_executable(test_mds_tls        unit/test_mds_tls.c)
 add_executable(test_mds_gss        unit/test_mds_gss.c)
 add_executable(test_config          unit/test_config.c)
@@ -153,6 +154,7 @@ foreach(test_target
     test_wrr_kernel
     test_placement_gate
     test_placement_create_boundary
+    test_ds_connector
     test_mds_tls
     test_mds_gss
     test_catalogue
