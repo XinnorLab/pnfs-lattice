@@ -375,6 +375,7 @@ static void test_iso8601(void)
  * ----------------------------------------------------------------------- */
 
 #include <unistd.h>
+#include <signal.h>
 #include <pthread.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -440,9 +441,12 @@ static void *fake_srv_thread(void *a)
                          "Content-Length: %ld\r\nConnection: close\r\n\r\n",
                          s->status, s->status == 200 ? "OK" : "Nope", cl);
         }
-        (void)write(c, hdr, (size_t)n);
+        /* MSG_NOSIGNAL: the client closes early on purpose in the oversize
+         * tests, and the server thread lives in the test process -- a
+         * SIGPIPE would kill the whole run (seen on the CI runner) */
+        (void)send(c, hdr, (size_t)n, MSG_NOSIGNAL);
         if (blen > 0) {
-            (void)write(c, s->body, blen);
+            (void)send(c, s->body, blen, MSG_NOSIGNAL);
         }
         if (s->stream_bytes > 0) {
             static char filler[65536];
@@ -450,7 +454,7 @@ static void *fake_srv_thread(void *a)
             memset(filler, 'x', sizeof(filler));
             while (left > 0) {
                 size_t chunk = left > (long)sizeof(filler) ? sizeof(filler) : (size_t)left;
-                ssize_t w = write(c, filler, chunk);
+                ssize_t w = send(c, filler, chunk, MSG_NOSIGNAL);
                 if (w <= 0) {
                     break;
                 }
@@ -999,6 +1003,7 @@ static void test_http_get_streamed_oversize_and_short_body(void)
 
 int main(void)
 {
+    signal(SIGPIPE, SIG_IGN);   /* belt and braces for the fake server */
     printf("test_ds_connector\n");
     RUN_TEST(test_http_get_200_body);
     RUN_TEST(test_http_get_503_and_other_statuses);
