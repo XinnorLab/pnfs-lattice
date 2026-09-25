@@ -786,6 +786,20 @@ static void test_poll_once_publishes_and_readiness(void)
     ASSERT_EQ(r.covered_ds, 1u);
     ASSERT_EQ(atomic_load(&g_branch_metrics.connector_batches_dropped_total[DC_JSON]) >= 1u, true);
 
+    /* a batch with two digests for one profile id: DC_PROFILE_INCONSISTENT
+     * is a real array index (8, past the old fixed-8 sizing) and must be
+     * counted like every other drop reason */
+    {
+        char recs[8192];
+        snprintf(recs, sizeof(recs), "%s,%s", rec_prof(0, "xinas-mvp", "sha256:p"),
+                 rec_prof(1, "xinas-mvp", "sha256:q"));
+        RESERVE(200, batch("rt-1", "e1", 3, "2026-09-24T10:00:03Z", "cfg-d", "COMPLETE", recs));
+        ASSERT_EQ(ds_connector_poll_once(), MDS_ERR_INVAL);
+        fake_srv_stop(&s);
+        ASSERT_EQ(atomic_load(&g_branch_metrics.connector_batches_dropped_total[DC_PROFILE_INCONSISTENT]) >= 1u,
+                  true);
+    }
+
     /* 503 after the grace: the gauge and the fact both drop, on the same rule */
     usleep(700 * 1000);
     RESERVE(503, "{\"ready\":false}");

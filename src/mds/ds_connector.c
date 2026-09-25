@@ -1485,7 +1485,7 @@ static void note_poll_error(enum ds_connector_poll_error e, enum ds_connector_dr
         atomic_fetch_add_explicit(&g_branch_metrics.connector_poll_errors_total[e], 1,
                                   memory_order_relaxed);
     }
-    if (e == DCP_DROP && (unsigned)d < 8) {
+    if (e == DCP_DROP && (unsigned)d < DC_COUNT) {
         atomic_fetch_add_explicit(&g_branch_metrics.connector_batches_dropped_total[d], 1,
                                   memory_order_relaxed);
     }
