@@ -328,6 +328,47 @@ static void test_manifest_constants(void)
     ASSERT_EQ(strcmp(placement_mode_name(PM_LEGACY), "legacy"), 0);
 }
 
+static void test_profile_pins(void)
+{
+    struct pm_profile_pin p[PM_PROFILES_MAX];
+    uint32_t n = 99;
+    char err[160];
+    char buf[PM_PROFILES_MAX * (PM_PROFILE_ID_MAX + PM_DIGEST_MAX + 1)];
+    static const char *bad[] = {
+        "",
+        "xinas-mvp",
+        "=sha256:a",
+        "xinas-mvp=",
+        "a b=sha256:a",
+        "a=sha256:x,a=sha256:y",
+        "x=d,,y=d",
+        "p1=d,p2=d,p3=d,p4=d,p5=d,p6=d,p7=d,p8=d,p9=d",
+        "0123456789012345678901234567890123456789012345678901234567890123=d",   /* 64 chars */
+    };
+
+    ASSERT_EQ(pm_parse_profile_pins("zfs-mvp=sha256:b, xinas-mvp=sha256:a", p, &n, err, sizeof(err)), 0);
+    ASSERT_EQ(n, 2u);
+    ASSERT_EQ(strcmp(p[0].id, "xinas-mvp"), 0);
+    ASSERT_EQ(strcmp(p[0].digest, "sha256:a"), 0);
+    ASSERT_EQ(strcmp(p[1].id, "zfs-mvp"), 0);
+    ASSERT_EQ(strcmp(p[1].digest, "sha256:b"), 0);
+    ASSERT_EQ(pm_format_profile_pins(p, n, buf, sizeof(buf)) > 0, 1);
+    ASSERT_EQ(strcmp(buf, "xinas-mvp=sha256:a,zfs-mvp=sha256:b"), 0);
+    ASSERT_EQ(pm_format_profile_pins(p, 0, buf, sizeof(buf)), 1);
+    ASSERT_EQ(strcmp(buf, "-"), 0);
+    ASSERT_EQ(pm_format_profile_pins(p, n, buf, 8), -1);
+    ASSERT_EQ(pm_profile_id_valid("xinas-mvp.v1_2", 14), true);
+    ASSERT_EQ(pm_profile_id_valid("a=b", 3), false);
+    ASSERT_EQ(pm_profile_id_valid("", 0), false);
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        err[0] = '\0';
+        ASSERT_EQ(pm_parse_profile_pins(bad[i], p, &n, err, sizeof(err)), -1);
+        ASSERT_EQ(err[0] != '\0', 1);
+    }
+    ASSERT_EQ(strcmp(ds_connector_drop_name(DC_PROFILE_INCONSISTENT), "PROFILE_INCONSISTENT"), 0);
+    ASSERT_EQ(strcmp(ds_connector_drop_name(DC_PROFILE_LIMIT), "PROFILE_LIMIT"), 0);
+}
+
 int main(void)
 {
     printf("test_placement_config\n");
@@ -345,6 +386,7 @@ int main(void)
     RUN_TEST(test_rr_keeps_geometry);
     RUN_TEST(test_validate_is_pure);
     RUN_TEST(test_manifest_constants);
+    RUN_TEST(test_profile_pins);
     printf("%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }
