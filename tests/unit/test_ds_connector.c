@@ -67,24 +67,31 @@ static void reg_init(void)
     REG.ds[1].tcp_port = 2049;
 }
 
-static void st_init(const char *profile_pin, const char *config_pin)
+static void st_init(const char *profile_pins, const char *config_pin)
 {
     struct ds_connector_cfg cfg;
+    char err[160];
     memset(&cfg, 0, sizeof(cfg));
     cfg.contract_major = 1;
     cfg.max_ds = 256;
     snprintf(cfg.access_scope, sizeof(cfg.access_scope), "cluster-default");
-    if (profile_pin) snprintf(cfg.expected_profile_digest, sizeof(cfg.expected_profile_digest), "%s", profile_pin);
+    if (profile_pins) {
+        if (pm_parse_profile_pins(profile_pins, cfg.expected_profiles,
+                                  &cfg.expected_profile_count, err, sizeof(err)) != 0) {
+            fprintf(stderr, "  bad test pins %s: %s\n", profile_pins, err);
+            abort();
+        }
+    }
     if (config_pin) snprintf(cfg.expected_config_digest, sizeof(cfg.expected_config_digest), "%s", config_pin);
     ds_connector_state_init(&ST, &cfg);
 }
 
-/* One assessment record with overridable fields. */
-static const char *rec(uint32_t ds, unsigned gen, const char *target, const char *inc,
-                       const char *server, const char *path, unsigned port,
-                       const char *scope, const char *access, const char *quality,
-                       unsigned ttl, const char *profile, const char *allowed,
-                       unsigned ppm, const char *domain_json)
+/* One assessment record with overridable fields, carrying profile id pid. */
+static const char *rec_pid(const char *pid, uint32_t ds, unsigned gen, const char *target, const char *inc,
+                           const char *server, const char *path, unsigned port,
+                           const char *scope, const char *access, const char *quality,
+                           unsigned ttl, const char *profile, const char *allowed,
+                           unsigned ppm, const char *domain_json)
 {
     static char r[4][4096];
     static int slot;
@@ -95,11 +102,31 @@ static const char *rec(uint32_t ds, unsigned gen, const char *target, const char
         "\"endpoint\":{\"server\":\"%s\",\"export_path\":\"%s\",\"protocol\":\"NFS\",\"transport\":\"TCP\",\"port\":%u},"
         "\"scope\":\"%s\",\"access_scope_id\":\"%s\",\"quality\":\"%s\","
         "\"observed_at\":\"2026-09-24T10:00:00Z\",\"evidence_age_ms\":1000,\"remaining_ttl_ms\":%u,"
-        "\"profile\":{\"id\":\"xinas-mvp\",\"version\":\"1\",\"digest\":\"%s\"},"
+        "\"profile\":{\"id\":\"%s\",\"version\":\"1\",\"digest\":\"%s\"},"
         "\"placement\":{\"allowed\":%s,\"multiplier_ppm\":%u,\"reason_codes\":[\"NORMAL\",\"X\"]},"
         "\"resources\":{\"capacity_domain_id\":%s,\"shared_resource_ids\":[]},\"coverage\":[]}",
-        ds, gen, target, inc, server, path, port, scope, access, quality, ttl, profile, allowed, ppm, domain_json);
+        ds, gen, target, inc, server, path, port, scope, access, quality, ttl, pid, profile, allowed, ppm, domain_json);
     return b;
+}
+
+/* One assessment record with overridable fields. */
+static const char *rec(uint32_t ds, unsigned gen, const char *target, const char *inc,
+                       const char *server, const char *path, unsigned port,
+                       const char *scope, const char *access, const char *quality,
+                       unsigned ttl, const char *profile, const char *allowed,
+                       unsigned ppm, const char *domain_json)
+{
+    return rec_pid("xinas-mvp", ds, gen, target, inc, server, path, port, scope, access,
+                   quality, ttl, profile, allowed, ppm, domain_json);
+}
+
+/* rec_ok(ds) with another profile. */
+static const char *rec_prof(uint32_t ds, const char *pid, const char *digest)
+{
+    return rec_pid(pid, ds, 2, "mnt/data", "\"mnt/data:0:u\"",
+                   ds == 0 ? "192.168.64.51" : "192.168.64.71", "/mnt/data", 2049,
+                   "NEW_ALLOCATION", "cluster-default", "VALID", 15000, digest, "true",
+                   1000000, "\"ctrl-1/fs-1/inc\"");
 }
 
 static const char *rec_ok(uint32_t ds)
@@ -152,7 +179,9 @@ static void test_healthy_batch_is_accepted(void)
     ASSERT_EQ(strcmp(v.rows[0].reasons[0], "NORMAL"), 0);
     ASSERT_EQ(v.rows[1].present, false);            /* ds 1 has no record */
     ASSERT_EQ(strcmp(v.config_digest, "cfg-d"), 0);
-    ASSERT_EQ(strcmp(v.profile_digest, "sha256:p"), 0);
+    ASSERT_EQ(v.profile_count, 1u);
+    ASSERT_EQ(strcmp(v.profiles[0].id, "xinas-mvp"), 0);
+    ASSERT_EQ(strcmp(v.profiles[0].digest, "sha256:p"), 0);
     ASSERT_EQ(ST.pins[0].pinned, true);
     ASSERT_EQ(ST.pins[0].binding_generation, 2u);
     ASSERT_EQ(strcmp(ST.runtime_epoch, "rt-1"), 0);
@@ -226,31 +255,109 @@ static void test_config_digest_pin(void)
     ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "cfg-expected", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
 }
 
-static void test_profile_digest_pin_and_consistency(void)
+static void test_profiles_two_ids_without_pins(void)
 {
     struct placement_assessment_view v; struct ds_connector_report rep;
-    reg_init(); st_init("sha256:p", NULL);
-    const char *other = rec(1, 1, "s", "\"i\"", "192.168.64.71", "/mnt/data", 2049, "NEW_ALLOCATION",
-                            "cluster-default", "VALID", 15000, "sha256:q", "true", 1000000, "null");
-    char recs[8192]; snprintf(recs, sizeof(recs), "%s,%s", rec_ok(0), other);
+    char recs[8192];
+    reg_init(); st_init(NULL, NULL);
+    snprintf(recs, sizeof(recs), "%s,%s", rec_prof(0, "zfs-mvp", "sha256:z"),
+             rec_prof(1, "xinas-mvp", "sha256:p"));
+    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", recs), &v, &rep), DC_OK);
+    ASSERT_EQ(rep.accepted, 2u);
+    ASSERT_EQ(rep.rejected_binding, 0u);
+    ASSERT_EQ(v.profile_count, 2u);
+    ASSERT_EQ(strcmp(v.profiles[0].id, "xinas-mvp"), 0);     /* sorted by id */
+    ASSERT_EQ(strcmp(v.profiles[1].id, "zfs-mvp"), 0);
+    ASSERT_EQ(strcmp(v.profiles[1].digest, "sha256:z"), 0);
+}
+
+static void test_profiles_pinned_by_id(void)
+{
+    struct placement_assessment_view v; struct ds_connector_report rep;
+    char recs[8192];
+    snprintf(recs, sizeof(recs), "%s,%s", rec_prof(0, "xinas-mvp", "sha256:p"),
+             rec_prof(1, "zfs-mvp", "sha256:z"));
+    /* both pinned */
+    reg_init(); st_init("xinas-mvp=sha256:p,zfs-mvp=sha256:z", NULL);
+    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", recs), &v, &rep), DC_OK);
+    ASSERT_EQ(rep.accepted, 2u);
+    /* an unpinned id: only its record is rejected */
+    reg_init(); st_init("xinas-mvp=sha256:p", NULL);
     ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", recs), &v, &rep), DC_OK);
     ASSERT_EQ(rep.accepted, 1u);
     ASSERT_EQ(rep.rejected_binding, 1u);
     ASSERT_EQ(v.rows[1].present, false);
-    /* without a pin two digests inside one batch still reject the second */
-    st_init(NULL, NULL);
+    ASSERT_TRUE(strstr(rep.detail, "not pinned") != NULL);
+    /* a wrong digest for a pinned id: only its record is rejected */
+    reg_init(); st_init("xinas-mvp=sha256:p,zfs-mvp=sha256:other", NULL);
     ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", recs), &v, &rep), DC_OK);
     ASSERT_EQ(rep.accepted, 1u);
     ASSERT_EQ(rep.rejected_binding, 1u);
-    /* a connector profile reload (new digest on every record, same binding
-     * tuple) is accepted without a connector restart: the digest is not part
-     * of the pin */
-    const char *reloaded = rec(0, 2, "mnt/data", "\"mnt/data:0:u\"", "192.168.64.51", "/mnt/data", 2049,
-                               "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:q", "true", 1000000, "null");
-    ASSERT_EQ(apply(batch("rt-1", "e1", 2, "2026-09-24T10:00:02Z", "c", "COMPLETE", reloaded), &v, &rep), DC_OK);
+    ASSERT_TRUE(strstr(rep.detail, "!= pinned") != NULL);
+}
+
+static void test_profiles_inconsistent_batch_is_dropped(void)
+{
+    struct placement_assessment_view v; struct ds_connector_report rep;
+    char recs[8192];
+    const char *wrong_endpoint;
+    reg_init(); st_init(NULL, NULL);
+    snprintf(recs, sizeof(recs), "%s,%s", rec_prof(0, "xinas-mvp", "sha256:p"),
+             rec_prof(1, "xinas-mvp", "sha256:q"));
+    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", recs), &v, &rep),
+              DC_PROFILE_INCONSISTENT);
+    ASSERT_EQ(v.batch_valid, false);
+    ASSERT_TRUE(strstr(rep.detail, "xinas-mvp") != NULL);
+    /* still dropped when the second record fails a binding check */
+    wrong_endpoint = rec(1, 2, "mnt/data", "\"mnt/data:0:u\"", "10.9.9.9", "/mnt/data", 2049,
+                         "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:q", "true",
+                         1000000, "\"ctrl-1/fs-1/inc\"");
+    snprintf(recs, sizeof(recs), "%s,%s", rec_prof(0, "xinas-mvp", "sha256:p"), wrong_endpoint);
+    reg_init(); st_init(NULL, NULL);
+    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", recs), &v, &rep),
+              DC_PROFILE_INCONSISTENT);
+}
+
+static void test_profiles_limit_and_invalid_id(void)
+{
+    struct placement_assessment_view v; struct ds_connector_report rep;
+    char recs[16384];
+    char id[16];
+    size_t off = 0;
+    reg_init(); st_init(NULL, NULL);
+    for (uint32_t ds = 0; ds < PM_PROFILES_MAX + 1; ds++) {
+        snprintf(id, sizeof(id), "p%u", (unsigned)ds);
+        off += (size_t)snprintf(recs + off, sizeof(recs) - off, "%s%s", ds == 0 ? "" : ",",
+                                rec_prof(ds, id, "sha256:p"));
+    }
+    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", recs), &v, &rep),
+              DC_PROFILE_LIMIT);
+    /* an id outside [A-Za-z0-9._-]{1,63} is a shape rejection */
+    reg_init(); st_init(NULL, NULL);
+    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE",
+                          rec_prof(0, "bad id", "sha256:p")), &v, &rep), DC_OK);
+    ASSERT_EQ(rep.rejected_shape, 1u);
+    ASSERT_EQ(rep.accepted, 0u);
+}
+
+static void test_profile_reload_with_and_without_pin(void)
+{
+    struct placement_assessment_view v; struct ds_connector_report rep;
+    /* no pin: a reload (new digest, same binding tuple) is accepted -- the
+     * digest is not part of the per-DS pin */
+    reg_init(); st_init(NULL, NULL);
+    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE",
+                          rec_prof(0, "xinas-mvp", "sha256:p")), &v, &rep), DC_OK);
+    ASSERT_EQ(apply(batch("rt-1", "e1", 2, "2026-09-24T10:00:02Z", "c", "COMPLETE",
+                          rec_prof(0, "xinas-mvp", "sha256:q")), &v, &rep), DC_OK);
     ASSERT_EQ(rep.accepted, 1u);
-    ASSERT_EQ(rep.rejected_binding, 0u);
-    ASSERT_EQ(strcmp(v.profile_digest, "sha256:q"), 0);
+    ASSERT_EQ(strcmp(v.profiles[0].digest, "sha256:q"), 0);
+    /* pinned to the old digest: the reloaded record is rejected */
+    reg_init(); st_init("xinas-mvp=sha256:p", NULL);
+    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE",
+                          rec_prof(0, "xinas-mvp", "sha256:q")), &v, &rep), DC_OK);
+    ASSERT_EQ(rep.accepted, 0u);
+    ASSERT_EQ(rep.rejected_binding, 1u);
 }
 
 static void test_endpoint_rule(void)
@@ -648,7 +755,8 @@ static void test_poll_once_publishes_and_readiness(void)
     ASSERT_EQ(r.eligible_ds, 1u);
     ASSERT_EQ(strcmp(r.coverage, "partial"), 0);
     ASSERT_EQ(strcmp(r.config_digest, "cfg-d"), 0);
-    ASSERT_EQ(strcmp(r.profile_digest, "sha256:p"), 0);
+    ASSERT_EQ(r.profile_count, 1u);
+    ASSERT_EQ(strcmp(r.profiles[0].digest, "sha256:p"), 0);
     ASSERT_EQ(atomic_load(&g_branch_metrics.connector_covered_ds), 1u);
 
 #define RESERVE(status, body_) do { \
@@ -1018,7 +1126,11 @@ int main(void)
     RUN_TEST(test_runtime_epoch_change_resets_pins);
     RUN_TEST(test_old_generated_at_is_dropped);
     RUN_TEST(test_config_digest_pin);
-    RUN_TEST(test_profile_digest_pin_and_consistency);
+    RUN_TEST(test_profiles_two_ids_without_pins);
+    RUN_TEST(test_profiles_pinned_by_id);
+    RUN_TEST(test_profiles_inconsistent_batch_is_dropped);
+    RUN_TEST(test_profiles_limit_and_invalid_id);
+    RUN_TEST(test_profile_reload_with_and_without_pin);
     RUN_TEST(test_binding_rules_in_a_batch);
     RUN_TEST(test_unknown_duplicate_failed_and_shape);
     RUN_TEST(test_json_and_size_and_schema);

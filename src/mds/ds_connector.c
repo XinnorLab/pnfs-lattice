@@ -466,6 +466,7 @@ struct rec {
     char     access_scope[PM_SCOPE_MAX];
     bool     valid;
     uint64_t remaining_ttl_ms;
+    char     profile_id[PM_PROFILE_ID_MAX];
     char     profile_digest[PM_DIGEST_MAX];
     bool     allowed;
     uint64_t ppm;
@@ -555,7 +556,12 @@ static bool parse_record(const struct jdoc *d, int obj, struct rec *r,
     }
     pr = tok_get(d, obj, "profile");
     if (!tok_is(d, pr, JSMN_OBJECT) ||
-        !tok_copy(d, tok_get(d, pr, "digest"), r->profile_digest, sizeof(r->profile_digest))) {
+        !tok_copy(d, tok_get(d, pr, "id"), r->profile_id, sizeof(r->profile_id)) ||
+        !pm_profile_id_valid(r->profile_id, strlen(r->profile_id))) {
+        set_detail(rep, "ds %u: profile.id invalid", r->ds_id);
+        return false;
+    }
+    if (!tok_copy(d, tok_get(d, pr, "digest"), r->profile_digest, sizeof(r->profile_digest))) {
         set_detail(rep, "ds %u: profile.digest invalid", r->ds_id);
         return false;
     }
@@ -610,10 +616,10 @@ static bool parse_record(const struct jdoc *d, int obj, struct rec *r,
     return true;
 }
 
-/* The pin excludes profile.digest on purpose: the digest is checked on
- * every batch (pin key + batch-wide consistency), and a connector profile
- * reload must not strand the DS in BINDING_MISMATCH until a process
- * restart (review finding B-6). */
+/* The pin excludes the profile on purpose: profiles are checked on every
+ * batch (pins by id + batch consistency), and a connector profile reload
+ * must not strand the DS in BINDING_MISMATCH until a process restart
+ * (review finding B-6). */
 static bool pin_matches(const struct ds_connector_pin *p, const struct rec *r,
                         const char *instance)
 {
@@ -637,7 +643,6 @@ static void pin_set(struct ds_connector_pin *p, const struct rec *r, const char 
     (void)snprintf(p->datastore_id, sizeof(p->datastore_id), "%s", r->datastore_id);
     (void)snprintf(p->target_id, sizeof(p->target_id), "%s", r->target_id);
     (void)snprintf(p->target_incarnation, sizeof(p->target_incarnation), "%s", r->target_incarnation);
-    (void)snprintf(p->profile_digest, sizeof(p->profile_digest), "%s", r->profile_digest);
     (void)snprintf(p->access_scope, sizeof(p->access_scope), "%s", r->access_scope);
 }
 
@@ -649,6 +654,50 @@ struct inst_update {
     bool     failed_snapshot;
     int      assessments_tok;
 };
+
+static const struct pm_profile_pin *profile_find(const struct pm_profile_pin *p, uint32_t n,
+                                                 const char *id)
+{
+    uint32_t i;
+
+    for (i = 0; i < n; i++) {
+        if (strcmp(p[i].id, id) == 0) {
+            return &p[i];
+        }
+    }
+    return NULL;
+}
+
+/* Record one well-formed record's profile in the batch map (design §3.4). */
+static enum ds_connector_drop batch_profile_note(struct pm_profile_pin *map, uint32_t *n,
+                                                 const struct rec *r,
+                                                 struct ds_connector_report *rep)
+{
+    const struct pm_profile_pin *seen = profile_find(map, *n, r->profile_id);
+
+    if (seen != NULL) {
+        if (strcmp(seen->digest, r->profile_digest) != 0) {
+            set_detail(rep, "profile %s: digests %s and %s in one batch",
+                       r->profile_id, seen->digest, r->profile_digest);
+            return DC_PROFILE_INCONSISTENT;
+        }
+        return DC_OK;
+    }
+    if (*n == PM_PROFILES_MAX) {
+        set_detail(rep, "more than %d profiles in one batch", PM_PROFILES_MAX);
+        return DC_PROFILE_LIMIT;
+    }
+    (void)snprintf(map[*n].id, sizeof(map[*n].id), "%s", r->profile_id);
+    (void)snprintf(map[*n].digest, sizeof(map[*n].digest), "%s", r->profile_digest);
+    (*n)++;
+    return DC_OK;
+}
+
+static int profile_pin_cmp(const void *a, const void *b)
+{
+    return strcmp(((const struct pm_profile_pin *)a)->id,
+                  ((const struct pm_profile_pin *)b)->id);
+}
 
 /* NOLINTNEXTLINE(readability-function-cognitive-complexity) */
 enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
@@ -672,7 +721,8 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
     bool epoch_reset = false;
     char runtime_epoch[DC_NAME_MAX];
     char config_digest[PM_DIGEST_MAX];
-    char batch_profile[PM_DIGEST_MAX];
+    struct pm_profile_pin batch_profiles[PM_PROFILES_MAX];
+    uint32_t n_batch_profiles = 0;
     uint64_t generated_ms;
     enum ds_connector_drop drop = DC_SCHEMA;
     int i;
@@ -937,7 +987,6 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
     if (!epoch_reset) {
         memcpy(new_pins, st->pins, MDS_MAX_DS_NODES * sizeof(*new_pins));
     }
-    batch_profile[0] = '\0';
     out->count = reg->count;
     for (i = 0; i < (int)reg->count; i++) {
         out->rows[i].ds_id = reg->ds[i].ds_id;
@@ -959,6 +1008,15 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
             if (!parse_record(&d, obj, &r, rep)) {
                 rep->rejected_shape++;
                 continue;
+            }
+            {
+                enum ds_connector_drop pdrop =
+                    batch_profile_note(batch_profiles, &n_batch_profiles, &r, rep);
+
+                if (pdrop != DC_OK) {
+                    drop = pdrop;
+                    goto out_drop;
+                }
             }
             if (r.ds_id >= st->cfg.max_ds) {
                 rep->unknown_ds++;
@@ -996,18 +1054,22 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
                            rd->host, rd->export_path, (unsigned)rd->tcp_port);
                 continue;
             }
-            if (st->cfg.expected_profile_digest[0] != '\0' &&
-                strcmp(st->cfg.expected_profile_digest, r.profile_digest) != 0) {
-                rep->rejected_binding++;
-                set_detail(rep, "ds %u: profile digest %s != expected", r.ds_id, r.profile_digest);
-                continue;
-            }
-            if (batch_profile[0] == '\0') {
-                (void)snprintf(batch_profile, sizeof(batch_profile), "%s", r.profile_digest);
-            } else if (strcmp(batch_profile, r.profile_digest) != 0) {
-                rep->rejected_binding++;
-                set_detail(rep, "ds %u: profile digest differs inside the batch", r.ds_id);
-                continue;
+            if (st->cfg.expected_profile_count > 0) {
+                const struct pm_profile_pin *pin =
+                    profile_find(st->cfg.expected_profiles, st->cfg.expected_profile_count,
+                                 r.profile_id);
+
+                if (pin == NULL) {
+                    rep->rejected_binding++;
+                    set_detail(rep, "ds %u: profile %s not pinned", r.ds_id, r.profile_id);
+                    continue;
+                }
+                if (strcmp(pin->digest, r.profile_digest) != 0) {
+                    rep->rejected_binding++;
+                    set_detail(rep, "ds %u: profile %s digest %s != pinned", r.ds_id,
+                               r.profile_id, r.profile_digest);
+                    continue;
+                }
             }
             if (new_pins[r.ds_id].pinned) {
                 const struct ds_connector_pin *p = &new_pins[r.ds_id];
@@ -1096,7 +1158,9 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
     out->batch_valid = true;
     out->batch_received_mono_ms = now_mono_ms;
     (void)snprintf(out->config_digest, sizeof(out->config_digest), "%s", config_digest);
-    (void)snprintf(out->profile_digest, sizeof(out->profile_digest), "%s", batch_profile);
+    qsort(batch_profiles, n_batch_profiles, sizeof(batch_profiles[0]), profile_pin_cmp);
+    out->profile_count = n_batch_profiles;
+    memcpy(out->profiles, batch_profiles, n_batch_profiles * sizeof(batch_profiles[0]));
     rep->drop = DC_OK;
     free(seen);
     free(new_pins);
@@ -1576,8 +1640,9 @@ int ds_connector_configure(const struct mds_config *cfg, struct ds_cache *cache)
     dcfg.contract_major = cfg->ds_connector_expected_contract_major;
     dcfg.max_ds = cfg->ds_connector_max_ds;
     (void)snprintf(dcfg.access_scope, sizeof(dcfg.access_scope), "%s", cfg->ds_connector_access_scope);
-    (void)snprintf(dcfg.expected_profile_digest, sizeof(dcfg.expected_profile_digest), "%s",
-                   cfg->ds_connector_expected_profile_digest);
+    dcfg.expected_profile_count = cfg->ds_connector_expected_profile_count;
+    memcpy(dcfg.expected_profiles, cfg->ds_connector_expected_profiles,
+           sizeof(dcfg.expected_profiles));
     (void)snprintf(dcfg.expected_config_digest, sizeof(dcfg.expected_config_digest), "%s",
                    cfg->ds_connector_expected_config_digest);
     pthread_mutex_lock(&g_dc.lock);

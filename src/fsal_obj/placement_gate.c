@@ -907,7 +907,8 @@ void placement_gate_readiness(struct placement_readiness *out)
         uint32_t i;
 
         memcpy(out->config_digest, ctx.assess->config_digest, sizeof(out->config_digest));
-        memcpy(out->profile_digest, ctx.assess->profile_digest, sizeof(out->profile_digest));
+        out->profile_count = ctx.assess->profile_count;
+        memcpy(out->profiles, ctx.assess->profiles, sizeof(out->profiles));
         for (i = 0; i < ctx.assess->count; i++) {
             const struct placement_assessment_row *r = &ctx.assess->rows[i];
 

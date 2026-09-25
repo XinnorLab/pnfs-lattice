@@ -45,7 +45,8 @@ struct ds_connector_cfg {
     uint32_t contract_major;
     uint32_t max_ds;
     char     access_scope[PM_SCOPE_MAX];
-    char     expected_profile_digest[PM_DIGEST_MAX];   /* "" = not pinned */
+    uint32_t expected_profile_count;                       /* 0 = not pinned */
+    struct pm_profile_pin expected_profiles[PM_PROFILES_MAX];
     char     expected_config_digest[PM_DIGEST_MAX];    /* "" = not pinned */
 };
 
@@ -57,7 +58,6 @@ struct ds_connector_pin {
     char     datastore_id[DC_NAME_MAX];
     char     target_id[DC_NAME_MAX];
     char     target_incarnation[DC_NAME_MAX];
-    char     profile_digest[PM_DIGEST_MAX];
     char     access_scope[PM_SCOPE_MAX];
 };
 
