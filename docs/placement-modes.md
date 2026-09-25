@@ -143,9 +143,13 @@ an accepted batch every assessment is bound before it is trusted: `scope`
 = `NEW_ALLOCATION`, `access_scope_id` = `ds_connector_access_scope`,
 `endpoint.server` = the registry host, `endpoint.port` = the registry
 port, and the registered export path equals the endpoint's or lies under
-it (`192.168.64.51:/mnt/data/pnfs-ds` inside the share `/mnt/data`);
-when profile pins are set via `ds_connector_expected_profiles`, each record's profile id must be in the pin map with a matching digest; records with unpinned ids or mismatched digests are rejected. When pins are unset, any profile is accepted. The batch is dropped if one profile id carries two digests or if there are more than 8 distinct profile ids (a trailing `/` on the
-endpoint path names the same share).  The first accepted tuple
+it (`192.168.64.51:/mnt/data/pnfs-ds` inside the share `/mnt/data`; a
+trailing `/` on the endpoint path names the same share); when profile
+pins are set via `ds_connector_expected_profiles`, each record's profile
+id must be in the pin map with a matching digest; records with unpinned
+ids or mismatched digests are rejected. When pins are unset, any profile
+is accepted. The batch is dropped if one profile id carries two digests
+or if there are more than 8 distinct profile ids.  The first accepted tuple
 `(instance, binding_generation, datastore_id, target_id,
 target_incarnation, access scope)` is pinned per DS; a later record must
 repeat it or carry a higher `binding_generation` (rebind: the DS is
