@@ -102,18 +102,28 @@ static void test_smart_parses_with_connector_defaults(void)
     ASSERT_EQ(cfg.ds_connector_expected_contract_major, 1u);
     ASSERT_EQ(cfg.ds_connector_max_ds, 256u);
     ASSERT_EQ(strcmp(cfg.ds_connector_access_scope, "cluster-default"), 0);
-    ASSERT_EQ(cfg.ds_connector_expected_profile_digest[0], '\0');
+    ASSERT_EQ(cfg.ds_connector_expected_profile_count, 0u);
     ASSERT_EQ(cfg.placement_policy, PLACEMENT_WEIGHTED_RR);
     ASSERT_EQ(strlen(cfg.placement_config_generation), 64u);
     /* explicit, consistent values */
-    ASSERT_EQ(write_tmp_ini("placement_mode = smart\nds_connector_enabled = true\nds_connector_socket = /tmp/c.sock\nds_connector_poll_ms = 5000\nds_connector_request_deadline_ms = 4000\nds_connector_max_ds = 8\nds_connector_access_scope = lab\nds_connector_expected_profile_digest = sha256:abc\n", path), 0);
+    ASSERT_EQ(write_tmp_ini("placement_mode = smart\nds_connector_enabled = true\nds_connector_socket = /tmp/c.sock\nds_connector_poll_ms = 5000\nds_connector_request_deadline_ms = 4000\nds_connector_max_ds = 8\nds_connector_access_scope = lab\nds_connector_expected_profiles = zfs-mvp=sha256:z,xinas-mvp=sha256:abc\n", path), 0);
     ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);
     ASSERT_EQ(strcmp(cfg.ds_connector_socket, "/tmp/c.sock"), 0);
     ASSERT_EQ(cfg.ds_connector_poll_ms, 5000u);
     ASSERT_EQ(cfg.ds_connector_request_deadline_ms, 4000u);
     ASSERT_EQ(cfg.ds_connector_max_ds, 8u);
     ASSERT_EQ(strcmp(cfg.ds_connector_access_scope, "lab"), 0);
-    ASSERT_EQ(strcmp(cfg.ds_connector_expected_profile_digest, "sha256:abc"), 0);
+    ASSERT_EQ(cfg.ds_connector_expected_profile_count, 2u);
+    ASSERT_EQ(strcmp(cfg.ds_connector_expected_profiles[0].id, "xinas-mvp"), 0);
+    ASSERT_EQ(strcmp(cfg.ds_connector_expected_profiles[0].digest, "sha256:abc"), 0);
+    ASSERT_EQ(strcmp(cfg.ds_connector_expected_profiles[1].id, "zfs-mvp"), 0);
+    {
+        /* the pins are part of the config generation */
+        struct mds_config other; char p2[128];
+        ASSERT_EQ(write_tmp_ini("placement_mode = smart\nds_connector_enabled = true\nds_connector_socket = /tmp/c.sock\nds_connector_poll_ms = 5000\nds_connector_request_deadline_ms = 4000\nds_connector_max_ds = 8\nds_connector_access_scope = lab\nds_connector_expected_profiles = xinas-mvp=sha256:abc\n", p2), 0);
+        ASSERT_EQ(mds_config_load(p2, &other), MDS_OK);
+        ASSERT_EQ(strcmp(cfg.placement_config_generation, other.placement_config_generation) != 0, 1);
+    }
 }
 
 static void test_smart_connector_conflicts_and_ranges(void)
@@ -138,6 +148,10 @@ static void test_smart_connector_conflicts_and_ranges(void)
         "placement_policy_enabled = true\nds_connector_enabled = true\n",
         "placement_mode = smart\nds_connector_poll_ms = 1s\n",
         "placement_mode = smart\nds_connector_access_scope = \n",
+        "placement_mode = smart\nds_connector_expected_profile_digest = sha256:abc\n",   /* removed key */
+        "placement_mode = smart\nds_connector_expected_profiles = \n",
+        "placement_mode = smart\nds_connector_expected_profiles = bad id=sha256:a\n",
+        "placement_mode = smart\nds_connector_expected_profiles = a=x,a=y\n",
     };
     for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
         struct mds_config cfg; char path[128];

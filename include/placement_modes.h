@@ -58,7 +58,8 @@ enum placement_shrink {
 #define PM_KEY_CONN_CONTRACT_MAJOR   "ds_connector_expected_contract_major"
 #define PM_KEY_CONN_MAX_DS           "ds_connector_max_ds"
 #define PM_KEY_CONN_ACCESS_SCOPE     "ds_connector_access_scope"
-#define PM_KEY_CONN_PROFILE_DIGEST   "ds_connector_expected_profile_digest"
+/* Replaced by PM_KEY_CONN_PROFILES; its presence is a config error. */
+#define PM_KEY_CONN_PROFILE_DIGEST_REMOVED "ds_connector_expected_profile_digest"
 #define PM_KEY_CONN_PROFILES         "ds_connector_expected_profiles"
 #define PM_KEY_CONN_CONFIG_DIGEST    "ds_connector_expected_config_digest"
 #define PM_DEFAULT_CONN_SOCKET       "/run/lattice-ds-connector/connector.sock"

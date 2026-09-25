@@ -291,7 +291,17 @@ void placement_config_generation(const struct mds_config *cfg, char out[65])
         APPEND("conn_major=%u\n", (unsigned)cfg->ds_connector_expected_contract_major);
         APPEND("conn_max_ds=%u\n", (unsigned)cfg->ds_connector_max_ds);
         APPEND("conn_scope=%s\n", cfg->ds_connector_access_scope);
-        APPEND("conn_profile=%s\n", cfg->ds_connector_expected_profile_digest);
+        {
+            char pins[PM_PROFILES_MAX * (PM_PROFILE_ID_MAX + PM_DIGEST_MAX + 1)];
+
+            if (pm_format_profile_pins(cfg->ds_connector_expected_profiles,
+                                       cfg->ds_connector_expected_profile_count,
+                                       pins, sizeof(pins)) < 0) {
+                free(buf);
+                return;
+            }
+            APPEND("conn_profiles=%s\n", pins);
+        }
         APPEND("conn_config=%s\n", cfg->ds_connector_expected_config_digest);
     }
 #undef APPEND
