@@ -142,9 +142,12 @@ standard JSON escapes including `\uXXXX` surrogate pairs, so a
 an accepted batch every assessment is bound before it is trusted: `scope`
 = `NEW_ALLOCATION`, `access_scope_id` = `ds_connector_access_scope`,
 `endpoint.server` = the registry host, `endpoint.port` = the registry
-port, and the registered export path equals the endpoint's or lies under
-it (`192.168.64.51:/mnt/data/pnfs-ds` inside the share `/mnt/data`; a
-trailing `/` on the endpoint path names the same share); when profile
+port, trailing `/` is normalized (dropped, `/` stays `/`) on paths, and
+without `endpoint.ds_path` the `export_path` must equal the registered
+path exactly; when `ds_path` is present, it must equal the registered
+path and `export_path` must equal `ds_path` or be a component-wise
+ancestor of it (but not `/` unless `ds_path = /`). A DS registered in a
+subdirectory of a share needs `ds_path` in the connector binding. When profile
 pins are set via `ds_connector_expected_profiles`, each record's profile
 id must be in the pin map with a matching digest; records with unpinned
 ids or mismatched digests are rejected. When pins are unset, any profile
