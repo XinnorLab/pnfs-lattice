@@ -60,7 +60,8 @@ struct placement_assessment_view {
     bool     batch_valid;
     uint64_t batch_received_mono_ms;
     char     config_digest[PM_DIGEST_MAX];
-    char     profile_digest[PM_DIGEST_MAX];
+    uint32_t profile_count;                          /* profiles of the last accepted batch */
+    struct pm_profile_pin profiles[PM_PROFILES_MAX]; /* sorted by id */
 };
 
 struct placement_ctx {
@@ -167,7 +168,8 @@ struct placement_readiness {
     char     coverage[8];              /* "full" | "partial" | "none" | "n/a" */
     uint64_t last_success_mono_ms;
     char     config_digest[PM_DIGEST_MAX];
-    char     profile_digest[PM_DIGEST_MAX];
+    uint32_t profile_count;
+    struct pm_profile_pin profiles[PM_PROFILES_MAX];
     char     last_detail[160];
 };
 void placement_gate_readiness(struct placement_readiness *out);

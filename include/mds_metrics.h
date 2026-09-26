@@ -16,6 +16,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "mds_histogram.h"
+#include "placement_modes.h" /* enum ds_connector_drop, DC_COUNT */
 
 /* Live counters (written by hot paths, read by snapshot). */
 struct mds_metrics {
@@ -175,7 +176,7 @@ struct mds_branch_metrics {
     _Atomic uint64_t placement_mode_gauge;           /**< enum placement_mode of the gate (0 = legacy) */
     /* Connector client (smart). */
     _Atomic uint64_t connector_poll_errors_total[8];   /**< by enum ds_connector_poll_error */
-    _Atomic uint64_t connector_batches_dropped_total[8]; /**< by enum ds_connector_drop */
+    _Atomic uint64_t connector_batches_dropped_total[DC_COUNT]; /**< by enum ds_connector_drop */
     _Atomic uint64_t connector_batches_accepted_total;
     _Atomic uint64_t connector_last_success_mono_ms;   /**< gauge source; 0 = never */
     _Atomic uint64_t connector_covered_ds;             /**< gauge */

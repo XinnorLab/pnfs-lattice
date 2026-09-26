@@ -13,6 +13,8 @@
 #ifndef PLACEMENT_MODES_H
 #define PLACEMENT_MODES_H
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /*
@@ -56,7 +58,9 @@ enum placement_shrink {
 #define PM_KEY_CONN_CONTRACT_MAJOR   "ds_connector_expected_contract_major"
 #define PM_KEY_CONN_MAX_DS           "ds_connector_max_ds"
 #define PM_KEY_CONN_ACCESS_SCOPE     "ds_connector_access_scope"
-#define PM_KEY_CONN_PROFILE_DIGEST   "ds_connector_expected_profile_digest"
+/* Replaced by PM_KEY_CONN_PROFILES; its presence is a config error. */
+#define PM_KEY_CONN_PROFILE_DIGEST_REMOVED "ds_connector_expected_profile_digest"
+#define PM_KEY_CONN_PROFILES         "ds_connector_expected_profiles"
 #define PM_KEY_CONN_CONFIG_DIGEST    "ds_connector_expected_config_digest"
 #define PM_DEFAULT_CONN_SOCKET       "/run/lattice-ds-connector/connector.sock"
 #define PM_DEFAULT_CONN_POLL_MS      1000u
@@ -69,6 +73,23 @@ enum placement_shrink {
 #define PM_DEFAULT_CONN_ACCESS_SCOPE "cluster-default"
 #define PM_CONN_SCOPE                "NEW_ALLOCATION"
 #define PM_DIGEST_MAX                128
+#define PM_PROFILES_MAX              8
+#define PM_PROFILE_ID_MAX            64    /* [A-Za-z0-9._-]{1,63} + NUL */
+
+/* One pinned connector profile: ds_connector_expected_profiles item, and
+ * one entry of a batch's profile map (per-profile digest design, §3). */
+struct pm_profile_pin {
+    char id[PM_PROFILE_ID_MAX];
+    char digest[PM_DIGEST_MAX];
+};
+
+bool pm_profile_id_valid(const char *s, size_t len);
+/* "id=digest[,id=digest...]" -> out[] sorted by id; 0 ok, -1 error (err set). */
+int  pm_parse_profile_pins(const char *val, struct pm_profile_pin out[PM_PROFILES_MAX],
+                           uint32_t *count, char *err, size_t errcap);
+/* "id=digest,..." or "-" when n == 0; bytes written, -1 when cap is too small. */
+int  pm_format_profile_pins(const struct pm_profile_pin *p, uint32_t n,
+                            char *buf, size_t cap);
 
 /* Build facts behind the `placement_build` config-show row (design
  * section 9): the connector client and the enterprise prealloc module are
@@ -119,6 +140,8 @@ enum ds_connector_drop {
     DC_OLD_GENERATED_AT,
     DC_CONFIG_DIGEST,
     DC_TOO_LARGE,
+    DC_PROFILE_INCONSISTENT, /* one profile id with two digests in one batch */
+    DC_PROFILE_LIMIT,        /* more than PM_PROFILES_MAX profile ids in one batch */
     DC_COUNT
 };
 const char *ds_connector_drop_name(enum ds_connector_drop d);

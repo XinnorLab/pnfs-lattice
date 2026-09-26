@@ -1425,17 +1425,29 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
             } else {
                 cfg->ds_connector_max_ds = (uint32_t)v;
             }
+        } else if (strcmp(key, PM_KEY_CONN_PROFILE_DIGEST_REMOVED) == 0) {
+            (void)fprintf(stderr,
+                "ERROR: %s was replaced by %s = <profile-id>=<digest>[,...]\n",
+                key, PM_KEY_CONN_PROFILES);
+            (void)fclose(fp);
+            return MDS_ERR_INVAL;
+        } else if (strcmp(key, PM_KEY_CONN_PROFILES) == 0) {
+            char perr[160];
+
+            if (pm_parse_profile_pins(val, cfg->ds_connector_expected_profiles,
+                                      &cfg->ds_connector_expected_profile_count,
+                                      perr, sizeof(perr)) != 0) {
+                (void)fprintf(stderr, "ERROR: %s: %s\n", key, perr);
+                (void)fclose(fp);
+                return MDS_ERR_INVAL;
+            }
         } else if (strcmp(key, PM_KEY_CONN_ACCESS_SCOPE) == 0 ||
-                   strcmp(key, PM_KEY_CONN_PROFILE_DIGEST) == 0 ||
                    strcmp(key, PM_KEY_CONN_CONFIG_DIGEST) == 0) {
             char *dst;
             size_t dcap;
             if (strcmp(key, PM_KEY_CONN_ACCESS_SCOPE) == 0) {
                 dst = cfg->ds_connector_access_scope;
                 dcap = sizeof(cfg->ds_connector_access_scope);
-            } else if (strcmp(key, PM_KEY_CONN_PROFILE_DIGEST) == 0) {
-                dst = cfg->ds_connector_expected_profile_digest;
-                dcap = sizeof(cfg->ds_connector_expected_profile_digest);
             } else {
                 dst = cfg->ds_connector_expected_config_digest;
                 dcap = sizeof(cfg->ds_connector_expected_config_digest);

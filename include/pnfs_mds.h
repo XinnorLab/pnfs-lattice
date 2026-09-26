@@ -741,7 +741,8 @@ struct mds_config {
     uint32_t              ds_connector_expected_contract_major;
     uint32_t              ds_connector_max_ds;
     char                  ds_connector_access_scope[PM_SCOPE_MAX];
-    char                  ds_connector_expected_profile_digest[PM_DIGEST_MAX];
+    uint32_t              ds_connector_expected_profile_count;
+    struct pm_profile_pin ds_connector_expected_profiles[PM_PROFILES_MAX];
     char                  ds_connector_expected_config_digest[PM_DIGEST_MAX];
 
     /*

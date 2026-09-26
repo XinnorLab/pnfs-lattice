@@ -102,7 +102,7 @@ names no mode to serve):
 - `ds_connector_expected_contract_major` — accepted `contract_version` major.  Default: 1.
 - `ds_connector_max_ds` — highest accepted `ds_id` count (1..256).  Default: 256.
 - `ds_connector_access_scope` — required `access_scope_id` of every assessment.  Default: `cluster-default`.
-- `ds_connector_expected_profile_digest` / `ds_connector_expected_config_digest` — optional pins; a batch or record with another digest is dropped.
+- `ds_connector_expected_profiles` — optional pins, `<profile-id>=<digest>[,...]` (at most 8, id `[A-Za-z0-9._-]{1,63}`); a record whose profile id is not pinned or whose digest differs from its pin is rejected. `ds_connector_expected_profile_digest` was removed and is a config error. `ds_connector_expected_config_digest` — optional pin; a batch with another config digest is dropped.
 The daemon logs `placement_mode=<mode> generation=<sha256[:12]> …` at startup; `placement_config_generation` (a SHA-256 of the managed keys) is what `lattice-placement mode verify` compares across MDS.
 ## Authentication
 - `nfs_auth_mode` — `sys|krb5|krb5i|krb5p`.

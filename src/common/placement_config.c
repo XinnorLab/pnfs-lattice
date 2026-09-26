@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <assert.h>
 
 #include <openssl/sha.h>
@@ -76,6 +77,8 @@ static const char *const drop_names[DC_COUNT] = {
     [DC_OLD_GENERATED_AT] = "OLD_GENERATED_AT",
     [DC_CONFIG_DIGEST] = "CONFIG_DIGEST",
     [DC_TOO_LARGE] = "TOO_LARGE",
+    [DC_PROFILE_INCONSISTENT] = "PROFILE_INCONSISTENT",
+    [DC_PROFILE_LIMIT] = "PROFILE_LIMIT",
 };
 
 const char *ds_connector_drop_name(enum ds_connector_drop d)
@@ -288,7 +291,17 @@ void placement_config_generation(const struct mds_config *cfg, char out[65])
         APPEND("conn_major=%u\n", (unsigned)cfg->ds_connector_expected_contract_major);
         APPEND("conn_max_ds=%u\n", (unsigned)cfg->ds_connector_max_ds);
         APPEND("conn_scope=%s\n", cfg->ds_connector_access_scope);
-        APPEND("conn_profile=%s\n", cfg->ds_connector_expected_profile_digest);
+        {
+            char pins[PM_PROFILES_MAX * (PM_PROFILE_ID_MAX + PM_DIGEST_MAX + 1)];
+
+            if (pm_format_profile_pins(cfg->ds_connector_expected_profiles,
+                                       cfg->ds_connector_expected_profile_count,
+                                       pins, sizeof(pins)) < 0) {
+                free(buf);
+                return;
+            }
+            APPEND("conn_profiles=%s\n", pins);
+        }
         APPEND("conn_config=%s\n", cfg->ds_connector_expected_config_digest);
     }
 #undef APPEND
@@ -300,4 +313,125 @@ void placement_config_generation(const struct mds_config *cfg, char out[65])
         out[2 * i + 1] = hex[digest[i] & 0x0f];
     }
     out[64] = '\0';
+}
+bool pm_profile_id_valid(const char *s, size_t len)
+{
+    size_t i;
+
+    if (s == NULL || len == 0 || len >= PM_PROFILE_ID_MAX) {
+        return false;
+    }
+    for (i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+
+        if (!(isalnum(c) || c == '.' || c == '_' || c == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int pin_cmp(const void *a, const void *b)
+{
+    return strcmp(((const struct pm_profile_pin *)a)->id,
+                  ((const struct pm_profile_pin *)b)->id);
+}
+
+static void trim(const char **s, size_t *len)
+{
+    while (*len > 0 && isspace((unsigned char)**s)) {
+        (*s)++;
+        (*len)--;
+    }
+    while (*len > 0 && isspace((unsigned char)(*s)[*len - 1])) {
+        (*len)--;
+    }
+}
+
+int pm_parse_profile_pins(const char *val, struct pm_profile_pin out[PM_PROFILES_MAX],
+                          uint32_t *count, char *err, size_t errcap)
+{
+    const char *p = val;
+    uint32_t n = 0;
+    uint32_t i;
+
+    *count = 0;
+    if (val == NULL || val[0] == '\0') {
+        (void)snprintf(err, errcap, "empty value");
+        return -1;
+    }
+    for (;;) {
+        const char *end = strchr(p, ',');
+        size_t len = end != NULL ? (size_t)(end - p) : strlen(p);
+        const char *eq = memchr(p, '=', len);
+        const char *id = p;
+        const char *dg;
+        size_t idl;
+        size_t dgl;
+
+        if (eq == NULL) {
+            (void)snprintf(err, errcap, "item '%.*s' is not id=digest", (int)len, p);
+            return -1;
+        }
+        idl = (size_t)(eq - p);
+        dg = eq + 1;
+        dgl = len - idl - 1;
+        trim(&id, &idl);
+        trim(&dg, &dgl);
+        if (!pm_profile_id_valid(id, idl)) {
+            (void)snprintf(err, errcap, "profile id '%.*s' must match [A-Za-z0-9._-]{1,63}",
+                           (int)idl, id);
+            return -1;
+        }
+        if (dgl == 0 || dgl >= PM_DIGEST_MAX) {
+            (void)snprintf(err, errcap, "profile %.*s: digest must be 1..%d bytes",
+                           (int)idl, id, PM_DIGEST_MAX - 1);
+            return -1;
+        }
+        if (n == PM_PROFILES_MAX) {
+            (void)snprintf(err, errcap, "more than %d profiles", PM_PROFILES_MAX);
+            return -1;
+        }
+        (void)snprintf(out[n].id, sizeof(out[n].id), "%.*s", (int)idl, id);
+        (void)snprintf(out[n].digest, sizeof(out[n].digest), "%.*s", (int)dgl, dg);
+        for (i = 0; i < n; i++) {
+            if (strcmp(out[i].id, out[n].id) == 0) {
+                (void)snprintf(err, errcap, "profile %s pinned twice", out[n].id);
+                return -1;
+            }
+        }
+        n++;
+        if (end == NULL) {
+            break;
+        }
+        p = end + 1;
+    }
+    qsort(out, n, sizeof(out[0]), pin_cmp);
+    *count = n;
+    return 0;
+}
+
+int pm_format_profile_pins(const struct pm_profile_pin *p, uint32_t n,
+                           char *buf, size_t cap)
+{
+    size_t off = 0;
+    uint32_t i;
+    int w;
+
+    if (cap == 0) {
+        return -1;
+    }
+    if (n == 0) {
+        w = snprintf(buf, cap, "-");
+        return (w < 0 || (size_t)w >= cap) ? -1 : w;
+    }
+    for (i = 0; i < n; i++) {
+        w = snprintf(buf + off, cap - off, "%s%s=%s", i == 0 ? "" : ",", p[i].id, p[i].digest);
+        if (w < 0 || (size_t)w >= cap - off) {
+            buf[0] = '\0';
+            return -1;
+        }
+        off += (size_t)w;
+    }
+    return (int)off;
 }

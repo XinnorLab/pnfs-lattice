@@ -143,10 +143,13 @@ an accepted batch every assessment is bound before it is trusted: `scope`
 = `NEW_ALLOCATION`, `access_scope_id` = `ds_connector_access_scope`,
 `endpoint.server` = the registry host, `endpoint.port` = the registry
 port, and the registered export path equals the endpoint's or lies under
-it (`192.168.64.51:/mnt/data/pnfs-ds` inside the share `/mnt/data`);
-`profile.digest` identical across the batch and equal to
-`ds_connector_expected_profile_digest` when set (a trailing `/` on the
-endpoint path names the same share).  The first accepted tuple
+it (`192.168.64.51:/mnt/data/pnfs-ds` inside the share `/mnt/data`; a
+trailing `/` on the endpoint path names the same share); when profile
+pins are set via `ds_connector_expected_profiles`, each record's profile
+id must be in the pin map with a matching digest; records with unpinned
+ids or mismatched digests are rejected. When pins are unset, any profile
+is accepted. The batch is dropped if one profile id carries two digests
+or if there are more than 8 distinct profile ids.  The first accepted tuple
 `(instance, binding_generation, datastore_id, target_id,
 target_incarnation, access scope)` is pinned per DS; a later record must
 repeat it or carry a higher `binding_generation` (rebind: the DS is
@@ -159,8 +162,8 @@ compared on the rest of the tuple, accepted as UNKNOWN
 `SOURCE_UNAVAILABLE`), and it neither creates nor changes a pin (a higher
 generation clears the pin; the next VALID record pins).  A VALID record
 with a null incarnation is a shape error.  The profile digest is
-deliberately **not** part of the pin: it is checked on every batch (pin key and batch-wide consistency),
-and a connector profile reload must not strand every DS in
+deliberately **not** part of the per-DS binding tuple: it is checked on every batch for id consistency and per-id binding,
+but a connector profile reload must not strand every DS in
 `BINDING_MISMATCH` until a process restart.  Records for unknown DS ids
 are ignored; a DS id that appears more than once in a batch has no
 trusted record and pins nothing.
@@ -205,7 +208,7 @@ the connector's side.
   `placement_build = wrr=<0|1> connector=<0|1> prealloc=<0|1>` (the build
   facts `verify` compares across MDS), the thresholds,
   `ds_capacity_domain.<id>`, in `smart` `placement_readiness`,
-  `placement_connector_config_digest`, `placement_connector_profile_digest`,
+  `placement_connector_config_digest`, `placement_connector_profiles`,
   `placement_connector_last_detail`, and one `placement_ds.<id> = domain=…
   state=… capacity_age_ms=… avail=… total=… [assessment_age_ms=… quality=…
   allowed=… ppm=… ttl_ms=…] weight=… reason=…` row per registered DS

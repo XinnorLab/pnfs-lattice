@@ -6691,8 +6691,15 @@ static void render_cfg_placement(const struct mds_config *cfg,
                    (unsigned)rd.covered_ds, (unsigned)rd.eligible_ds);
         RENDER_KEY("placement_connector_config_digest", "%s",
                    rd.config_digest[0] != '\0' ? rd.config_digest : "-");
-        RENDER_KEY("placement_connector_profile_digest", "%s",
-                   rd.profile_digest[0] != '\0' ? rd.profile_digest : "-");
+        {
+            char profiles[PM_PROFILES_MAX * (PM_PROFILE_ID_MAX + PM_DIGEST_MAX + 1)];
+
+            if (pm_format_profile_pins(rd.profiles, rd.profile_count,
+                                       profiles, sizeof(profiles)) < 0) {
+                (void)snprintf(profiles, sizeof(profiles), "-");
+            }
+            RENDER_KEY("placement_connector_profiles", "%s", profiles);
+        }
         RENDER_KEY("placement_connector_last_detail", "%s",
                    rd.last_detail[0] != '\0' ? rd.last_detail : "-");
     }

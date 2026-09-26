@@ -674,7 +674,7 @@ int mds_metrics_prometheus_v2(const struct mds_metrics_snapshot *snap,
             return -1;
         }
         base += extra;
-        for (int r = 1; r < DC_COUNT && r < 8; r++) {
+        for (int r = 1; r < DC_COUNT; r++) {
             extra = snprintf(buf + base, cap - (size_t)base,
                 "pnfs_mds_connector_batches_dropped_total{reason=\"%s\"} %lu\n",
                 ds_connector_drop_name((enum ds_connector_drop)r),
