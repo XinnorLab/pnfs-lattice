@@ -375,11 +375,29 @@ uint64_t ds_connector_iso8601_ms(const char *s, size_t len)
     return (uint64_t)secs * 1000ULL + ms;
 }
 
+/* Length of p without trailing '/' ("/" keeps its one byte). */
+static size_t path_len(const char *p)
+{
+    size_t n = strlen(p);
+
+    while (n > 1 && p[n - 1] == '/') {
+        n--;
+    }
+    return n;
+}
+
+static bool path_eq(const char *a, size_t al, const char *b, size_t bl)
+{
+    return al == bl && strncmp(a, b, al) == 0;
+}
+
 bool ds_connector_endpoint_matches(const struct ds_connector_registry_ds *ds,
                                    const char *server, const char *export_path,
-                                   uint32_t port)
+                                   const char *ds_path, uint32_t port)
 {
     size_t el;
+    size_t rl;
+    size_t dl;
 
     if (ds == NULL || server == NULL || export_path == NULL) {
         return false;
@@ -390,26 +408,28 @@ bool ds_connector_endpoint_matches(const struct ds_connector_registry_ds *ds,
     if (port != 0 && ds->tcp_port != 0 && port != ds->tcp_port) {
         return false;
     }
-    el = strlen(export_path);
-    if (el == 0 || export_path[0] != '/') {
+    if (export_path[0] != '/' || ds->export_path[0] != '/') {
         return false;
     }
-    /* "/mnt/data/" names the same share as "/mnt/data" */
-    while (el > 1 && export_path[el - 1] == '/') {
-        el--;
+    el = path_len(export_path);
+    rl = path_len(ds->export_path);
+    if (ds_path == NULL || ds_path[0] == '\0') {
+        return path_eq(export_path, el, ds->export_path, rl);
     }
-    if (strlen(ds->export_path) == el && strncmp(ds->export_path, export_path, el) == 0) {
-        return true;
+    if (ds_path[0] != '/') {
+        return false;
     }
-    /* the registered directory lies under the exported share */
-    if (el > 1 && strncmp(ds->export_path, export_path, el) == 0 &&
-        ds->export_path[el] == '/') {
+    dl = path_len(ds_path);
+    if (!path_eq(ds_path, dl, ds->export_path, rl)) {
+        return false;
+    }
+    if (path_eq(export_path, el, ds_path, dl)) {
         return true;
     }
     if (el == 1) {
-        return ds->export_path[0] == '/';
+        return false;   /* "/" is never the parent of a DS path */
     }
-    return false;
+    return el < dl && strncmp(ds_path, export_path, el) == 0 && ds_path[el] == '/';
 }
 
 void ds_connector_state_init(struct ds_connector_state *st,
@@ -462,6 +482,7 @@ struct rec {
     char     target_incarnation[DC_NAME_MAX];   /* "" when null */
     char     server[MDS_DS_HOST_MAX];
     char     export_path[MDS_DS_EXPORT_MAX];
+    char     ds_path[MDS_DS_EXPORT_MAX];   /* "" when absent */
     uint64_t port;
     char     access_scope[PM_SCOPE_MAX];
     bool     valid;
@@ -524,6 +545,12 @@ static bool parse_record(const struct jdoc *d, int obj, struct rec *r,
     v = tok_get(d, ep, "transport");
     if (!(tok_str_eq(d, v, "TCP") || tok_str_eq(d, v, "RDMA"))) {
         set_detail(rep, "ds %u: endpoint.transport invalid", r->ds_id);
+        return false;
+    }
+    r->ds_path[0] = '\0';
+    v = tok_get(d, ep, "ds_path");
+    if (v >= 0 && (!tok_copy(d, v, r->ds_path, sizeof(r->ds_path)) || r->ds_path[0] != '/')) {
+        set_detail(rep, "ds %u: endpoint.ds_path invalid", r->ds_id);
         return false;
     }
     if (!tok_str_eq(d, tok_get(d, obj, "scope"), PM_CONN_SCOPE)) {
@@ -1047,10 +1074,13 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
                            r.access_scope, st->cfg.access_scope);
                 continue;
             }
-            if (!ds_connector_endpoint_matches(rd, r.server, r.export_path, (uint32_t)r.port)) {
+            if (!ds_connector_endpoint_matches(rd, r.server, r.export_path, r.ds_path,
+                                               (uint32_t)r.port)) {
                 rep->rejected_binding++;
-                set_detail(rep, "ds %u: endpoint %s:%s:%llu does not match the registry %s:%s:%u",
-                           r.ds_id, r.server, r.export_path, (unsigned long long)r.port,
+                set_detail(rep, "ds %u: endpoint %s:%s%s%s:%llu does not match the registry %s:%s:%u",
+                           r.ds_id, r.server, r.export_path,
+                           r.ds_path[0] != '\0' ? " ds_path=" : "", r.ds_path,
+                           (unsigned long long)r.port,
                            rd->host, rd->export_path, (unsigned)rd->tcp_port);
                 continue;
             }

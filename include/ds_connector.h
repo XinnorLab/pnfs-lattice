@@ -107,11 +107,14 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
 /* "YYYY-MM-DDTHH:MM:SS[.fff]Z" -> milliseconds since the epoch; 0 on error. */
 uint64_t ds_connector_iso8601_ms(const char *s, size_t len);
 
-/* Endpoint rule: server == host, port == tcp_port (when both set) and the
- * registry export path equals the endpoint path or lies under it. */
+/* Endpoint rule (endpoint ds_path design §4): server == host,
+ * port == tcp_port when both set; without ds_path the endpoint path equals
+ * the registry path; with ds_path, ds_path equals the registry path and the
+ * endpoint path is ds_path or a component-wise ancestor of it, "/" never a
+ * parent.  Trailing '/' is ignored.  ds_path NULL or "" = absent. */
 bool ds_connector_endpoint_matches(const struct ds_connector_registry_ds *ds,
                                    const char *server, const char *export_path,
-                                   uint32_t port);
+                                   const char *ds_path, uint32_t port);
 
 /* -----------------------------------------------------------------------
  * I/O half
