@@ -405,6 +405,37 @@ static void test_endpoint_rule(void)
     ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/", "/", 2049), true);
 }
 
+static void test_path_is_canonical(void)
+{
+    static const char *const ok[] = { "/", "/a", "/a/", "/a/b", "/mnt/data/pnfs-ds", "/a/.b", "/a/b..", "/a/..." };
+    static const char *const bad[] = { "", "a", "a/b", "//", "/a//b", "/a/./b", "/a/../b", "/..", "/.",
+                                       "/a/..", "/a/.", "/a//" };
+    for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
+        ASSERT_EQ(ds_connector_path_is_canonical(ok[i]), true);
+    }
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        ASSERT_EQ(ds_connector_path_is_canonical(bad[i]), false);
+    }
+    ASSERT_EQ(ds_connector_path_is_canonical(NULL), false);
+}
+
+/* Re-review 2026-09-27 P1: the same '..' string on both sides must not match. */
+static void test_endpoint_rule_needs_canonical_paths(void)
+{
+    struct ds_connector_registry_ds ds;
+    static const char *const evil = "/mnt/data/training-a/../../data2/training-c/pnfs-ds";
+    memset(&ds, 0, sizeof(ds));
+    snprintf(ds.host, sizeof(ds.host), "192.168.64.51");
+    snprintf(ds.export_path, sizeof(ds.export_path), "%s", evil);
+    ds.tcp_port = 2049;
+    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data/training-a", evil, 2049), false);
+    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", evil, NULL, 2049), false);
+    snprintf(ds.export_path, sizeof(ds.export_path), "/mnt/data/pnfs-ds");
+    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data/./", "/mnt/data/pnfs-ds", 2049), false);
+    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt//data", "/mnt/data/pnfs-ds", 2049), false);
+    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data", "/mnt/data/pnfs-ds", 2049), true);
+}
+
 static void test_endpoint_ds_path_in_a_batch(void)
 {
     struct placement_assessment_view v; struct ds_connector_report rep;
@@ -425,6 +456,12 @@ static void test_endpoint_ds_path_in_a_batch(void)
     reg_init(); st_init(NULL, NULL);
     ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
     ASSERT_EQ(rep.rejected_shape, 1u);
+    /* a non-canonical ds_path is a shape error, whatever the registry says */
+    REC_DS_PATH = "/mnt/data/x/../pnfs-ds";
+    reg_init(); st_init(NULL, NULL);
+    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
+    ASSERT_EQ(rep.rejected_shape, 1u);
+    ASSERT_TRUE(strstr(rep.detail, "endpoint.ds_path invalid") != NULL);
     /* the registered path: accepted */
     REC_DS_PATH = "/mnt/data/pnfs-ds";
     reg_init(); st_init(NULL, NULL);
@@ -1185,6 +1222,8 @@ int main(void)
     RUN_TEST(test_poll_once_publishes_and_readiness);
     RUN_TEST(test_iso8601);
     RUN_TEST(test_endpoint_rule);
+    RUN_TEST(test_path_is_canonical);
+    RUN_TEST(test_endpoint_rule_needs_canonical_paths);
     RUN_TEST(test_endpoint_ds_path_in_a_batch);
     RUN_TEST(test_healthy_batch_is_accepted);
     RUN_TEST(test_contract_major_mismatch);
