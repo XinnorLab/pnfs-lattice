@@ -386,6 +386,35 @@ static size_t path_len(const char *p)
     return n;
 }
 
+bool ds_connector_path_is_canonical(const char *p)
+{
+    size_t n;
+
+    if (p == NULL || p[0] != '/') {
+        return false;
+    }
+    n = strlen(p);
+    if (n == 1) {
+        return true;
+    }
+    if (p[n - 1] == '/') {
+        n--;            /* one trailing '/' is dropped; "//" leaves an empty component */
+    }
+    for (size_t i = 1; i <= n;) {
+        size_t len = 0;
+
+        while (i + len < n && p[i + len] != '/') {
+            len++;
+        }
+        if (len == 0 || (len == 1 && p[i] == '.') ||
+            (len == 2 && p[i] == '.' && p[i + 1] == '.')) {
+            return false;
+        }
+        i += len + 1;
+    }
+    return true;
+}
+
 static bool path_eq(const char *a, size_t al, const char *b, size_t bl)
 {
     return al == bl && strncmp(a, b, al) == 0;
@@ -408,7 +437,8 @@ bool ds_connector_endpoint_matches(const struct ds_connector_registry_ds *ds,
     if (port != 0 && ds->tcp_port != 0 && port != ds->tcp_port) {
         return false;
     }
-    if (export_path[0] != '/' || ds->export_path[0] != '/') {
+    if (!ds_connector_path_is_canonical(export_path) ||
+        !ds_connector_path_is_canonical(ds->export_path)) {
         return false;
     }
     el = path_len(export_path);
@@ -416,7 +446,7 @@ bool ds_connector_endpoint_matches(const struct ds_connector_registry_ds *ds,
     if (ds_path == NULL || ds_path[0] == '\0') {
         return path_eq(export_path, el, ds->export_path, rl);
     }
-    if (ds_path[0] != '/') {
+    if (!ds_connector_path_is_canonical(ds_path)) {
         return false;
     }
     dl = path_len(ds_path);
@@ -537,6 +567,7 @@ static bool parse_record(const struct jdoc *d, int obj, struct rec *r,
     if (!tok_is(d, ep, JSMN_OBJECT) ||
         !tok_copy(d, tok_get(d, ep, "server"), r->server, sizeof(r->server)) ||
         !tok_copy(d, tok_get(d, ep, "export_path"), r->export_path, sizeof(r->export_path)) ||
+        !ds_connector_path_is_canonical(r->export_path) ||
         !tok_str_eq(d, tok_get(d, ep, "protocol"), "NFS") ||
         !tok_u64(d, tok_get(d, ep, "port"), &r->port) || r->port == 0 || r->port > 65535) {
         set_detail(rep, "ds %u: endpoint invalid", r->ds_id);
@@ -549,7 +580,8 @@ static bool parse_record(const struct jdoc *d, int obj, struct rec *r,
     }
     r->ds_path[0] = '\0';
     v = tok_get(d, ep, "ds_path");
-    if (v >= 0 && (!tok_copy(d, v, r->ds_path, sizeof(r->ds_path)) || r->ds_path[0] != '/')) {
+    if (v >= 0 && (!tok_copy(d, v, r->ds_path, sizeof(r->ds_path)) ||
+                   !ds_connector_path_is_canonical(r->ds_path))) {
         set_detail(rep, "ds %u: endpoint.ds_path invalid", r->ds_id);
         return false;
     }

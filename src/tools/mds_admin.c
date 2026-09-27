@@ -39,6 +39,7 @@
 #include "cluster_membership.h"
 
 #include "admin_util.h"
+#include "ds_connector.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -2339,6 +2340,14 @@ static int cmd_ds_add(int argc, const char *const *argv)
             }
             info.rdma_port = (uint16_t)rp;
         }
+    }
+
+    /* A connector endpoint can only match a canonical registry path
+     * (canonical endpoint paths design, 2026-09-27). */
+    if (!ds_connector_path_is_canonical(info.export_path)) {
+        (void)fprintf(stderr,
+            "Error: export path must be canonical (no '.', '..' or empty components)\n");
+        return 1;
     }
 
     enum mds_status st = cluster_transport_request_ds_add(

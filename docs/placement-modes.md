@@ -146,7 +146,10 @@ port, trailing `/` is normalized (dropped, `/` stays `/`) on paths, and
 without `endpoint.ds_path` the `export_path` must equal the registered
 path exactly; when `ds_path` is present, it must equal the registered
 path and `export_path` must equal `ds_path` or be a component-wise
-ancestor of it (but not `/` unless `ds_path = /`). A DS registered in a
+ancestor of it (but not `/` unless `ds_path = /`). Every path — both
+endpoint paths and the registered one — must be canonical: no `.`, `..`
+or empty component; a record with such an endpoint path is a shape
+rejection, and `mds-admin ds add` refuses such a path. A DS registered in a
 subdirectory of a share needs `ds_path` in the connector binding. When profile
 pins are set via `ds_connector_expected_profiles`, each record's profile
 id must be in the pin map with a matching digest; records with unpinned
