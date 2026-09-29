@@ -295,7 +295,8 @@ facts from the connector's side.
   for a verdict in force, with `hold_left_ms` the time until it runs out
   (the same value as `ttl_ms`); a neutral DS (no verdict in force) reads
   `assessment_age_ms=none quality=NONE allowed=- ppm=1000000 ttl_ms=0 …
-  verdict=none hold_left_ms=none`, with its `fill` weight and the gate's
+  verdict=none hold_left_ms=none`, with its base weight (the manual
+  domain weight when configured, else the fill level) and the gate's
   reason (`NONE` when it is a candidate).
 - Metrics: `pnfs_mds_placement_mode{mode}`,
   `pnfs_mds_placement_eligible_ds`,
