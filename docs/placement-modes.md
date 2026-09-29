@@ -265,9 +265,10 @@ follows the same rule.  The counts are over the registered DS:
 compares it with `registered_ds`); `retained_ds` of them are held by a
 retained verdict (`VERDICT_RETAINED`, allow or deny — the connector is
 not observing them); `neutral_ds = registered_ds − covered_ds` are
-placed neutrally; `eligible_ds` are not excluded by a verdict (the
-neutral ones plus the live allows with `multiplier_ppm > 0` — DS state
-and capacity are not counted here).  Partial or no coverage is a
+placed neutrally; `eligible_ds` are not denied or zeroed by a verdict
+(the neutral ones plus the live allows with `multiplier_ppm > 0` — DS
+state, capacity, the alias grades and `DOMAIN_MAP_MISMATCH` are not
+counted here).  Partial or no coverage is a
 degraded, correct state: the MDS places on the covered DS by their
 verdicts and on the others neutrally.  Run `lattice-ds-connector
 preflight --expect-ds 0,1` on the MDS before switching to see the same
@@ -300,11 +301,14 @@ facts from the connector's side.
   `pnfs_mds_placement_eligible_ds`,
   `pnfs_mds_placement_neutral_ds` and `pnfs_mds_placement_retained_ds`
   (gauges, `smart`: of the DS that reached the verdict step at the last
-  placement decision — past `DS_ONLINE`, the alias grades and the
-  capacity gate — those placed neutrally and those under a retained
-  verdict, allow or deny; readiness counts every registered DS instead,
-  so the two agree unless a DS is excluded before the verdict step; 0 in
-  the other modes),
+  placement decision — past `DS_ONLINE`, the alias grades,
+  `DOMAIN_MAP_MISMATCH` and the capacity gate — those placed neutrally
+  and those under a retained verdict, allow or deny; readiness counts
+  every registered DS instead, so the two agree unless a DS is excluded
+  before the verdict step; 0 in the other modes.  They move only at a
+  placement decision: on an idle cluster they keep the last decision's
+  values, so they are no liveness signal — `pnfs_mds_connector_reachable`
+  is),
   `pnfs_mds_placement_rejections_total{reason}`,
   `pnfs_mds_placement_admit_seconds` (histogram, 100 µs … +Inf with
   `_sum`/`_count`: time in the gate per selection or create admission,
@@ -323,9 +327,10 @@ facts from the connector's side.
   expired, so while the connector is unreachable it stays flat and
   `pnfs_mds_placement_neutral_ds` shows the effect instead).
 - Alerts for `smart`: a lost connector no longer refuses placements, so
-  it has to be alerted on — `pnfs_mds_connector_reachable == 0`, and
-  `pnfs_mds_placement_neutral_ds` growing while it was 0 (verdicts ran out
-  or never arrived: the cluster places, but no longer steers).
+  it has to be alerted on — `pnfs_mds_connector_reachable == 0` (the
+  liveness signal), and `pnfs_mds_placement_neutral_ds` growing while it
+  was 0 (verdicts ran out or never arrived: the cluster places, but no
+  longer steers; this gauge moves only when files are placed).
 - `pnfs_mds_placement_rejections_total{reason}` counts every DS the gate
   rejected at every placement decision (a DS that stays full for an hour
   keeps counting), `pnfs_mds_placement_alias_suspected_total` counts

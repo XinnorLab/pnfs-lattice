@@ -935,9 +935,10 @@ void placement_gate_readiness(struct placement_readiness *out)
     }
     /* Over every registered DS (smart verdict retention design section
      * 5.3): covered = a verdict in force, fresh or retained; neutral = the
-     * rest; eligible = not excluded by a live verdict (the neutral DS and
-     * the live allows with ppm > 0).  DS state and capacity are the gate's
-     * business, not readiness'. */
+     * rest; eligible = not denied or zeroed by a verdict (the neutral DS
+     * and the live allows with ppm > 0).  DS state, capacity, the alias
+     * grades and DOMAIN_MAP_MISMATCH are the gate's business, not
+     * readiness'. */
     if (ctx.cap != NULL) {
         uint32_t i;
 

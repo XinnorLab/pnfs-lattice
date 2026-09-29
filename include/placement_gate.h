@@ -173,9 +173,10 @@ struct placement_readiness {
     bool     last_batch_valid;
     uint32_t registered_ds;
     uint32_t covered_ds;               /* registered DS with a live verdict, fresh or retained */
-    uint32_t eligible_ds;              /* registered DS no live verdict excludes: the
-                                        * neutral ones + live allows with ppm > 0
-                                        * (DS state and capacity are not counted here) */
+    uint32_t eligible_ds;              /* registered DS not denied or zeroed by a
+                                        * verdict: the neutral ones + live allows with
+                                        * ppm > 0 (DS state, capacity, the alias grades
+                                        * and DOMAIN_MAP_MISMATCH are not counted here) */
     uint32_t retained_ds;              /* live verdicts carrying VERDICT_RETAINED, allow or deny */
     uint32_t neutral_ds;               /* registered_ds - covered_ds: placed neutrally */
     char     coverage[8];              /* "full" | "partial" | "none" | "n/a" */
