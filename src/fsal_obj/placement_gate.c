@@ -368,9 +368,9 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
         ppm = 1000000u;
         if (ctx->mode == PM_SMART) {
             /* Verdict retention design rules 1, 3 and 7: without a verdict
-             * in force the DS is neutral -- ppm stays 1 000 000 and the
-             * fill-level domain weight applies, after every gate above.
-             * Only a live verdict can exclude it or lower its weight.
+             * in force the DS is neutral -- ppm stays 1 000 000 on its
+             * domain's base weight, after every gate above.  Only a live
+             * verdict can exclude it or lower its weight.
              * NO_BINDING / ASSESSMENT_UNKNOWN / ASSESSMENT_STALE /
              * MODE_NOT_READY are no longer produced (the enum keeps them
              * for metric label stability). */
@@ -397,9 +397,14 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
                     continue;
                 }
                 ppm = ar->multiplier_ppm;
-                if (manual_domain_weight(ctx, rs[r_i].domain, &manual)) {
-                    domain_weight = manual;
-                }
+            }
+            /* The base weight (design section 5.2) is one rule for a
+             * neutral DS and a live one: the manual weight of the effective
+             * domain (the connector's for a live row, the operator map /
+             * ds:<id> otherwise) when configured, the fill level otherwise
+             * -- so both are weighted on one scale. */
+            if (manual_domain_weight(ctx, rs[r_i].domain, &manual)) {
+                domain_weight = manual;
             }
         }
         weight = placement_weight(domain_weight, ppm, n_aliases, &ovf);

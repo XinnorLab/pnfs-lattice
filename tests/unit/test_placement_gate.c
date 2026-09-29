@@ -958,6 +958,39 @@ static void test_smart_manual_base_weight(void)
     ASSERT_TRUE(out[0].weight == placement_weight(50, 1000000, 1, NULL));
 }
 
+/* Verdict retention design section 5.2: neutral is ppm 1 000 000 on the
+ * domain's base weight -- the manual weight of the DS's effective domain
+ * when one is configured, the fill level otherwise -- so a neutral DS and a
+ * live one share one scale under manual weights. */
+static void test_smart_manual_base_weight_applies_to_neutral_ds(void)
+{
+    struct mds_ds_info ds[3];
+    reset_smart();
+    for (uint32_t i = 0; i < 3; i++) { mk_ds(&ds[i], i, DS_ONLINE, "h"); add_row(i, "h", 1000, 500, 1 + i, 1000000); }
+    add_assess(0, true, true, 250000, 15000, "d-a");            /* ds 0: live allow, degraded */
+    snprintf(DOM[1], PM_DOMAIN_ID_MAX, "op-b");                  /* ds 1: neutral, operator domain */
+                                                                 /* ds 2: neutral, default domain ds:2 */
+    snprintf(DWID[0], PM_DOMAIN_ID_MAX, "d-a");  DW[0] = 3000;
+    snprintf(DWID[1], PM_DOMAIN_ID_MAX, "op-b"); DW[1] = 2000;
+    snprintf(DWID[2], PM_DOMAIN_ID_MAX, "ds:2"); DW[2] = 1000;
+    struct placement_ctx c = smart_ctx();
+    c.domain_weight_id = (const char (*)[PM_DOMAIN_ID_MAX])DWID;
+    c.domain_weight = DW;
+    c.domain_weight_count = 3;
+    struct placement_candidate out[3]; struct placement_reject_counts why;
+    ASSERT_EQ(placement_candidates(&c, ds, 3, out, &why), 3u);
+    ASSERT_EQ(why.neutral, 2u);
+    ASSERT_TRUE(out[0].weight == placement_weight(3000, 250000, 1, NULL));    /* live: manual x ppm */
+    ASSERT_TRUE(out[1].weight == placement_weight(2000, 1000000, 1, NULL));   /* neutral: manual x 10^6 */
+    ASSERT_TRUE(out[2].weight == placement_weight(1000, 1000000, 1, NULL));
+    ASSERT_EQ(strcmp(out[1].domain, "op-b"), 0);
+    ASSERT_EQ(strcmp(out[2].domain, "ds:2"), 0);
+    /* a neutral DS whose domain has no manual weight falls back to the fill level */
+    c.domain_weight_count = 2;
+    ASSERT_EQ(placement_candidates(&c, ds, 3, out, &why), 3u);
+    ASSERT_TRUE(out[2].weight == placement_weight(50, 1000000, 1, NULL));
+}
+
 static void test_reason_names_are_bounded(void)
 {
     for (int r = 0; r < PR_COUNT; r++) {
@@ -1470,6 +1503,7 @@ int main(void)
     RUN_TEST(test_smart_degraded_ppm_is_picked_less);
     RUN_TEST(test_smart_connector_domain_and_map_mismatch);
     RUN_TEST(test_smart_manual_base_weight);
+    RUN_TEST(test_smart_manual_base_weight_applies_to_neutral_ds);
     RUN_TEST(test_smart_alias_with_an_unbound_sibling);
     RUN_TEST(test_select_gated_fill_path_uses_the_gate);
     RUN_TEST(test_rr_is_cyclic_over_the_gated_list);

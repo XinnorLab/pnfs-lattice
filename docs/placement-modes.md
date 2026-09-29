@@ -15,7 +15,7 @@ upstream (`placement_policy`, `placement_policy_enabled`,
 |---|---|---|---|
 | `rr` | registered DS that are `DS_ONLINE` and pass the native NFS/transport/io-limit filters | none — cyclic order over the candidate list, one position per DS | not consulted |
 | `fill` | the `rr` set **and** a fresh capacity observation for the DS's capacity domain with `available > placement_min_free_bytes` | `domain_weight / N`, `domain_weight = max(1, floor(100 × available / total))` | not consulted |
-| `smart` | the `fill` set **minus** DS whose verdict in force contradicts the operator's `ds_capacity_domain.<id>` (`DOMAIN_MAP_MISMATCH`), denies (`CONNECTOR_DENIED`) or carries `multiplier_ppm = 0` (`ZERO_MULTIPLIER`); a DS without a verdict in force is **neutral** (placed as in `fill`) | `domain_weight / N × multiplier_ppm / 1 000 000` (neutral: `multiplier_ppm = 1 000 000`, the `fill` weight) | steers; never required to place |
+| `smart` | the `fill` set **minus** DS whose verdict in force contradicts the operator's `ds_capacity_domain.<id>` (`DOMAIN_MAP_MISMATCH`), denies (`CONNECTOR_DENIED`) or carries `multiplier_ppm = 0` (`ZERO_MULTIPLIER`); a DS without a verdict in force is **neutral** (placed as in `fill`) | `domain_weight / N × multiplier_ppm / 1 000 000`; `domain_weight` is the fill level or, with `placement_allow_manual_base_weights`, the domain's `placement_domain_weight.<domain>` (neutral: `multiplier_ppm = 1 000 000` on the same base weight — without manual weights, the `fill` weight) | steers; never required to place |
 
 `fill` and `smart` are **weighted random** selection, not a strict
 rotation.  `capacity` stays a legacy `placement_policy` value (strict
@@ -214,16 +214,25 @@ is *in force* while its row is present and the MDS clock is before its
 - **No verdict in force → neutral**: no row for the DS (never reported,
   no binding on the connector), a row that has run out, or no assessment
   view at all (the MDS has had no accepted batch since it started).  The
-  DS keeps `multiplier_ppm = 1 000 000`, the fill-level `domain_weight`
-  and the operator's domain (`ds_capacity_domain.<id>` or `ds:<id>`) —
-  its `fill` weight.
+  DS keeps `multiplier_ppm = 1 000 000` and the operator's domain
+  (`ds_capacity_domain.<id>` or `ds:<id>`), weighted by that domain's
+  base weight (below) — without manual weights, its `fill` weight.
 - **A live deny excludes** (`CONNECTOR_DENIED`), and so does a live
   `multiplier_ppm = 0` (`ZERO_MULTIPLIER`).
 - **A live allow weights by its multiplier**: weight = `domain_weight ×
   multiplier_ppm / 10⁶ / N`, where the domain is the connector's
-  `capacity_domain_id` and `domain_weight` is the fill level, or a manual
-  `placement_domain_weight.<domain>` when
-  `placement_allow_manual_base_weights = true`.
+  `capacity_domain_id`.
+- **The base weight** (`domain_weight`) is one rule for both: a manual
+  `placement_domain_weight.<domain>` for the DS's effective domain when
+  `placement_allow_manual_base_weights = true` and one is set, the fill
+  level (1..100) otherwise.  A neutral DS and a live one are therefore
+  weighted on one scale.  Under manual weights, declare them for the
+  operator domains a neutral DS uses (`ds_capacity_domain.<id>`, or the
+  `ds:<id>` default) as well as for the connector's domains: a DS whose
+  effective domain has no manual weight falls back to the fill scale,
+  which does not compare with manual weights (1..10 000) — against
+  weights in the thousands it is starved, against weights of 1..10 it
+  takes almost every file.
 
 The connector's domain is used only from a verdict in force, so
 `DOMAIN_MAP_MISMATCH` (an operator `ds_capacity_domain.<id>` that
