@@ -124,10 +124,11 @@ A batch is accepted whole or dropped whole: `contract_version` must be
 `ds_connector_expected_contract_major` (`1x`, `01.0` and a bare `1` are
 not versions); per connector instance the `(epoch, sequence)` line must
 not go backwards — an **equal** sequence is the connector re-serving its
-current snapshot until the next collection and is accepted (the rows are
-re-timed from the receive instant), a **lower** one is a replay that
-drops the batch; a changed `runtime_epoch` (connector restart) resets
-every line and every binding pin; a batch that would need more sequence
+current snapshot until the next collection and is accepted (each VALID
+record in it re-times its verdict from the receive instant), a **lower**
+one is a replay that drops the batch; a changed `runtime_epoch`
+(connector restart) resets every line and every binding pin but keeps
+the verdicts; a batch that would need more sequence
 lines than the 64 the MDS keeps is refused rather than run unprotected;
 `generated_at` must not go backwards (a backwards wall-clock step on the
 connector host therefore drops batches — `OLD_GENERATED_AT`, named in
@@ -155,27 +156,51 @@ is accepted. The batch is dropped if one profile id carries two digests
 or if there are more than 8 distinct profile ids.  The first accepted tuple
 `(instance, binding_generation, datastore_id, target_id,
 target_incarnation, access scope)` is pinned per DS; a later record must
-repeat it or carry a higher `binding_generation` (rebind: the DS is
-UNKNOWN for that batch); anything else is `BINDING_MISMATCH` and that DS
-has no record.  A `quality = UNKNOWN` record may carry
+repeat it or carry a higher `binding_generation` (rebind: the old
+binding's verdict is cleared and the DS has no verdict until the next
+VALID record of the new binding); anything else is `BINDING_MISMATCH`
+and the record is rejected.  A `quality = UNKNOWN` record may carry
 `target_incarnation: null` — the connector could not read its source and
 knows the configured binding but not the share's incarnation; it is
-compared on the rest of the tuple, accepted as UNKNOWN
-(`ASSESSMENT_UNKNOWN` with the connector's reason codes, e.g.
-`SOURCE_UNAVAILABLE`), and it neither creates nor changes a pin (a higher
-generation clears the pin; the next VALID record pins).  A VALID record
-with a null incarnation is a shape error.  The profile digest is
+compared on the rest of the tuple, accepted as UNKNOWN (no new data, see
+below), and it neither creates nor changes a pin (a higher generation
+clears the pin; the next VALID record pins).  A VALID *deny* may carry a
+null incarnation too: the connector's evidence-less denies
+(`SHARE_ABSENT`, `IDENTITY_MISMATCH`, with null `observed_at` and
+`evidence_age_ms`) are compared the same way and are verdicts like any
+other.  A VALID *allow* with a null incarnation is a shape error, as the
+batch schema says.  The profile digest is
 deliberately **not** part of the per-DS binding tuple: it is checked on every batch for id consistency and per-id binding,
 but a connector profile reload must not strand every DS in
 `BINDING_MISMATCH` until a process restart.  Records for unknown DS ids
 are ignored; a DS id that appears more than once in a batch has no
 trusted record and pins nothing.
 
-Candidate rule in `smart` (after the capacity gate): a fresh record
-(`received + remaining_ttl_ms` on the MDS clock) with `quality = VALID`,
-`allowed = true` and `multiplier_ppm > 0`; otherwise `NO_BINDING`,
-`ASSESSMENT_UNKNOWN`, `ASSESSMENT_STALE`, `CONNECTOR_DENIED` or
-`ZERO_MULTIPLIER`.  Weight = `domain_weight × multiplier_ppm / 10⁶ / N`,
+The MDS keeps the last VALID verdict per data store across batches (the
+verdict store; XinnorLab/pNFS
+`docs/superpowers/specs/2026-09-29-smart-verdict-retention-design.md`
+§5.1): an accepted VALID record replaces it at once, in both directions
+(`allowed`, `multiplier_ppm`, `capacity_domain_id`, reason codes, and
+`received + remaining_ttl_ms` on the MDS clock as its end; a VALID record
+with `remaining_ttl_ms = 0` leaves no verdict).  An UNKNOWN record, a
+rejected record (binding mismatch, shape, profile pin, duplicate) or a
+dropped batch never replaces it.  A FAILED instance snapshot contributes
+only VALID records carrying `VERDICT_RETAINED` — the connector's retained
+verdicts; any other VALID record there is no new data.  A rebind (a
+strictly higher `binding_generation`, also across a connector restart)
+clears the verdict; a connector restart (new `runtime_epoch`) keeps it.
+A verdict runs out at its own end and is dropped at the next accepted
+batch; nothing ever extends it except a new VALID record.  The published
+view carries one row per registered DS built from the store: a row is
+present only with a live verdict, and says whether that verdict is a
+retained one (`VERDICT_RETAINED`).  When no batch is accepted no new view
+is built, and the rows of the last one run out on their own end.
+
+Candidate rule in `smart` (after the capacity gate): a live verdict
+(before its `received + remaining_ttl_ms` on the MDS clock) with
+`allowed = true` and `multiplier_ppm > 0`; otherwise `NO_BINDING` (no
+live verdict at the last accepted batch), `ASSESSMENT_STALE` (it ran out
+since), `CONNECTOR_DENIED` or `ZERO_MULTIPLIER`.  Weight = `domain_weight × multiplier_ppm / 10⁶ / N`,
 where the domain is the connector's `capacity_domain_id` (an operator
 `ds_capacity_domain.<id>` that disagrees is `DOMAIN_MAP_MISMATCH`) and
 `domain_weight` is the fill level, or a manual
@@ -194,7 +219,7 @@ the socket is absent (`CONNECT`), the request timed out or the response
 was malformed (`TIMEOUT`), the status was unexpected (`HTTP`), the
 connector answered 503 (`UNAVAILABLE`) or the batch was dropped (`DROP`);
 the `pnfs_mds_connector_reachable` gauge follows the same rule; coverage
-counts DS with a fresh VALID record).  Partial coverage is a degraded, correct state: the MDS keeps
+counts DS with a live verdict, fresh or retained).  Partial coverage is a degraded, correct state: the MDS keeps
 placing on the covered DS.  Run `lattice-ds-connector preflight
 --expect-ds 0,1` on the MDS before switching to see the same facts from
 the connector's side.

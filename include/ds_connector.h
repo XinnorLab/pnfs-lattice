@@ -6,11 +6,13 @@
  *
  * Pure half: ds_connector_apply_batch() parses one batch of the
  * lattice-ds-connector contract (connector-batch.schema.json, contract
- * 1.0), validates the envelope, every instance's sequence line and every
- * assessment's binding against the DS registry, and builds an immutable
- * placement_assessment_view with TTLs on the MDS monotonic clock.  I/O
- * half (Task B3): the Unix-socket HTTP client and the poll thread that
- * publishes the view into the placement gate.
+ * 1.x), validates the envelope, every instance's sequence line and every
+ * assessment's binding against the DS registry, keeps the last VALID
+ * verdict per DS across batches (the verdict store, smart verdict
+ * retention design section 5.1) and builds an immutable
+ * placement_assessment_view from that store with TTLs on the MDS
+ * monotonic clock.  I/O half (Task B3): the Unix-socket HTTP client and
+ * the poll thread that publishes the view into the placement gate.
  */
 
 #ifndef DS_CONNECTOR_H
@@ -68,12 +70,35 @@ struct ds_connector_instance_seq {
     uint64_t sequence;
 };
 
+/*
+ * The verdict in force for one DS (smart verdict retention design
+ * section 5.1): the placement part of the last accepted VALID record that
+ * counted.  Only such a record replaces it; an UNKNOWN record, a rejected
+ * record and a dropped batch never touch it.  A strictly higher
+ * binding_generation clears it; a runtime_epoch reset keeps it; it runs
+ * out at expires_mono_ms (received + remaining_ttl_ms, MDS clock).
+ */
+struct ds_connector_verdict {
+    bool     live;
+    bool     allowed;
+    bool     retained;           /* reason_codes carried VERDICT_RETAINED */
+    uint32_t ppm;
+    uint32_t binding_generation;
+    uint64_t received_mono_ms;
+    uint64_t expires_mono_ms;
+    char     domain[PM_DOMAIN_ID_MAX];
+    char     reasons[PA_REASONS_MAX][PA_REASON_LEN];
+    uint32_t reason_count;
+};
+
 struct ds_connector_state {
     struct ds_connector_cfg cfg;
     char     runtime_epoch[DC_NAME_MAX];
     struct ds_connector_instance_seq inst[DC_INSTANCES_MAX];
     struct ds_connector_pin pins[MDS_MAX_DS_NODES];
     uint64_t last_generated_at_ms;   /* 0 = none yet */
+    struct ds_connector_verdict verdicts[MDS_MAX_DS_NODES];   /* indexed by ds_id */
+    uint64_t verdicts_expired_total; /* verdicts that ran out without a new one */
 };
 
 /* enum ds_connector_drop and ds_connector_drop_name() live in placement_modes.h. */
@@ -92,10 +117,12 @@ void ds_connector_state_init(struct ds_connector_state *st,
                              const struct ds_connector_cfg *cfg);
 
 /*
- * Parse and validate one batch.  DC_OK: `out` holds one row per registry
- * DS (present=false where no record was accepted) and the state advanced
- * (sequence lines, pins, generated_at).  Any other drop leaves the state
- * untouched and `out` empty with batch_valid=false.
+ * Parse and validate one batch.  DC_OK: the state advanced (sequence
+ * lines, pins, generated_at, the verdict store: expired verdicts dropped
+ * and counted, then the batch's counting VALID records applied) and `out`
+ * holds one row per registry DS built from the store -- present == valid
+ * == a live, unexpired verdict.  Any other drop leaves the state untouched
+ * (the store included) and `out` empty with batch_valid=false.
  */
 enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
                                                 const char *text, size_t len,

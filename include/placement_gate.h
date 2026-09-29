@@ -38,14 +38,16 @@ struct placement_capacity_view {
 };
 
 /* Connector assessments (placement_mode = smart), design section 7.
- * Built by ds_connector.c from a validated batch; published into the gate
+ * Built by ds_connector.c from its verdict store after a validated batch
+ * (smart verdict retention design section 5.1); published into the gate
  * with placement_gate_publish_assessments(); one row per registered DS. */
 #define PA_REASONS_MAX  4
 #define PA_REASON_LEN   32
 struct placement_assessment_row {
     uint32_t ds_id;
-    bool     present;            /* an accepted record exists for this ds */
-    bool     valid;              /* quality == VALID and the instance snapshot was not FAILED */
+    bool     present;            /* a live, unexpired verdict exists for this ds */
+    bool     valid;              /* == present (the verdict came from a VALID record) */
+    bool     retained;           /* the verdict's record carried VERDICT_RETAINED */
     bool     allowed;
     uint32_t multiplier_ppm;
     uint64_t expires_mono_ms;    /* received + remaining_ttl_ms (MDS clock) */

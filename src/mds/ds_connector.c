@@ -570,12 +570,6 @@ static bool parse_record(const struct jdoc *d, int obj, struct rec *r,
         set_detail(rep, "ds %u: quality invalid", r->ds_id);
         return false;
     }
-    /* the schema allows a null incarnation only on an UNKNOWN record:
-     * the connector knows its binding but could not observe the share */
-    if (r->valid && r->target_incarnation[0] == '\0') {
-        set_detail(rep, "ds %u: VALID record without target_incarnation", r->ds_id);
-        return false;
-    }
     if (!tok_u64(d, tok_get(d, obj, "remaining_ttl_ms"), &r->remaining_ttl_ms) ||
         r->remaining_ttl_ms > DC_TTL_MAX_MS) {
         set_detail(rep, "ds %u: remaining_ttl_ms invalid", r->ds_id);
@@ -597,6 +591,14 @@ static bool parse_record(const struct jdoc *d, int obj, struct rec *r,
         !tok_bool(d, tok_get(d, pl, "allowed"), &r->allowed) ||
         !tok_u64(d, tok_get(d, pl, "multiplier_ppm"), &r->ppm) || r->ppm > 1000000ULL) {
         set_detail(rep, "ds %u: placement invalid", r->ds_id);
+        return false;
+    }
+    /* The schema requires the incarnation only on a VALID allow.  An UNKNOWN
+     * record (the source was unreadable) and a VALID deny the policy derived
+     * without observing the share (SHARE_ABSENT, IDENTITY_MISMATCH) may carry
+     * null: the connector knows its binding but not the share's incarnation. */
+    if (r->valid && r->allowed && r->target_incarnation[0] == '\0') {
+        set_detail(rep, "ds %u: VALID allow without target_incarnation", r->ds_id);
         return false;
     }
     rs = tok_get(d, pl, "reason_codes");
@@ -673,6 +675,18 @@ static void pin_set(struct ds_connector_pin *p, const struct rec *r, const char 
     (void)snprintf(p->access_scope, sizeof(p->access_scope), "%s", r->access_scope);
 }
 
+static bool rec_has_reason(const struct rec *r, const char *code)
+{
+    uint32_t k;
+
+    for (k = 0; k < r->reason_count; k++) {
+        if (strcmp(r->reasons[k], code) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Proposed per-instance sequence updates, committed only on DC_OK. */
 struct inst_update {
     char     id[DC_NAME_MAX];
@@ -744,6 +758,8 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
     int n_inst;
     struct inst_update *upd = NULL;
     struct ds_connector_pin *new_pins = NULL;
+    struct ds_connector_verdict *new_verdicts = NULL;
+    uint64_t expired = 0;
     bool *seen = NULL;
     bool epoch_reset = false;
     char runtime_epoch[DC_NAME_MAX];
@@ -1014,9 +1030,23 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
     if (!epoch_reset) {
         memcpy(new_pins, st->pins, MDS_MAX_DS_NODES * sizeof(*new_pins));
     }
-    out->count = reg->count;
-    for (i = 0; i < (int)reg->count; i++) {
-        out->rows[i].ds_id = reg->ds[i].ds_id;
+    /* The verdict store (smart verdict retention design section 5.1),
+     * staged and committed only on DC_OK.  A runtime_epoch reset keeps it:
+     * only the sequence lines and the pins start over. */
+    new_verdicts = calloc(MDS_MAX_DS_NODES, sizeof(*new_verdicts));
+    if (new_verdicts == NULL) {
+        goto out_drop;
+    }
+    memcpy(new_verdicts, st->verdicts, MDS_MAX_DS_NODES * sizeof(*new_verdicts));
+    {
+        uint32_t k;
+
+        for (k = 0; k < MDS_MAX_DS_NODES; k++) {
+            if (new_verdicts[k].live && now_mono_ms >= new_verdicts[k].expires_mono_ms) {
+                memset(&new_verdicts[k], 0, sizeof(new_verdicts[k]));
+                expired++;
+            }
+        }
     }
     for (i = 0; i < n_inst; i++) {
         int arr = upd[i].assessments_tok;
@@ -1027,8 +1057,6 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
             int obj = j;
             struct rec r;
             const struct ds_connector_registry_ds *rd;
-            struct placement_assessment_row *row = NULL;
-            uint32_t ri;
             bool rebound = false;
 
             j = tok_skip(&d, obj);
@@ -1053,12 +1081,6 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
             if (rd == NULL) {
                 rep->unknown_ds++;
                 continue;
-            }
-            for (ri = 0; ri < reg->count; ri++) {
-                if (reg->ds[ri].ds_id == r.ds_id) {
-                    row = &out->rows[ri];
-                    break;
-                }
             }
             if (seen[r.ds_id]) {
                 /* duplicate ds inside one batch: no record is trusted and
@@ -1126,28 +1148,71 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
             }
             /* accepted (an unobserved record with no pin yet pins nothing) */
             rep->accepted++;
-            if (row == NULL) {
-                continue;
-            }
-            row->present = true;
-            row->received_mono_ms = now_mono_ms;
-            row->expires_mono_ms = now_mono_ms + r.remaining_ttl_ms;
-            row->allowed = r.allowed;
-            row->multiplier_ppm = (uint32_t)r.ppm;
-            memcpy(row->domain, r.domain, sizeof(row->domain));
-            memcpy(row->reasons, r.reasons, sizeof(row->reasons));
-            row->reason_count = r.reason_count;
             if (rebound) {
                 rep->rebound++;
-                row->valid = false;
-                if (row->reason_count < PA_REASONS_MAX) {
-                    (void)snprintf(row->reasons[row->reason_count], PA_REASON_LEN, "REBOUND");
-                    row->reason_count++;
+            }
+            {
+                struct ds_connector_verdict *vd = &new_verdicts[r.ds_id];
+                bool retained = rec_has_reason(&r, "VERDICT_RETAINED");
+                /* Only a VALID record replaces the verdict.  The record that
+                 * announces a rebind is not trusted yet: the DS has no verdict
+                 * until the next VALID record of the new binding.  A FAILED
+                 * instance snapshot is no new data -- its VALID records count
+                 * only as retained verdicts (VERDICT_RETAINED). */
+                bool counts = r.valid && !rebound && (!upd[i].failed_snapshot || retained);
+
+                /* Spec rule 5: a strictly higher binding_generation drops the
+                 * old binding's verdict -- also across a runtime_epoch reset,
+                 * which clears the pins but keeps the store. */
+                if (rebound ||
+                    (vd->live && (uint32_t)r.binding_generation > vd->binding_generation)) {
+                    memset(vd, 0, sizeof(*vd));
                 }
-            } else {
-                row->valid = r.valid && !upd[i].failed_snapshot;
+                if (counts) {
+                    /* A VALID record with no TTL left replaces the verdict
+                     * with none: the connector holds it for 0 ms. */
+                    memset(vd, 0, sizeof(*vd));
+                    if (r.remaining_ttl_ms > 0) {
+                        vd->live = true;
+                        vd->allowed = r.allowed;
+                        vd->retained = retained;
+                        vd->ppm = (uint32_t)r.ppm;
+                        vd->binding_generation = (uint32_t)r.binding_generation;
+                        vd->received_mono_ms = now_mono_ms;
+                        vd->expires_mono_ms = now_mono_ms + r.remaining_ttl_ms;
+                        memcpy(vd->domain, r.domain, sizeof(vd->domain));
+                        memcpy(vd->reasons, r.reasons, sizeof(vd->reasons));
+                        vd->reason_count = r.reason_count;
+                    }
+                }
             }
         }
+    }
+
+    /* --- the view: one row per registry DS, from the store ------------- */
+    out->count = reg->count;
+    for (i = 0; i < (int)reg->count; i++) {
+        struct placement_assessment_row *row = &out->rows[i];
+        const struct ds_connector_verdict *vd;
+
+        row->ds_id = reg->ds[i].ds_id;
+        if (row->ds_id >= MDS_MAX_DS_NODES) {
+            continue;
+        }
+        vd = &new_verdicts[row->ds_id];
+        if (!vd->live || now_mono_ms >= vd->expires_mono_ms) {
+            continue;
+        }
+        row->present = true;
+        row->valid = true;
+        row->retained = vd->retained;
+        row->allowed = vd->allowed;
+        row->multiplier_ppm = vd->ppm;
+        row->expires_mono_ms = vd->expires_mono_ms;
+        row->received_mono_ms = vd->received_mono_ms;
+        memcpy(row->domain, vd->domain, sizeof(row->domain));
+        memcpy(row->reasons, vd->reasons, sizeof(row->reasons));
+        row->reason_count = vd->reason_count;
     }
 
     /* --- commit --------------------------------------------------------- */
@@ -1155,7 +1220,7 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
         memset(st->inst, 0, sizeof(st->inst));
         MDS_LOG_INFO(LOG_COMP_MDS,
             "ds_connector: runtime_epoch changed (%s -> %s): sequence lines and "
-            "binding pins reset", st->runtime_epoch, runtime_epoch);
+            "binding pins reset, verdicts kept", st->runtime_epoch, runtime_epoch);
     }
     (void)snprintf(st->runtime_epoch, sizeof(st->runtime_epoch), "%s", runtime_epoch);
     for (i = 0; i < n_inst; i++) {
@@ -1184,6 +1249,8 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
         }
     }
     memcpy(st->pins, new_pins, MDS_MAX_DS_NODES * sizeof(*new_pins));
+    memcpy(st->verdicts, new_verdicts, MDS_MAX_DS_NODES * sizeof(*new_verdicts));
+    st->verdicts_expired_total += expired;
     st->last_generated_at_ms = generated_ms;
     out->batch_valid = true;
     out->batch_received_mono_ms = now_mono_ms;
@@ -1194,6 +1261,7 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
     rep->drop = DC_OK;
     free(seen);
     free(new_pins);
+    free(new_verdicts);
     free(upd);
     free(toks);
     return DC_OK;
@@ -1201,6 +1269,7 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
 out_drop:
     free(seen);
     free(new_pins);
+    free(new_verdicts);
     free(upd);
     free(toks);
     if (out != NULL) {

@@ -91,12 +91,16 @@ static void st_init(const char *profile_pins, const char *config_pin)
  * /mnt/data, as on the stand. */
 static const char *REC_DS_PATH = "/mnt/data/pnfs-ds";
 
-/* One assessment record with overridable fields, carrying profile id pid. */
+/* reason_codes every record carries unless a test sets its own (rec_r). */
+#define REC_REASONS "[\"NORMAL\",\"X\"]"
+
+/* One assessment record with overridable fields, carrying profile id pid
+ * and the reason_codes array reasons_json. */
 static const char *rec_pid(const char *pid, uint32_t ds, unsigned gen, const char *target, const char *inc,
                            const char *server, const char *path, unsigned port,
                            const char *scope, const char *access, const char *quality,
                            unsigned ttl, const char *profile, const char *allowed,
-                           unsigned ppm, const char *domain_json)
+                           unsigned ppm, const char *domain_json, const char *reasons_json)
 {
     static char r[4][4096];
     static int slot;
@@ -113,9 +117,10 @@ static const char *rec_pid(const char *pid, uint32_t ds, unsigned gen, const cha
         "\"scope\":\"%s\",\"access_scope_id\":\"%s\",\"quality\":\"%s\","
         "\"observed_at\":\"2026-09-24T10:00:00Z\",\"evidence_age_ms\":1000,\"remaining_ttl_ms\":%u,"
         "\"profile\":{\"id\":\"%s\",\"version\":\"1\",\"digest\":\"%s\"},"
-        "\"placement\":{\"allowed\":%s,\"multiplier_ppm\":%u,\"reason_codes\":[\"NORMAL\",\"X\"]},"
+        "\"placement\":{\"allowed\":%s,\"multiplier_ppm\":%u,\"reason_codes\":%s},"
         "\"resources\":{\"capacity_domain_id\":%s,\"shared_resource_ids\":[]},\"coverage\":[]}",
-        ds, gen, target, inc, server, path, port, dsp, scope, access, quality, ttl, pid, profile, allowed, ppm, domain_json);
+        ds, gen, target, inc, server, path, port, dsp, scope, access, quality, ttl, pid, profile, allowed, ppm,
+        reasons_json, domain_json);
     return b;
 }
 
@@ -127,7 +132,34 @@ static const char *rec(uint32_t ds, unsigned gen, const char *target, const char
                        unsigned ppm, const char *domain_json)
 {
     return rec_pid("xinas-mvp", ds, gen, target, inc, server, path, port, scope, access,
-                   quality, ttl, profile, allowed, ppm, domain_json);
+                   quality, ttl, profile, allowed, ppm, domain_json, REC_REASONS);
+}
+
+/* rec() with its own reason_codes array. */
+static const char *rec_r(uint32_t ds, unsigned gen, const char *target, const char *inc,
+                         const char *server, const char *path, unsigned port,
+                         const char *scope, const char *access, const char *quality,
+                         unsigned ttl, const char *profile, const char *allowed,
+                         unsigned ppm, const char *domain_json, const char *reasons_json)
+{
+    return rec_pid("xinas-mvp", ds, gen, target, inc, server, path, port, scope, access,
+                   quality, ttl, profile, allowed, ppm, domain_json, reasons_json);
+}
+
+/* A copy of record r with the evidence time and age null, as the connector
+ * publishes an evidence-less deny (SHARE_ABSENT, IDENTITY_MISMATCH). */
+static const char *no_evidence(const char *r)
+{
+    static char b[4096];
+    const char *from = "\"observed_at\":\"2026-09-24T10:00:00Z\",\"evidence_age_ms\":1000";
+    const char *to = "\"observed_at\":null,\"evidence_age_ms\":null";
+    const char *at = strstr(r, from);
+    if (at == NULL) {
+        fprintf(stderr, "  no_evidence: record without the evidence fields\n");
+        abort();
+    }
+    snprintf(b, sizeof(b), "%.*s%s%s", (int)(at - r), r, to, at + strlen(from));
+    return b;
 }
 
 /* rec_ok(ds) with another profile. */
@@ -136,7 +168,7 @@ static const char *rec_prof(uint32_t ds, const char *pid, const char *digest)
     return rec_pid(pid, ds, 2, "mnt/data", "\"mnt/data:0:u\"",
                    ds == 0 ? "192.168.64.51" : "192.168.64.71", "/mnt/data", 2049,
                    "NEW_ALLOCATION", "cluster-default", "VALID", 15000, digest, "true",
-                   1000000, "\"ctrl-1/fs-1/inc\"");
+                   1000000, "\"ctrl-1/fs-1/inc\"", REC_REASONS);
 }
 
 static const char *rec_ok(uint32_t ds)
@@ -238,14 +270,15 @@ static void test_runtime_epoch_change_resets_pins(void)
                               "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
     ASSERT_EQ(apply(batch("rt-1", "e1", 2, "2026-09-24T10:00:02Z", "c", "COMPLETE", changed), &v, &rep), DC_OK);
     ASSERT_EQ(rep.rejected_binding, 1u);
-    ASSERT_EQ(v.rows[0].present, false);
+    ASSERT_EQ(v.rows[0].present, true);            /* a rejected record keeps the verdict in force */
+    ASSERT_EQ(strcmp(v.rows[0].domain, "ctrl-1/fs-1/inc"), 0);
     ASSERT_TRUE(strstr(rep.detail, "BINDING_MISMATCH") != NULL);
     /* after a connector restart (new runtime_epoch) the tuple is re-pinned; an
      * older generated_at is fine across the epoch boundary */
     ASSERT_EQ(apply(batch("rt-2", "e1", 1, "2026-09-24T09:00:00Z", "c", "COMPLETE", changed), &v, &rep), DC_OK);
     ASSERT_EQ(rep.accepted, 1u);
     ASSERT_EQ(strcmp(ST.pins[0].target_id, "other-share"), 0);
-    ASSERT_EQ(v.rows[0].domain[0], '\0');          /* null domain */
+    ASSERT_EQ(v.rows[0].domain[0], '\0');          /* the new VALID record replaced it: null domain */
 }
 
 static void test_old_generated_at_is_dropped(void)
@@ -456,15 +489,16 @@ static void test_binding_rules_in_a_batch(void)
                               "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
     ASSERT_EQ(apply(batch("rt-1", "e1", 5, "2026-09-24T10:00:05Z", "c", "COMPLETE", new_inc), &v, &rep), DC_OK);
     ASSERT_EQ(rep.rejected_binding, 1u);
-    ASSERT_EQ(v.rows[0].present, false);
+    ASSERT_EQ(v.rows[0].present, true);             /* rejected: the verdict of batch 4 stays */
     const char *rebound = rec(0, 3, "mnt/data", "\"mnt/data:0:NEW\"", "192.168.64.51", "/mnt/data", 2049,
                               "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
     ASSERT_EQ(apply(batch("rt-1", "e1", 6, "2026-09-24T10:00:06Z", "c", "COMPLETE", rebound), &v, &rep), DC_OK);
     ASSERT_EQ(rep.rebound, 1u);
-    ASSERT_EQ(v.rows[0].present, true);
-    ASSERT_EQ(v.rows[0].valid, false);              /* UNKNOWN until the next fresh record */
+    ASSERT_EQ(v.rows[0].present, false);            /* the rebind cleared the old binding's verdict; */
+    ASSERT_EQ(v.rows[0].valid, false);              /* the announcing record is not trusted yet */
     ASSERT_EQ(ST.pins[0].binding_generation, 3u);
     ASSERT_EQ(apply(batch("rt-1", "e1", 7, "2026-09-24T10:00:07Z", "c", "COMPLETE", rebound), &v, &rep), DC_OK);
+    ASSERT_EQ(v.rows[0].present, true);
     ASSERT_EQ(v.rows[0].valid, true);
     /* lower generation after the re-pin is rejected */
     ASSERT_EQ(apply(batch("rt-1", "e1", 8, "2026-09-24T10:00:08Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
@@ -486,8 +520,9 @@ static void test_unknown_duplicate_failed_and_shape(void)
     ASSERT_EQ(rep.accepted, 0u);
     ASSERT_EQ(ST.pins[0].pinned, false);            /* ... and nothing is pinned */
     ASSERT_EQ(apply(batch("rt-1", "e1", 3, "2026-09-24T10:00:03Z", "c", "FAILED", rec_ok(0)), &v, &rep), DC_OK);
-    ASSERT_EQ(v.rows[0].present, true);
-    ASSERT_EQ(v.rows[0].valid, false);              /* FAILED snapshot -> UNKNOWN */
+    ASSERT_EQ(rep.accepted, 1u);
+    ASSERT_EQ(v.rows[0].present, false);            /* a fresh VALID record in a FAILED snapshot */
+    ASSERT_EQ(v.rows[0].valid, false);              /* is no new data: no verdict */
     const char *bad_ttl = rec(0, 2, "mnt/data", "\"mnt/data:0:u\"", "192.168.64.51", "/mnt/data", 2049,
                               "NEW_ALLOCATION", "cluster-default", "VALID", 4000000, "sha256:p", "true", 1000000, "null");
     ASSERT_EQ(apply(batch("rt-1", "e1", 4, "2026-09-24T10:00:04Z", "c", "COMPLETE", bad_ttl), &v, &rep), DC_OK);
@@ -499,6 +534,8 @@ static void test_unknown_duplicate_failed_and_shape(void)
     const char *denied = rec(0, 2, "mnt/data", "\"mnt/data:0:u\"", "192.168.64.51", "/mnt/data", 2049,
                              "NEW_ALLOCATION", "cluster-default", "VALID", 1000, "sha256:p", "false", 0, "null");
     ASSERT_EQ(apply(batch("rt-1", "e1", 6, "2026-09-24T10:00:06Z", "c", "COMPLETE", denied), &v, &rep), DC_OK);
+    ASSERT_EQ(v.rows[0].present, true);
+    ASSERT_EQ(v.rows[0].valid, true);
     ASSERT_EQ(v.rows[0].allowed, false);
     ASSERT_EQ(v.rows[0].multiplier_ppm, 0u);
 }
@@ -1073,13 +1110,13 @@ static void test_unobserved_incarnation_on_unknown_records(void)
     struct placement_assessment_view v; struct ds_connector_report rep;
     reg_init(); st_init(NULL, NULL);
     /* the source is down before the first VALID record: UNKNOWN + null
-     * incarnation is accepted, the row is present and invalid, nothing pins */
+     * incarnation is accepted, there is no verdict (no row), nothing pins */
     const char *down = rec(0, 2, "mnt/data", "null", "192.168.64.51", "/mnt/data", 2049,
                            "NEW_ALLOCATION", "cluster-default", "UNKNOWN", 15000, "sha256:p", "false", 0, "null");
     ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", down), &v, &rep), DC_OK);
     ASSERT_EQ(rep.accepted, 1u);
     ASSERT_EQ(rep.rejected_binding, 0u);
-    ASSERT_EQ(v.rows[0].present, true);
+    ASSERT_EQ(v.rows[0].present, false);
     ASSERT_EQ(v.rows[0].valid, false);
     ASSERT_EQ(ST.pins[0].pinned, false);
     /* the source comes back: the VALID record pins */
@@ -1088,12 +1125,14 @@ static void test_unobserved_incarnation_on_unknown_records(void)
     ASSERT_EQ(strcmp(ST.pins[0].target_incarnation, "mnt/data:0:u"), 0);
     /* the source goes down again (the stand: xinas-agent stopped): the
      * unobserved record matches the pin on the rest of the tuple -- UNKNOWN,
-     * not BINDING_MISMATCH, and the pin keeps its incarnation */
+     * not BINDING_MISMATCH, the pin keeps its incarnation and the VALID
+     * verdict stays in force */
     ASSERT_EQ(apply(batch("rt-1", "e1", 3, "2026-09-24T10:00:03Z", "c", "COMPLETE", down), &v, &rep), DC_OK);
     ASSERT_EQ(rep.accepted, 1u);
     ASSERT_EQ(rep.rejected_binding, 0u);
     ASSERT_EQ(v.rows[0].present, true);
-    ASSERT_EQ(v.rows[0].valid, false);
+    ASSERT_EQ(v.rows[0].valid, true);
+    ASSERT_EQ(v.rows[0].allowed, true);
     ASSERT_EQ(strcmp(ST.pins[0].target_incarnation, "mnt/data:0:u"), 0);
     /* ... but the rest of the tuple is still checked */
     const char *other = rec(0, 2, "other-share", "null", "192.168.64.51", "/mnt/data", 2049,
@@ -1106,7 +1145,7 @@ static void test_unobserved_incarnation_on_unknown_records(void)
                                  "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
     ASSERT_EQ(apply(batch("rt-1", "e1", 5, "2026-09-24T10:00:05Z", "c", "COMPLETE", valid_null), &v, &rep), DC_OK);
     ASSERT_EQ(rep.rejected_shape, 1u);
-    ASSERT_EQ(v.rows[0].present, false);
+    ASSERT_EQ(v.rows[0].present, true);             /* rejected: the verdict stays */
     /* a rebind announced while the source is down clears the pin; the next
      * VALID record with the new generation pins */
     const char *rebind_down = rec(0, 3, "mnt/data", "null", "192.168.64.51", "/mnt/data", 2049,
@@ -1114,6 +1153,7 @@ static void test_unobserved_incarnation_on_unknown_records(void)
     ASSERT_EQ(apply(batch("rt-1", "e1", 6, "2026-09-24T10:00:06Z", "c", "COMPLETE", rebind_down), &v, &rep), DC_OK);
     ASSERT_EQ(rep.rebound, 1u);
     ASSERT_EQ(ST.pins[0].pinned, false);
+    ASSERT_EQ(v.rows[0].present, false);            /* ... and the old binding's verdict */
     const char *rebound_valid = rec(0, 3, "mnt/data", "\"mnt/data:0:NEW\"", "192.168.64.51", "/mnt/data", 2049,
                                     "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
     ASSERT_EQ(apply(batch("rt-1", "e1", 7, "2026-09-24T10:00:07Z", "c", "COMPLETE", rebound_valid), &v, &rep), DC_OK);
@@ -1121,6 +1161,197 @@ static void test_unobserved_incarnation_on_unknown_records(void)
     ASSERT_EQ(ST.pins[0].binding_generation, 3u);
     ASSERT_EQ(strcmp(ST.pins[0].target_incarnation, "mnt/data:0:NEW"), 0);
     ASSERT_EQ(v.rows[0].valid, true);
+}
+
+/* -----------------------------------------------------------------------
+ * The verdict store (smart verdict retention design section 5.1)
+ * ----------------------------------------------------------------------- */
+
+static void test_unknown_record_keeps_the_verdict(void)
+{
+    struct placement_assessment_view v; struct ds_connector_report rep;
+    reg_init(); st_init(NULL, NULL);
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 1, "2026-09-29T10:00:01Z", "c", "COMPLETE", rec_ok(0)), 1000000, &v, &rep), DC_OK);
+    ASSERT_EQ(v.rows[0].present, true);
+    const char *unk = rec(0, 2, "mnt/data", "null", "192.168.64.51", "/mnt/data", 2049,
+                          "NEW_ALLOCATION", "cluster-default", "UNKNOWN", 0, "sha256:p", "false", 0, "null");
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 2, "2026-09-29T10:00:02Z", "c", "COMPLETE", unk), 1005000, &v, &rep), DC_OK);
+    ASSERT_EQ(rep.accepted, 1u);
+    ASSERT_EQ(v.rows[0].present, true);                       /* still the first verdict */
+    ASSERT_EQ(v.rows[0].valid, true);
+    ASSERT_EQ(v.rows[0].allowed, true);
+    ASSERT_EQ(v.rows[0].retained, false);
+    ASSERT_TRUE(v.rows[0].expires_mono_ms == 1015000ull);     /* its own TTL, not refreshed */
+    ASSERT_TRUE(v.rows[0].received_mono_ms == 1000000ull);
+    ASSERT_EQ(strcmp(v.rows[0].reasons[0], "NORMAL"), 0);     /* not the UNKNOWN record's */
+}
+
+static void test_rejected_record_and_dropped_batch_keep_the_verdict(void)
+{
+    struct placement_assessment_view v; struct ds_connector_report rep;
+    reg_init(); st_init(NULL, NULL);
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 1, "2026-09-29T10:00:01Z", "c", "COMPLETE", rec_ok(0)), 1000000, &v, &rep), DC_OK);
+    /* a record the MDS rejects (binding mismatch) is no new data */
+    const char *wrong_scope = rec(0, 2, "mnt/data", "\"mnt/data:0:u\"", "192.168.64.51", "/mnt/data", 2049,
+                                  "NEW_ALLOCATION", "other-scope", "VALID", 15000, "sha256:p", "false", 0, "null");
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 2, "2026-09-29T10:00:02Z", "c", "COMPLETE", wrong_scope), 1001000, &v, &rep), DC_OK);
+    ASSERT_EQ(rep.rejected_binding, 1u);
+    ASSERT_EQ(v.rows[0].present, true);
+    ASSERT_EQ(v.rows[0].allowed, true);
+    ASSERT_TRUE(v.rows[0].expires_mono_ms == 1015000ull);
+    /* ... nor is a record with a bad shape */
+    const char *bad_ppm = rec(0, 2, "mnt/data", "\"mnt/data:0:u\"", "192.168.64.51", "/mnt/data", 2049,
+                              "NEW_ALLOCATION", "cluster-default", "VALID", 1000, "sha256:p", "true", 1000001, "null");
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 3, "2026-09-29T10:00:03Z", "c", "COMPLETE", bad_ppm), 1002000, &v, &rep), DC_OK);
+    ASSERT_EQ(rep.rejected_shape, 1u);
+    ASSERT_EQ(v.rows[0].present, true);
+    /* a dropped batch (replay) leaves the store as it was */
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 2, "2026-09-29T10:00:04Z", "c", "COMPLETE", ""), 1003000, &v, &rep), DC_REPLAY);
+    ASSERT_EQ(v.batch_valid, false);
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 4, "2026-09-29T10:00:05Z", "c", "COMPLETE", ""), 1004000, &v, &rep), DC_OK);
+    ASSERT_EQ(v.rows[0].present, true);
+    ASSERT_TRUE(v.rows[0].expires_mono_ms == 1015000ull);
+}
+
+static void test_verdict_expires_on_its_ttl_and_is_counted(void)
+{
+    struct placement_assessment_view v; struct ds_connector_report rep;
+    reg_init(); st_init(NULL, NULL);
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 1, "2026-09-29T10:00:01Z", "c", "COMPLETE", rec_ok(0)), 1000000, &v, &rep), DC_OK);
+    ASSERT_TRUE(ST.verdicts_expired_total == 0ull);
+    /* a dropped batch past the TTL commits nothing, the count included */
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 0, "2026-09-29T10:00:20Z", "c", "COMPLETE", ""), 1016000, &v, &rep), DC_REPLAY);
+    ASSERT_TRUE(ST.verdicts_expired_total == 0ull);
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 2, "2026-09-29T10:00:30Z", "c", "COMPLETE", ""), 1020000, &v, &rep), DC_OK);
+    ASSERT_EQ(v.rows[0].present, false);                      /* 15 s TTL ran out */
+    ASSERT_EQ(v.rows[0].valid, false);
+    ASSERT_TRUE(ST.verdicts_expired_total == 1ull);
+    ASSERT_EQ(ST.verdicts[0].live, false);
+    /* counted once, not on every later batch */
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 3, "2026-09-29T10:00:31Z", "c", "COMPLETE", ""), 1021000, &v, &rep), DC_OK);
+    ASSERT_TRUE(ST.verdicts_expired_total == 1ull);
+    /* the TTL boundary is exclusive: live while now < expires */
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 4, "2026-09-29T10:00:32Z", "c", "COMPLETE", rec_ok(0)), 1022000, &v, &rep), DC_OK);
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 5, "2026-09-29T10:00:33Z", "c", "COMPLETE", ""), 1036999, &v, &rep), DC_OK);
+    ASSERT_EQ(v.rows[0].present, true);
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 6, "2026-09-29T10:00:34Z", "c", "COMPLETE", ""), 1037000, &v, &rep), DC_OK);
+    ASSERT_EQ(v.rows[0].present, false);
+    ASSERT_TRUE(ST.verdicts_expired_total == 2ull);
+    /* a VALID record with no TTL left replaces the verdict with none (not an expiry) */
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 7, "2026-09-29T10:00:35Z", "c", "COMPLETE", rec_ok(0)), 1038000, &v, &rep), DC_OK);
+    const char *ttl0 = rec(0, 2, "mnt/data", "\"mnt/data:0:u\"", "192.168.64.51", "/mnt/data", 2049,
+                           "NEW_ALLOCATION", "cluster-default", "VALID", 0, "sha256:p", "true", 1000000, "\"ctrl-1/fs-1/inc\"");
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 8, "2026-09-29T10:00:36Z", "c", "COMPLETE", ttl0), 1039000, &v, &rep), DC_OK);
+    ASSERT_EQ(rep.accepted, 1u);
+    ASSERT_EQ(v.rows[0].present, false);
+    ASSERT_TRUE(ST.verdicts_expired_total == 2ull);
+}
+
+static void test_failed_snapshot_only_carries_retained_verdicts(void)
+{
+    struct placement_assessment_view v; struct ds_connector_report rep;
+    reg_init(); st_init(NULL, NULL);
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 1, "2026-09-29T10:00:01Z", "c", "FAILED", rec_ok(0)), 1000000, &v, &rep), DC_OK);
+    ASSERT_EQ(v.rows[0].present, false);                      /* a fresh VALID in a FAILED snapshot: no */
+    const char *ret = rec_r(0, 2, "mnt/data", "\"mnt/data:0:u\"", "192.168.64.51", "/mnt/data", 2049,
+                            "NEW_ALLOCATION", "cluster-default", "VALID", 600000, "sha256:p", "false", 0, "null",
+                            "[\"VERDICT_RETAINED\",\"SOURCE_TIMEOUT\",\"ARRAY_UNAVAILABLE\"]");
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 2, "2026-09-29T10:00:02Z", "c", "FAILED", ret), 1001000, &v, &rep), DC_OK);
+    ASSERT_EQ(v.rows[0].present, true);
+    ASSERT_EQ(v.rows[0].valid, true);
+    ASSERT_EQ(v.rows[0].allowed, false);
+    ASSERT_EQ(v.rows[0].retained, true);
+    ASSERT_TRUE(v.rows[0].expires_mono_ms == 1601000ull);
+    ASSERT_EQ(v.rows[0].reason_count, 3u);
+    ASSERT_EQ(strcmp(v.rows[0].reasons[0], "VERDICT_RETAINED"), 0);
+    /* the next FAILED snapshot with a fresh (non-retained) VALID allow does not replace it */
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 3, "2026-09-29T10:00:03Z", "c", "FAILED", rec_ok(0)), 1002000, &v, &rep), DC_OK);
+    ASSERT_EQ(v.rows[0].allowed, false);
+    ASSERT_EQ(v.rows[0].retained, true);
+    /* a retained record in a COMPLETE snapshot counts too, and a fresh one clears the flag */
+    const char *ret_allow = rec_r(0, 2, "mnt/data", "\"mnt/data:0:u\"", "192.168.64.51", "/mnt/data", 2049,
+                                  "NEW_ALLOCATION", "cluster-default", "VALID", 300000, "sha256:p", "true", 250000,
+                                  "\"ctrl-1/fs-1/inc\"",
+                                  "[\"VERDICT_RETAINED\",\"RESTORED_FROM_STATE\",\"SOURCE_TIMEOUT\",\"DEGRADED\"]");
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 4, "2026-09-29T10:00:04Z", "c", "COMPLETE", ret_allow), 1003000, &v, &rep), DC_OK);
+    ASSERT_EQ(v.rows[0].allowed, true);
+    ASSERT_EQ(v.rows[0].multiplier_ppm, 250000u);
+    ASSERT_EQ(v.rows[0].retained, true);
+    ASSERT_EQ(ST.verdicts[0].retained, true);
+    ASSERT_TRUE(v.rows[0].expires_mono_ms == 1303000ull);
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 5, "2026-09-29T10:00:05Z", "c", "COMPLETE", rec_ok(0)), 1004000, &v, &rep), DC_OK);
+    ASSERT_EQ(v.rows[0].retained, false);
+    ASSERT_EQ(v.rows[0].multiplier_ppm, 1000000u);
+}
+
+static void test_rebind_clears_and_epoch_reset_keeps(void)
+{
+    struct placement_assessment_view v; struct ds_connector_report rep;
+    reg_init(); st_init(NULL, NULL);
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 1, "2026-09-29T10:00:01Z", "c", "COMPLETE", rec_ok(0)), 1000000, &v, &rep), DC_OK);
+    ASSERT_EQ(apply_at(batch("rt-2", "e1", 1, "2026-09-29T10:00:02Z", "c", "COMPLETE", ""), 1001000, &v, &rep), DC_OK);
+    ASSERT_EQ(v.rows[0].present, true);                       /* connector restart: kept */
+    ASSERT_EQ(ST.pins[0].pinned, false);                      /* (the pins did reset) */
+    ASSERT_TRUE(v.rows[0].expires_mono_ms == 1015000ull);
+    const char *gen3 = rec(0, 3, "mnt/data", "null", "192.168.64.51", "/mnt/data", 2049,
+                           "NEW_ALLOCATION", "cluster-default", "UNKNOWN", 0, "sha256:p", "false", 0, "null");
+    ASSERT_EQ(apply_at(batch("rt-2", "e1", 2, "2026-09-29T10:00:03Z", "c", "COMPLETE", gen3), 1002000, &v, &rep), DC_OK);
+    ASSERT_EQ(v.rows[0].present, false);                      /* rebind announced: cleared */
+    ASSERT_EQ(ST.verdicts[0].live, false);
+    ASSERT_TRUE(ST.verdicts_expired_total == 0ull);           /* a clear is not an expiry */
+}
+
+static void test_evidence_less_deny_is_a_live_verdict(void)
+{
+    struct placement_assessment_view v; struct ds_connector_report rep;
+    char absent[4096];
+    char retained[4096];
+    reg_init(); st_init(NULL, NULL);
+    /* SHARE_ABSENT as the connector publishes it: VALID, allowed false,
+     * null incarnation / observed_at / evidence_age_ms / domain, and the
+     * critical hold as its TTL */
+    snprintf(absent, sizeof(absent), "%s",
+             no_evidence(rec_r(0, 2, "mnt/data", "null", "192.168.64.51", "/mnt/data", 2049,
+                               "NEW_ALLOCATION", "cluster-default", "VALID", 1200000, "sha256:p", "false", 0,
+                               "null", "[\"SHARE_ABSENT\"]")));
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 1, "2026-09-29T10:00:01Z", "c", "COMPLETE", absent), 1000000, &v, &rep), DC_OK);
+    ASSERT_EQ(rep.accepted, 1u);
+    ASSERT_EQ(rep.rejected_shape, 0u);
+    ASSERT_EQ(v.rows[0].present, true);
+    ASSERT_EQ(v.rows[0].valid, true);
+    ASSERT_EQ(v.rows[0].allowed, false);
+    ASSERT_EQ(v.rows[0].multiplier_ppm, 0u);
+    ASSERT_EQ(v.rows[0].retained, false);
+    ASSERT_EQ(v.rows[0].domain[0], '\0');
+    ASSERT_EQ(strcmp(v.rows[0].reasons[0], "SHARE_ABSENT"), 0);
+    ASSERT_TRUE(v.rows[0].expires_mono_ms == 2200000ull);
+    ASSERT_EQ(ST.pins[0].pinned, false);                      /* an unobserved incarnation pins nothing */
+    /* after a pinned VALID allow the same deny matches the pin on the rest of
+     * the tuple and replaces the allow at once */
+    reg_init(); st_init(NULL, NULL);
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 1, "2026-09-29T10:00:01Z", "c", "COMPLETE", rec_ok(0)), 1000000, &v, &rep), DC_OK);
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 2, "2026-09-29T10:00:02Z", "c", "COMPLETE", absent), 1001000, &v, &rep), DC_OK);
+    ASSERT_EQ(rep.accepted, 1u);
+    ASSERT_EQ(rep.rejected_binding, 0u);
+    ASSERT_EQ(v.rows[0].allowed, false);
+    ASSERT_TRUE(v.rows[0].expires_mono_ms == 2201000ull);
+    ASSERT_EQ(strcmp(ST.pins[0].target_incarnation, "mnt/data:0:u"), 0);
+    /* retained across a collection error (FAILED snapshot) */
+    snprintf(retained, sizeof(retained), "%s",
+             no_evidence(rec_r(0, 2, "mnt/data", "null", "192.168.64.51", "/mnt/data", 2049,
+                               "NEW_ALLOCATION", "cluster-default", "VALID", 1170000, "sha256:p", "false", 0,
+                               "null", "[\"VERDICT_RETAINED\",\"SOURCE_TIMEOUT\",\"SHARE_ABSENT\"]")));
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 3, "2026-09-29T10:00:32Z", "c", "FAILED", retained), 1031000, &v, &rep), DC_OK);
+    ASSERT_EQ(v.rows[0].present, true);
+    ASSERT_EQ(v.rows[0].allowed, false);
+    ASSERT_EQ(v.rows[0].retained, true);
+    ASSERT_TRUE(v.rows[0].expires_mono_ms == 2201000ull);
+    /* a VALID allow still needs its incarnation */
+    const char *allow_null = rec(0, 2, "mnt/data", "null", "192.168.64.51", "/mnt/data", 2049,
+                                 "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
+    ASSERT_EQ(apply_at(batch("rt-1", "e1", 4, "2026-09-29T10:00:33Z", "c", "COMPLETE", allow_null), 1032000, &v, &rep), DC_OK);
+    ASSERT_EQ(rep.rejected_shape, 1u);
+    ASSERT_EQ(v.rows[0].allowed, false);                      /* and the deny stays */
 }
 
 static void test_contract_version_shapes(void)
@@ -1207,6 +1438,12 @@ int main(void)
     RUN_TEST(test_unicode_escapes_in_strings);
     RUN_TEST(test_contract_version_shapes);
     RUN_TEST(test_unobserved_incarnation_on_unknown_records);
+    RUN_TEST(test_unknown_record_keeps_the_verdict);
+    RUN_TEST(test_rejected_record_and_dropped_batch_keep_the_verdict);
+    RUN_TEST(test_verdict_expires_on_its_ttl_and_is_counted);
+    RUN_TEST(test_failed_snapshot_only_carries_retained_verdicts);
+    RUN_TEST(test_rebind_clears_and_epoch_reset_keeps);
+    RUN_TEST(test_evidence_less_deny_is_a_live_verdict);
     RUN_TEST(test_http_get_streamed_oversize_and_short_body);
     printf("%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
