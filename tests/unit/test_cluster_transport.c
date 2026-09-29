@@ -2005,6 +2005,58 @@ static void test_config_show_placement_rows(void)
     }
     free(text);
 
+    /* a fresh live deny for ds 0: excluded, verdict=fresh with its hold --
+     * the row the lattice-placement helper parses (final review, R7) */
+    {
+        struct placement_assessment_view v;
+        uint64_t now = ds_cache_mono_ms();
+
+        memset(&v, 0, sizeof(v));
+        v.count = 1;
+        v.batch_valid = true;
+        v.rows[0].ds_id = 0;
+        v.rows[0].present = true;
+        v.rows[0].valid = true;
+        v.rows[0].retained = false;
+        v.rows[0].allowed = false;
+        v.rows[0].multiplier_ppm = 0;
+        v.rows[0].received_mono_ms = now;
+        v.rows[0].expires_mono_ms = now + 1200000;
+        snprintf(v.rows[0].domain, sizeof(v.rows[0].domain), "xi/fs-0");
+        snprintf(v.rows[0].reasons[0], sizeof(v.rows[0].reasons[0]), "EXPORT_ACCESS_MISSING");
+        v.rows[0].reason_count = 1;
+        placement_gate_publish_assessments(&v);
+    }
+    text = NULL;
+    st = cluster_transport_request_config_show("127.0.0.1", port, NULL, &text);
+    ASSERT_EQ(st, MDS_OK);
+    ASSERT_TRUE(text != NULL);
+    ASSERT_TRUE(strstr(text, "coverage=partial registered_ds=2 covered_ds=1 eligible_ds=1 retained_ds=0 neutral_ds=1\n") != NULL);
+    {
+        static const char deny_head[] = "quality=VALID allowed=0 ppm=0 ttl_ms=";
+        static const char deny_mid[] = " weight=0 reason=CONNECTOR_DENIED verdict=fresh hold_left_ms=";
+        const char *r0 = strstr(text, "placement_ds.0 = domain=xi/fs-0 state=ONLINE ");
+        const char *r1 = strstr(text, "placement_ds.1 = domain=xi/fs-1 state=ONLINE ");
+        const char *e0;
+        const char *q;
+        char *end = NULL;
+        unsigned long long ttl;
+        unsigned long long hold;
+
+        ASSERT_TRUE(r0 != NULL && r1 != NULL);
+        e0 = strchr(r0, '\n');
+        ASSERT_TRUE(e0 != NULL);
+        q = strstr(r0, deny_head);
+        ASSERT_TRUE(q != NULL && q < e0);
+        ttl = strtoull(q + sizeof(deny_head) - 1, &end, 10);
+        ASSERT_TRUE(end != NULL && strncmp(end, deny_mid, sizeof(deny_mid) - 1) == 0);
+        hold = strtoull(end + sizeof(deny_mid) - 1, &end, 10);
+        ASSERT_TRUE(end == e0);                          /* the row ends with the hold */
+        ASSERT_TRUE(hold == ttl && hold > 0 && hold <= 1200000);
+        ASSERT_TRUE(strstr(r1, neutral_row) != NULL);    /* ds 1 still neutral */
+    }
+    free(text);
+
     cluster_transport_server_stop(srv);
     placement_gate_destroy();
     ds_cache_destroy(cache);
