@@ -798,6 +798,15 @@ static struct ds_cache *cache_two_ds(struct mds_catalogue **cat_out)
     return c;
 }
 
+/* The gate's verdict for one registered DS: a candidate (reason NONE) with
+ * weight w.  In the poll test both DS are half full and alone in their
+ * domain, so a live normal verdict and neutral give the same weight. */
+static bool gate_places_with(uint32_t ds_id, uint64_t w)
+{
+    struct placement_ds_status st;
+    return placement_gate_ds_status(ds_id, &st) && st.reason == PR_NONE && st.weight == w;
+}
+
 static void test_poll_once_publishes_and_readiness(void)
 {
     struct mds_catalogue *cat = NULL;
@@ -822,6 +831,19 @@ static void test_poll_once_publishes_and_readiness(void)
     ASSERT_EQ(r.mode_active, true);
     ASSERT_EQ(r.connector_config_valid, false);        /* not configured yet */
     ASSERT_EQ(strcmp(r.coverage, "none"), 0);
+    /* no batch yet: both DS are neutral and placed as in fill (verdict
+     * retention design rule 1) -- never MODE_NOT_READY */
+    const uint64_t w = placement_weight(50, 1000000, 1, NULL);
+    {
+        struct ds_capacity_obs half0 = { 1000, 500, 1, ds_cache_mono_ms(), 0 };
+        struct ds_capacity_obs half1 = { 1000, 500, 2, ds_cache_mono_ms(), 0 };
+        ASSERT_EQ(ds_cache_set_capacity_obs(cache, 0, &half0), 0);
+        ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &half1), 0);
+        placement_gate_publish_capacity();
+    }
+    ASSERT_TRUE(w > 0);
+    ASSERT_TRUE(gate_places_with(0, w));
+    ASSERT_TRUE(gate_places_with(1, w));
 
     /* one socket path for the whole test: the connector is configured once
      * and every later server re-serves at that path */
@@ -846,6 +868,9 @@ static void test_poll_once_publishes_and_readiness(void)
     ASSERT_EQ(r.profile_count, 1u);
     ASSERT_EQ(strcmp(r.profiles[0].digest, "sha256:p"), 0);
     ASSERT_EQ(atomic_load(&g_branch_metrics.connector_covered_ds), 1u);
+    /* partial coverage: ds 0 by its verdict, ds 1 (no binding) neutral */
+    ASSERT_TRUE(gate_places_with(0, w));
+    ASSERT_TRUE(gate_places_with(1, w));
 
 #define RESERVE(status, body_) do { \
         memset(&s, 0, sizeof(s)); \
@@ -905,6 +930,9 @@ static void test_poll_once_publishes_and_readiness(void)
     ASSERT_EQ(r.connector_reachable, false);
     ASSERT_EQ(r.covered_ds, 1u);                        /* 15 s TTL not yet over */
     ASSERT_EQ(atomic_load(&g_branch_metrics.connector_poll_errors_total[DCP_CONNECT]) >= 1u, true);
+    /* an unreachable connector refuses nothing */
+    ASSERT_TRUE(gate_places_with(0, w));
+    ASSERT_TRUE(gate_places_with(1, w));
 
     /* a good batch restores reachability */
     RESERVE(200, batch("rt-1", "e1", 2, "2026-09-24T10:00:02Z", "cfg-d", "COMPLETE", rec_ok(0)));

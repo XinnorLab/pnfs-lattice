@@ -75,7 +75,7 @@ struct placement_ctx {
     /* cfg->ds_capacity_domain (indexed by ds_id) or NULL. */
     const char          (*domain_of)[PM_DOMAIN_ID_MAX];
     const struct placement_capacity_view   *cap;      /* NULL in rr/legacy */
-    const struct placement_assessment_view *assess;   /* NULL until Stage B */
+    const struct placement_assessment_view *assess;   /* NULL until the first batch: every DS neutral */
     _Atomic uint32_t     *rr_counter;                 /* shared rr cursor; NULL = rr_key only */
     /* Manual base weights (smart, placement_allow_manual_base_weights). */
     const char          (*domain_weight_id)[PM_DOMAIN_ID_MAX];
@@ -95,6 +95,11 @@ struct placement_candidate {
 
 struct placement_reject_counts {
     uint32_t by_reason[PR_COUNT];
+    /* smart, per decision (not rejections): DS that passed the capacity
+     * gate without a verdict in force and were weighted neutrally, and DS
+     * weighted by a live allow that carries VERDICT_RETAINED. */
+    uint32_t neutral;
+    uint32_t retained;
 };
 
 /*

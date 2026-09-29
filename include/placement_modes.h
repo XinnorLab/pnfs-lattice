@@ -115,14 +115,14 @@ enum placement_reason {
     PR_CAPACITY_FULL,
     PR_DOMAIN_MAP_CONTRADICTION,
     PR_SHARED_FS_ALIAS_UNMAPPED,
-    PR_ASSESSMENT_UNKNOWN,
-    PR_ASSESSMENT_STALE,
+    PR_ASSESSMENT_UNKNOWN,    /* no longer produced (smart: neutral); kept as a label */
+    PR_ASSESSMENT_STALE,      /* no longer produced (smart: neutral); kept as a label */
     PR_CONNECTOR_DENIED,
     PR_ZERO_MULTIPLIER,
-    PR_NO_BINDING,
+    PR_NO_BINDING,            /* no longer produced (smart: neutral); kept as a label */
     PR_NO_ELIGIBLE_DS,
     PR_INSUFFICIENT_ELIGIBLE_DS,
-    PR_MODE_NOT_READY,
+    PR_MODE_NOT_READY,        /* no longer produced (smart: neutral); kept as a label */
     PR_WEIGHT_OVERFLOW,
     PR_DOMAIN_MAP_MISMATCH,   /* smart: declared domain != the connector's */
     PR_COUNT

@@ -395,16 +395,24 @@ static void test_no_candidate_is_nospc_never_ds0(void)
     ASSERT_EQ(e.ds_id, 0u);   /* entries zeroed; the caller checks the status first */
 }
 
-static void test_smart_without_assessments_is_not_ready(void)
+static void test_smart_without_assessments_admits_neutrally(void)
 {
+    /* no batch since start: smart places like fill (verdict retention
+     * design rule 1) -- MODE_NOT_READY is no longer produced */
     struct mds_ds_info ds[1];
     reset();
     mk_ds(&ds[0], 0, DS_ONLINE, "h");
     add_row(0, "h", 1000, 500, 1, 1000000);
     struct placement_ctx c = ctx_for(PM_SMART);
     struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why;
+    ASSERT_EQ(placement_admit(&c, ds, 1, &sc, 1, 0, &e, &why), MDS_OK);
+    ASSERT_EQ(why, PR_NONE);
+    ASSERT_EQ(e.ds_id, 0u);
+    /* a full DS is still refused, as NO_ELIGIBLE_DS */
+    V.rows[0].obs.avail_bytes = 0;
+    sc = 1;
     ASSERT_EQ(placement_admit(&c, ds, 1, &sc, 1, 0, &e, &why), MDS_ERR_NOSPC);
-    ASSERT_EQ(why, PR_MODE_NOT_READY);
+    ASSERT_EQ(why, PR_NO_ELIGIBLE_DS);
 }
 
 static void test_fill_fairness_4_to_1(void)
@@ -649,19 +657,43 @@ static void test_smart_reasons(void)
     struct mds_ds_info ds[5];
     reset_smart();
     for (uint32_t i = 0; i < 5; i++) { mk_ds(&ds[i], i, DS_ONLINE, "h"); add_row(i, "h", 1000, 500, 10 + i, 1000000); }
-    /* ds0: no record; ds1: UNKNOWN; ds2: expired; ds3: denied; ds4: ppm 0 */
+    /* ds0: no record; ds1: a row that is not valid (R5 never publishes
+     * one; defensive); ds2: expired; ds3: denied; ds4: ppm 0 */
     add_assess(1, false, true, 1000000, 15000, NULL);
     add_assess(2, true, true, 1000000, 500, NULL);      /* received at -1000, ttl 500 -> expired */
     add_assess(3, true, false, 1000000, 15000, NULL);
     add_assess(4, true, true, 0, 15000, NULL);
     struct placement_ctx c = smart_ctx();
     struct placement_candidate out[5]; struct placement_reject_counts why;
-    ASSERT_EQ(placement_candidates(&c, ds, 5, out, &why), 0u);
-    ASSERT_EQ(why.by_reason[PR_NO_BINDING], 1u);
-    ASSERT_EQ(why.by_reason[PR_ASSESSMENT_UNKNOWN], 1u);
-    ASSERT_EQ(why.by_reason[PR_ASSESSMENT_STALE], 1u);
+    /* no verdict in force is neutral, not a refusal; only a live verdict excludes */
+    ASSERT_EQ(placement_candidates(&c, ds, 5, out, &why), 3u);
+    ASSERT_EQ(out[0].ds_id, 0u);
+    ASSERT_EQ(out[1].ds_id, 1u);
+    ASSERT_EQ(out[2].ds_id, 2u);
+    for (int k = 0; k < 3; k++) {
+        ASSERT_TRUE(out[k].weight == placement_weight(50, 1000000, 1, NULL));
+    }
+    ASSERT_EQ(why.neutral, 3u);
+    ASSERT_EQ(why.by_reason[PR_NO_BINDING], 0u);
+    ASSERT_EQ(why.by_reason[PR_ASSESSMENT_UNKNOWN], 0u);
+    ASSERT_EQ(why.by_reason[PR_ASSESSMENT_STALE], 0u);
     ASSERT_EQ(why.by_reason[PR_CONNECTOR_DENIED], 1u);
     ASSERT_EQ(why.by_reason[PR_ZERO_MULTIPLIER], 1u);
+    /* the expiry instant itself is no longer in force (A.rows[1] is ds2) */
+    A.rows[1].expires_mono_ms = c.now_mono_ms;
+    A.rows[1].multiplier_ppm = 250000;
+    ASSERT_EQ(placement_candidates(&c, ds, 5, out, &why), 3u);
+    ASSERT_TRUE(out[2].weight == placement_weight(50, 1000000, 1, NULL));
+    A.rows[1].expires_mono_ms = c.now_mono_ms + 1;
+    ASSERT_EQ(placement_candidates(&c, ds, 5, out, &why), 3u);
+    ASSERT_TRUE(out[2].weight == placement_weight(50, 250000, 1, NULL));
+    ASSERT_EQ(why.neutral, 2u);
+    /* the per-DS verdict agrees: neutral is admitted, a live deny is not */
+    enum placement_reason r0;
+    ASSERT_EQ(placement_ds_admitted(&c, ds, 5, 0, &r0), true);
+    ASSERT_EQ(r0, PR_NONE);
+    ASSERT_EQ(placement_ds_admitted(&c, ds, 5, 3, &r0), false);
+    ASSERT_EQ(r0, PR_CONNECTOR_DENIED);
     /* capacity comes first: a full domain is CAPACITY_FULL even with a fine assessment */
     reset_smart();
     mk_ds(&ds[0], 0, DS_ONLINE, "h");
@@ -675,17 +707,126 @@ static void test_smart_reasons(void)
     ASSERT_EQ(r, PR_CAPACITY_FULL);
 }
 
-static void test_smart_without_view_is_not_ready(void)
+static void test_smart_without_view_keeps_the_fill_gates(void)
+{
+    /* neutral is the fill weight, not a bypass: DS state, the capacity
+     * gate and the alias grades still exclude (design rule 7) */
+    struct mds_ds_info ds[5];
+    reset_smart();
+    mk_ds(&ds[0], 0, DS_ONLINE, "a");
+    mk_ds(&ds[1], 1, DS_OFFLINE, "b");
+    mk_ds(&ds[2], 2, DS_ONLINE, "c");
+    mk_ds(&ds[3], 3, DS_ONLINE, "xi");
+    mk_ds(&ds[4], 4, DS_ONLINE, "xi");
+    add_row(0, "a", 1000, 500, 1, 1000000);
+    add_row(1, "b", 1000, 500, 2, 1000000);
+    add_row(2, "c", 1000, 0, 3, 1000000);          /* full */
+    add_row(3, "xi", 1000, 500, 7, 1000000);       /* an undeclared proven alias pair */
+    add_row(4, "xi", 1000, 500, 7, 1000000);
+    struct placement_ctx c = smart_ctx();
+    c.assess = NULL;
+    struct placement_candidate out[5]; struct placement_reject_counts why;
+    ASSERT_EQ(placement_candidates(&c, ds, 5, out, &why), 1u);
+    ASSERT_EQ(out[0].ds_id, 0u);
+    ASSERT_TRUE(out[0].weight == placement_weight(50, 1000000, 1, NULL));
+    ASSERT_EQ(strcmp(out[0].domain, "ds:0"), 0);
+    ASSERT_EQ(why.neutral, 1u);
+    ASSERT_EQ(why.by_reason[PR_DS_OFFLINE], 1u);
+    ASSERT_EQ(why.by_reason[PR_CAPACITY_FULL], 1u);
+    ASSERT_EQ(why.by_reason[PR_SHARED_FS_ALIAS_UNMAPPED], 2u);
+    ASSERT_EQ(why.by_reason[PR_MODE_NOT_READY], 0u);
+    enum placement_reason r;
+    ASSERT_EQ(placement_ds_admitted(&c, ds, 5, 0, &r), true);
+    ASSERT_EQ(r, PR_NONE);
+    ASSERT_EQ(placement_ds_admitted(&c, ds, 5, 2, &r), false);
+    ASSERT_EQ(r, PR_CAPACITY_FULL);
+    /* a stale observation excludes the neutral DS too; admit then refuses
+     * with NO_ELIGIBLE_DS, never MODE_NOT_READY */
+    V.rows[0].obs.observed_mono_ms = 1000000 - 500000;
+    ASSERT_EQ(placement_candidates(&c, ds, 5, out, &why), 0u);
+    ASSERT_EQ(why.by_reason[PR_CAPACITY_STALE], 1u);
+    ASSERT_EQ(why.neutral, 0u);
+    struct mds_ds_map_entry e; uint32_t sc = 1;
+    ASSERT_EQ(placement_admit(&c, ds, 5, &sc, 1, 0, &e, &r), MDS_ERR_NOSPC);
+    ASSERT_EQ(r, PR_NO_ELIGIBLE_DS);
+}
+
+static void test_smart_without_a_verdict_is_neutral(void)
+{
+    struct mds_ds_info ds[2];
+    reset_smart();
+    mk_ds(&ds[0], 0, DS_ONLINE, "a"); mk_ds(&ds[1], 1, DS_ONLINE, "b");
+    add_row(0, "a", 1000, 800, 1, 1000000); add_row(1, "b", 1000, 800, 2, 1000000);
+    add_assess(0, true, true, 250000, 15000, "d-a");            /* ds 0 degraded, ds 1 never reported */
+    struct placement_ctx c = smart_ctx();
+    struct placement_candidate out[2]; struct placement_reject_counts why;
+    memset(&why, 0, sizeof(why));
+    ASSERT_EQ(placement_candidates(&c, ds, 2, out, &why), 2u);
+    ASSERT_TRUE(out[1].weight == placement_weight(80, 1000000, 1, NULL));   /* neutral = fill weight */
+    ASSERT_TRUE(out[0].weight == placement_weight(80, 250000, 1, NULL));
+    ASSERT_EQ(why.neutral, 1u);
+    ASSERT_EQ(why.by_reason[PR_NO_BINDING], 0u);
+    ASSERT_EQ(strcmp(out[0].domain, "d-a"), 0);
+    ASSERT_EQ(strcmp(out[1].domain, "ds:1"), 0);                 /* the operator's domain */
+}
+
+static void test_smart_expired_verdict_is_neutral_and_live_deny_excludes(void)
+{
+    struct mds_ds_info ds[2];
+    reset_smart();
+    mk_ds(&ds[0], 0, DS_ONLINE, "a"); mk_ds(&ds[1], 1, DS_ONLINE, "b");
+    add_row(0, "a", 1000, 800, 1, 1000000); add_row(1, "b", 1000, 800, 2, 1000000);
+    add_assess(0, true, false, 0, 15000, "d-a");               /* live deny */
+    add_assess(1, true, false, 0, 500, "d-b");                 /* received 999000 + ttl 500: expired at 999500 */
+    struct placement_ctx c = smart_ctx();
+    struct placement_candidate out[2]; struct placement_reject_counts why;
+    memset(&why, 0, sizeof(why));
+    ASSERT_EQ(placement_candidates(&c, ds, 2, out, &why), 1u);
+    ASSERT_EQ(out[0].ds_id, 1u);
+    ASSERT_EQ(why.by_reason[PR_CONNECTOR_DENIED], 1u);
+    ASSERT_EQ(why.neutral, 1u);
+    ASSERT_TRUE(out[0].weight == placement_weight(80, 1000000, 1, NULL));
+    ASSERT_EQ(strcmp(out[0].domain, "ds:1"), 0);                 /* not the expired row's d-b */
+    /* a live zero multiplier still excludes */
+    A.rows[0].allowed = true;
+    ASSERT_EQ(placement_candidates(&c, ds, 2, out, &why), 1u);
+    ASSERT_EQ(why.by_reason[PR_ZERO_MULTIPLIER], 1u);
+}
+
+static void test_smart_without_any_view_places_like_fill(void)
 {
     struct mds_ds_info ds[1];
     reset_smart();
-    mk_ds(&ds[0], 0, DS_ONLINE, "h");
-    add_row(0, "h", 1000, 500, 1, 1000000);
+    mk_ds(&ds[0], 0, DS_ONLINE, "a");
+    add_row(0, "a", 1000, 500, 1, 1000000);
     struct placement_ctx c = smart_ctx();
-    c.assess = NULL;
+    c.assess = NULL;                                           /* no batch since start */
     struct placement_candidate out[1]; struct placement_reject_counts why;
-    ASSERT_EQ(placement_candidates(&c, ds, 1, out, &why), 0u);
-    ASSERT_EQ(why.by_reason[PR_MODE_NOT_READY], 1u);
+    memset(&why, 0, sizeof(why));
+    ASSERT_EQ(placement_candidates(&c, ds, 1, out, &why), 1u);
+    ASSERT_EQ(why.by_reason[PR_MODE_NOT_READY], 0u);
+    ASSERT_TRUE(out[0].weight == placement_weight(50, 1000000, 1, NULL));
+}
+
+static void test_smart_retained_verdict_is_counted(void)
+{
+    struct mds_ds_info ds[1];
+    reset_smart();
+    mk_ds(&ds[0], 0, DS_ONLINE, "a");
+    add_row(0, "a", 1000, 500, 1, 1000000);
+    add_assess(0, true, true, 1000000, 600000, "d-a");
+    A.rows[0].retained = true;
+    struct placement_ctx c = smart_ctx();
+    struct placement_candidate out[1]; struct placement_reject_counts why;
+    memset(&why, 0, sizeof(why));
+    ASSERT_EQ(placement_candidates(&c, ds, 1, out, &why), 1u);
+    ASSERT_EQ(why.retained, 1u);
+    ASSERT_EQ(why.neutral, 0u);
+    /* once it has run out it is neither retained nor a verdict: neutral */
+    A.rows[0].expires_mono_ms = c.now_mono_ms;
+    ASSERT_EQ(placement_candidates(&c, ds, 1, out, &why), 1u);
+    ASSERT_EQ(why.retained, 0u);
+    ASSERT_EQ(why.neutral, 1u);
 }
 
 static void test_smart_degraded_ppm_is_picked_less(void)
@@ -730,6 +871,23 @@ static void test_smart_connector_domain_and_map_mismatch(void)
     ASSERT_EQ(placement_candidates(&c, ds, 3, out, &why), 2u);
     ASSERT_EQ(why.by_reason[PR_DOMAIN_MAP_MISMATCH], 1u);
     ASSERT_TRUE(out[0].weight == placement_weight(80, 1000000, 2, NULL));   /* N still counts the alias */
+    /* only a verdict in force carries the connector's domain: once ds2's
+     * row has run out, the operator map applies (no DOMAIN_MAP_MISMATCH),
+     * and without a map the DS is its own domain ds:2 -- neutral either way */
+    snprintf(DOM[1], PM_DOMAIN_ID_MAX, "ctrl/fs-1");
+    snprintf(DOM[2], PM_DOMAIN_ID_MAX, "op/fs-2");
+    ASSERT_EQ(placement_candidates(&c, ds, 3, out, &why), 2u);
+    ASSERT_EQ(why.by_reason[PR_DOMAIN_MAP_MISMATCH], 1u);          /* live row: the map disagrees */
+    A.rows[2].expires_mono_ms = c.now_mono_ms;                      /* runs out now */
+    ASSERT_EQ(placement_candidates(&c, ds, 3, out, &why), 3u);
+    ASSERT_EQ(why.by_reason[PR_DOMAIN_MAP_MISMATCH], 0u);
+    ASSERT_EQ(why.neutral, 1u);
+    ASSERT_EQ(strcmp(out[2].domain, "op/fs-2"), 0);
+    ASSERT_TRUE(out[2].weight == placement_weight(80, 1000000, 1, NULL));
+    DOM[2][0] = '\0';
+    ASSERT_EQ(placement_candidates(&c, ds, 3, out, &why), 3u);
+    ASSERT_EQ(strcmp(out[2].domain, "ds:2"), 0);
+    ASSERT_TRUE(out[2].weight == placement_weight(80, 1000000, 1, NULL));
 }
 
 static void test_smart_alias_with_an_unbound_sibling(void)
@@ -972,14 +1130,24 @@ static void test_singleton_smart_init_and_readiness(void)
     ASSERT_EQ(r.registered_ds, 1u);
     ASSERT_EQ(r.covered_ds, 0u);
     ASSERT_EQ(strcmp(r.coverage, "none"), 0);
-    /* no assessments published: every candidate check is NOT_READY */
+    /* no assessments published: every DS is neutral and placed as in fill */
     struct mds_ds_info ds[1]; mk_ds(&ds[0], 0, DS_ONLINE, "ds-host");
     struct ds_capacity_obs half = { 1000, 500, 1, ds_cache_mono_ms(), 0 };
     ASSERT_EQ(ds_cache_set_capacity_obs(cache, 0, &half), 0);
     placement_gate_publish_capacity();
-    struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why;
-    ASSERT_EQ(placement_select_gated(true, PLACEMENT_WEIGHTED_RR, ds, 1, &sc, 1, 65536, 0, &e, &why), MDS_ERR_NOSPC);
-    ASSERT_EQ(why, PR_MODE_NOT_READY);
+    struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why = PR_CAPACITY_FULL;
+    ASSERT_EQ(placement_select_gated(true, PLACEMENT_WEIGHTED_RR, ds, 1, &sc, 1, 65536, 0, &e, &why), MDS_OK);
+    ASSERT_EQ(why, PR_NONE);
+    ASSERT_EQ(e.ds_id, 0u);
+    {
+        struct placement_ds_status st0;
+        struct placement_token tok;
+        ASSERT_EQ(placement_gate_ds_status(0, &st0), true);
+        ASSERT_EQ(st0.assessed, false);
+        ASSERT_EQ(st0.reason, PR_NONE);
+        ASSERT_TRUE(st0.weight == placement_weight(50, 1000000, 1, NULL));
+        ASSERT_EQ(placement_gate_admit_create(0, PP_NEW_OBJECT, &tok, &why), MDS_OK);
+    }
     /* a published view with a fresh VALID row makes the DS eligible */
     struct placement_assessment_view v; memset(&v, 0, sizeof(v));
     v.count = 1; v.batch_valid = true;
@@ -1152,7 +1320,11 @@ int main(void)
     RUN_TEST(test_admit_counts_per_ds_reasons);
     RUN_TEST(test_smart_healthy_row_is_a_candidate);
     RUN_TEST(test_smart_reasons);
-    RUN_TEST(test_smart_without_view_is_not_ready);
+    RUN_TEST(test_smart_without_view_keeps_the_fill_gates);
+    RUN_TEST(test_smart_without_a_verdict_is_neutral);
+    RUN_TEST(test_smart_expired_verdict_is_neutral_and_live_deny_excludes);
+    RUN_TEST(test_smart_without_any_view_places_like_fill);
+    RUN_TEST(test_smart_retained_verdict_is_counted);
     RUN_TEST(test_smart_degraded_ppm_is_picked_less);
     RUN_TEST(test_smart_connector_domain_and_map_mismatch);
     RUN_TEST(test_smart_manual_base_weight);
@@ -1173,7 +1345,7 @@ int main(void)
     RUN_TEST(test_fill_multi_stripe_distinct_and_shrink_vs_strict);
     RUN_TEST(test_fill_mirrors_are_distinct);
     RUN_TEST(test_no_candidate_is_nospc_never_ds0);
-    RUN_TEST(test_smart_without_assessments_is_not_ready);
+    RUN_TEST(test_smart_without_assessments_admits_neutrally);
     RUN_TEST(test_fill_fairness_4_to_1);
     RUN_TEST(test_fill_equal_fill_is_even);
     RUN_TEST(test_alias_domain_total_equals_single_ds_domain);

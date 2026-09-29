@@ -1944,7 +1944,14 @@ static void test_config_show_placement_rows(void)
     ASSERT_TRUE(text != NULL);
     ASSERT_TRUE(strstr(text, "placement_readiness = mode_active=1 connector_config_valid=0 connector_reachable=0 last_batch_valid=0 coverage=none registered_ds=1 covered_ds=0 eligible_ds=0\n") != NULL);
     ASSERT_TRUE(strstr(text, "placement_ds.1 = domain=xi/fs-1 state=ONLINE capacity_age_ms=") != NULL);
-    ASSERT_TRUE(strstr(text, "assessment_age_ms=none quality=NONE allowed=0 ppm=0 ttl_ms=0 weight=0 reason=MODE_NOT_READY\n") != NULL);
+    {
+        /* no batch yet: the DS is neutral -- the fill weight, reason NONE */
+        char neutral_row[160];
+        (void)snprintf(neutral_row, sizeof(neutral_row),
+                       "assessment_age_ms=none quality=NONE allowed=0 ppm=0 ttl_ms=0 weight=%llu reason=NONE\n",
+                       (unsigned long long)placement_weight(50, 1000000, 1, NULL));
+        ASSERT_TRUE(strstr(text, neutral_row) != NULL);
+    }
     free(text);
 
     cluster_transport_server_stop(srv);
