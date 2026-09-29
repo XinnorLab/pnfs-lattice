@@ -593,6 +593,14 @@ int mds_metrics_prometheus_v2(const struct mds_metrics_snapshot *snap,
             "# HELP pnfs_mds_placement_eligible_ds Candidates at the last placement decision.\n"
             "# TYPE pnfs_mds_placement_eligible_ds gauge\n"
             "pnfs_mds_placement_eligible_ds %lu\n"
+            "# HELP pnfs_mds_placement_neutral_ds smart: DS placed neutrally (no verdict in force) "
+            "at the last placement decision.\n"
+            "# TYPE pnfs_mds_placement_neutral_ds gauge\n"
+            "pnfs_mds_placement_neutral_ds %lu\n"
+            "# HELP pnfs_mds_placement_retained_ds smart: DS under a retained verdict (allow or deny) "
+            "at the last placement decision.\n"
+            "# TYPE pnfs_mds_placement_retained_ds gauge\n"
+            "pnfs_mds_placement_retained_ds %lu\n"
             "# HELP pnfs_mds_placement_alias_suspected_total Same filesystem id behind two host names.\n"
             "# TYPE pnfs_mds_placement_alias_suspected_total counter\n"
             "pnfs_mds_placement_alias_suspected_total %lu\n"
@@ -601,6 +609,10 @@ int mds_metrics_prometheus_v2(const struct mds_metrics_snapshot *snap,
             placement_mode_name(pm),
             (unsigned long)atomic_load(
                 (_Atomic uint64_t *)&branch->placement_eligible_ds),
+            (unsigned long)atomic_load(
+                (_Atomic uint64_t *)&branch->placement_neutral_ds),
+            (unsigned long)atomic_load(
+                (_Atomic uint64_t *)&branch->placement_retained_ds),
             (unsigned long)atomic_load(
                 (_Atomic uint64_t *)&branch->placement_alias_suspected_total));
         if (extra < 0 || ((size_t)base + (size_t)extra) >= cap) {
@@ -638,12 +650,17 @@ int mds_metrics_prometheus_v2(const struct mds_metrics_snapshot *snap,
             "# HELP pnfs_mds_connector_batches_accepted_total Connector batches accepted.\n"
             "# TYPE pnfs_mds_connector_batches_accepted_total counter\n"
             "pnfs_mds_connector_batches_accepted_total %lu\n"
-            "# HELP pnfs_mds_connector_covered_ds Registered DS with a fresh VALID assessment.\n"
+            "# HELP pnfs_mds_connector_covered_ds Registered DS with a verdict in force (fresh or "
+            "retained) at the last accepted batch.\n"
             "# TYPE pnfs_mds_connector_covered_ds gauge\n"
             "pnfs_mds_connector_covered_ds %lu\n"
             "# HELP pnfs_mds_connector_reachable 1 when the last poll within 3 intervals succeeded.\n"
             "# TYPE pnfs_mds_connector_reachable gauge\n"
             "pnfs_mds_connector_reachable %lu\n"
+            "# HELP pnfs_mds_connector_verdicts_expired_total Verdicts that ran out without a new "
+            "one (counted at the next accepted batch).\n"
+            "# TYPE pnfs_mds_connector_verdicts_expired_total counter\n"
+            "pnfs_mds_connector_verdicts_expired_total %lu\n"
             "# HELP pnfs_mds_connector_last_success_mono_ms Monotonic ms of the last accepted batch (0 = never).\n"
             "# TYPE pnfs_mds_connector_last_success_mono_ms gauge\n"
             "pnfs_mds_connector_last_success_mono_ms %lu\n"
@@ -652,6 +669,7 @@ int mds_metrics_prometheus_v2(const struct mds_metrics_snapshot *snap,
             (unsigned long)atomic_load((_Atomic uint64_t *)&branch->connector_batches_accepted_total),
             (unsigned long)atomic_load((_Atomic uint64_t *)&branch->connector_covered_ds),
             (unsigned long)atomic_load((_Atomic uint64_t *)&branch->connector_reachable),
+            (unsigned long)atomic_load((_Atomic uint64_t *)&branch->connector_verdicts_expired_total),
             (unsigned long)atomic_load((_Atomic uint64_t *)&branch->connector_last_success_mono_ms));
         if (extra < 0 || ((size_t)base + (size_t)extra) >= cap) {
             return -1;

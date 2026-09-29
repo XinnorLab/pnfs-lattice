@@ -95,9 +95,11 @@ struct placement_candidate {
 
 struct placement_reject_counts {
     uint32_t by_reason[PR_COUNT];
-    /* smart, per decision (not rejections): DS that passed the capacity
-     * gate without a verdict in force and were weighted neutrally, and DS
-     * weighted by a live allow that carries VERDICT_RETAINED. */
+    /* smart, per decision (not rejections), over the DS that passed the
+     * capacity gate: DS without a verdict in force (weighted neutrally),
+     * and DS whose live verdict carries VERDICT_RETAINED -- allow or deny;
+     * a retained deny is counted under CONNECTOR_DENIED as well.
+     * placement_gate_note_rejections() stores both as gauges. */
     uint32_t neutral;
     uint32_t retained;
 };
@@ -170,8 +172,12 @@ struct placement_readiness {
     bool     connector_reachable;
     bool     last_batch_valid;
     uint32_t registered_ds;
-    uint32_t covered_ds;               /* fresh valid records */
-    uint32_t eligible_ds;              /* covered and allowed with ppm > 0 */
+    uint32_t covered_ds;               /* registered DS with a live verdict, fresh or retained */
+    uint32_t eligible_ds;              /* registered DS no live verdict excludes: the
+                                        * neutral ones + live allows with ppm > 0
+                                        * (DS state and capacity are not counted here) */
+    uint32_t retained_ds;              /* live verdicts carrying VERDICT_RETAINED, allow or deny */
+    uint32_t neutral_ds;               /* registered_ds - covered_ds: placed neutrally */
     char     coverage[8];              /* "full" | "partial" | "none" | "n/a" */
     uint64_t last_success_mono_ms;
     char     config_digest[PM_DIGEST_MAX];
@@ -213,13 +219,16 @@ struct placement_ds_status {
     uint64_t weight;            /* 0 when not a candidate */
     enum placement_reason reason;
     /* smart */
-    bool     assessed;          /* a record exists */
+    bool     assessed;          /* a verdict is in force (live, unexpired row) */
     bool     assessment_valid;
     bool     assessment_allowed;
-    uint32_t assessment_ppm;
+    uint32_t assessment_ppm;    /* 1 000 000 when neutral */
     uint64_t assessment_age_ms; /* UINT64_MAX when none */
     uint64_t assessment_ttl_ms; /* remaining, 0 when expired/none */
     char     assessment_reason[PA_REASON_LEN];
+    bool     neutral;           /* no verdict in force: `allowed=-`, ppm 1 000 000 */
+    char     verdict[12];       /* "fresh" | "retained" | "none" ("" outside smart) */
+    uint64_t hold_left_ms;      /* until the verdict runs out; 0 when none */
 };
 
 /* DS ids in the published view (0 in rr/legacy or before the first publish). */

@@ -822,7 +822,20 @@ static void test_smart_retained_verdict_is_counted(void)
     ASSERT_EQ(placement_candidates(&c, ds, 1, out, &why), 1u);
     ASSERT_EQ(why.retained, 1u);
     ASSERT_EQ(why.neutral, 0u);
+    /* a retained deny is retained too (and still CONNECTOR_DENIED): the
+     * gauge counts every live retained verdict, like readiness */
+    A.rows[0].allowed = false;
+    ASSERT_EQ(placement_candidates(&c, ds, 1, out, &why), 0u);
+    ASSERT_EQ(why.retained, 1u);
+    ASSERT_EQ(why.by_reason[PR_CONNECTOR_DENIED], 1u);
+    ASSERT_EQ(why.neutral, 0u);
+    A.rows[0].allowed = true;
+    A.rows[0].multiplier_ppm = 0;
+    ASSERT_EQ(placement_candidates(&c, ds, 1, out, &why), 0u);
+    ASSERT_EQ(why.retained, 1u);
+    ASSERT_EQ(why.by_reason[PR_ZERO_MULTIPLIER], 1u);
     /* once it has run out it is neither retained nor a verdict: neutral */
+    A.rows[0].multiplier_ppm = 1000000;
     A.rows[0].expires_mono_ms = c.now_mono_ms;
     ASSERT_EQ(placement_candidates(&c, ds, 1, out, &why), 1u);
     ASSERT_EQ(why.retained, 0u);
@@ -1129,6 +1142,9 @@ static void test_singleton_smart_init_and_readiness(void)
     ASSERT_EQ(r.connector_reachable, false);
     ASSERT_EQ(r.registered_ds, 1u);
     ASSERT_EQ(r.covered_ds, 0u);
+    ASSERT_EQ(r.neutral_ds, 1u);                             /* no view: every DS neutral */
+    ASSERT_EQ(r.eligible_ds, 1u);                            /* ... and none excluded by a verdict */
+    ASSERT_EQ(r.retained_ds, 0u);
     ASSERT_EQ(strcmp(r.coverage, "none"), 0);
     /* no assessments published: every DS is neutral and placed as in fill */
     struct mds_ds_info ds[1]; mk_ds(&ds[0], 0, DS_ONLINE, "ds-host");
@@ -1144,11 +1160,21 @@ static void test_singleton_smart_init_and_readiness(void)
         struct placement_token tok;
         ASSERT_EQ(placement_gate_ds_status(0, &st0), true);
         ASSERT_EQ(st0.assessed, false);
+        ASSERT_EQ(st0.neutral, true);
+        ASSERT_EQ(strcmp(st0.verdict, "none"), 0);
+        ASSERT_EQ(st0.assessment_ppm, 1000000u);
         ASSERT_EQ(st0.reason, PR_NONE);
         ASSERT_TRUE(st0.weight == placement_weight(50, 1000000, 1, NULL));
         ASSERT_EQ(placement_gate_admit_create(0, PP_NEW_OBJECT, &tok, &why), MDS_OK);
     }
-    /* a published view with a fresh VALID row makes the DS eligible */
+    /* a second registered DS the connector has no verdict for */
+    add_cache_ds(cat, cache, 1, "ds-host-1");
+    {
+        struct ds_capacity_obs half1 = { 1000, 500, 2, ds_cache_mono_ms(), 0 };
+        ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &half1), 0);
+    }
+    placement_gate_publish_capacity();
+    /* a published view with one live VALID row of two registered DS */
     struct placement_assessment_view v; memset(&v, 0, sizeof(v));
     v.count = 1; v.batch_valid = true;
     v.rows[0].ds_id = 0; v.rows[0].present = true; v.rows[0].valid = true; v.rows[0].allowed = true;
@@ -1156,17 +1182,132 @@ static void test_singleton_smart_init_and_readiness(void)
     v.rows[0].expires_mono_ms = ds_cache_mono_ms() + 15000;
     placement_gate_publish_assessments(&v);
     placement_gate_readiness(&r);
+    ASSERT_EQ(r.registered_ds, 2u);
     ASSERT_EQ(r.covered_ds, 1u);
-    ASSERT_EQ(r.eligible_ds, 1u);
-    ASSERT_EQ(strcmp(r.coverage, "full"), 0);
+    ASSERT_EQ(r.eligible_ds, 2u);                            /* ds 0 by its allow, ds 1 neutral */
+    ASSERT_EQ(r.retained_ds, 0u);
+    ASSERT_EQ(r.neutral_ds, 1u);
+    ASSERT_EQ(strcmp(r.coverage, "partial"), 0);
     ASSERT_EQ(placement_select_gated(true, PLACEMENT_WEIGHTED_RR, ds, 1, &sc, 1, 65536, 0, &e, &why), MDS_OK);
     ASSERT_EQ(e.ds_id, 0u);
     struct placement_ds_status st;
     ASSERT_EQ(placement_gate_ds_status(0, &st), true);
     ASSERT_EQ(st.assessed, true);
+    ASSERT_EQ(st.neutral, false);
     ASSERT_EQ(st.assessment_valid, true);
     ASSERT_EQ(st.assessment_ppm, 1000000u);
     ASSERT_TRUE(st.assessment_ttl_ms > 10000);
+    ASSERT_EQ(strcmp(st.verdict, "fresh"), 0);
+    ASSERT_TRUE(st.hold_left_ms > 10000 && st.hold_left_ms <= 15000);
+    /* ds 1: no verdict in force -- neutral, placed at its fill weight */
+    ASSERT_EQ(placement_gate_ds_status(1, &st), true);
+    ASSERT_EQ(strcmp(st.verdict, "none"), 0);
+    ASSERT_TRUE(st.hold_left_ms == 0);
+    ASSERT_TRUE(st.weight > 0);
+    ASSERT_EQ(st.reason, PR_NONE);
+    ASSERT_EQ(st.neutral, true);
+    ASSERT_EQ(st.assessed, false);
+    ASSERT_EQ(st.assessment_ppm, 1000000u);
+    placement_gate_destroy();
+    ds_cache_destroy(cache);
+    mds_catalogue_close(cat);
+}
+
+/* Readiness (verdict retention design section 5.3, Rulings 9 and 10) and
+ * the gauges of the last decision over four DS: a fresh allow, a retained
+ * allow, a retained deny and one whose verdict has run out (neutral). */
+static void test_smart_readiness_and_gauges_count_verdicts(void)
+{
+    struct mds_config cfg = fill_cfg();
+    cfg.placement_mode = PM_SMART;
+    cfg.ds_connector_poll_ms = 1000;
+    struct mds_catalogue *cat = NULL;
+    struct ds_cache *cache = cache_with_ds(&cat, 0);
+    ASSERT_TRUE(cache != NULL);
+    add_cache_ds(cat, cache, 1, "ds-host-1");
+    add_cache_ds(cat, cache, 2, "ds-host-2");
+    add_cache_ds(cat, cache, 3, "ds-host-3");
+    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
+    uint64_t now = ds_cache_mono_ms();
+    for (uint32_t i = 0; i < 4; i++) {
+        struct ds_capacity_obs half = { 1000, 500, 10 + i, now, 0 };
+        ASSERT_EQ(ds_cache_set_capacity_obs(cache, i, &half), 0);
+    }
+    placement_gate_publish_capacity();
+    struct placement_assessment_view v; memset(&v, 0, sizeof(v));
+    v.count = 4; v.batch_valid = true;
+    for (uint32_t i = 0; i < 4; i++) {
+        v.rows[i].ds_id = i; v.rows[i].present = true; v.rows[i].valid = true;
+        v.rows[i].allowed = true; v.rows[i].multiplier_ppm = 1000000;
+        v.rows[i].received_mono_ms = now;
+        v.rows[i].expires_mono_ms = now + 600000;
+    }
+    v.rows[1].retained = true; v.rows[1].multiplier_ppm = 500000;     /* retained allow */
+    v.rows[2].retained = true; v.rows[2].allowed = false;             /* retained deny */
+    v.rows[2].multiplier_ppm = 0;
+    v.rows[3].received_mono_ms = now - 20000;                         /* ran out: neutral */
+    v.rows[3].expires_mono_ms = now - 1;
+    placement_gate_publish_assessments(&v);
+
+    struct placement_readiness r;
+    placement_gate_readiness(&r);
+    ASSERT_EQ(r.registered_ds, 4u);
+    ASSERT_EQ(r.covered_ds, 3u);
+    ASSERT_EQ(r.retained_ds, 2u);                   /* the retained allow and the retained deny */
+    ASSERT_EQ(r.neutral_ds, 1u);
+    ASSERT_EQ(r.eligible_ds, 3u);                   /* 2 live allows + 1 neutral */
+    ASSERT_EQ(strcmp(r.coverage, "partial"), 0);
+
+    struct placement_ds_status st;
+    ASSERT_EQ(placement_gate_ds_status(1, &st), true);
+    ASSERT_EQ(strcmp(st.verdict, "retained"), 0);
+    ASSERT_TRUE(st.hold_left_ms > 590000 && st.hold_left_ms <= 600000);
+    ASSERT_EQ(st.assessment_ppm, 500000u);
+    ASSERT_EQ(st.reason, PR_NONE);
+    ASSERT_EQ(placement_gate_ds_status(2, &st), true);
+    ASSERT_EQ(strcmp(st.verdict, "retained"), 0);
+    ASSERT_EQ(st.neutral, false);
+    ASSERT_EQ(st.assessment_allowed, false);
+    ASSERT_EQ(st.reason, PR_CONNECTOR_DENIED);
+    ASSERT_TRUE(st.weight == 0);
+    ASSERT_EQ(placement_gate_ds_status(3, &st), true);
+    ASSERT_EQ(strcmp(st.verdict, "none"), 0);
+    ASSERT_TRUE(st.hold_left_ms == 0);
+    ASSERT_EQ(st.neutral, true);
+    ASSERT_EQ(st.assessed, false);
+    ASSERT_TRUE(st.assessment_age_ms == UINT64_MAX);
+    ASSERT_TRUE(st.assessment_ttl_ms == 0);
+    ASSERT_EQ(st.assessment_ppm, 1000000u);
+    ASSERT_EQ(st.reason, PR_NONE);
+    ASSERT_TRUE(st.weight == placement_weight(50, 1000000, 1, NULL));
+
+    /* the gauges of the last decision agree with readiness */
+    struct mds_ds_info ds[4];
+    mk_ds(&ds[0], 0, DS_ONLINE, "ds-host");
+    mk_ds(&ds[1], 1, DS_ONLINE, "ds-host-1");
+    mk_ds(&ds[2], 2, DS_ONLINE, "ds-host-2");
+    mk_ds(&ds[3], 3, DS_ONLINE, "ds-host-3");
+    uint64_t denied0 = atomic_load(&g_branch_metrics.placement_rejections_total[PR_CONNECTOR_DENIED]);
+    struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why = PR_CAPACITY_FULL;
+    ASSERT_EQ(placement_select_gated(true, PLACEMENT_WEIGHTED_RR, ds, 4, &sc, 1, 65536, 0, &e, &why), MDS_OK);
+    ASSERT_TRUE(e.ds_id != 2u);
+    ASSERT_EQ(atomic_load(&g_branch_metrics.placement_eligible_ds), 3u);
+    ASSERT_EQ(atomic_load(&g_branch_metrics.placement_neutral_ds), 1u);
+    ASSERT_EQ(atomic_load(&g_branch_metrics.placement_retained_ds), 2u);
+    ASSERT_TRUE(atomic_load(&g_branch_metrics.placement_rejections_total[PR_CONNECTOR_DENIED]) == denied0 + 1);
+
+    /* fill has no verdicts: both gauges drop to 0 at its next decision */
+    placement_gate_destroy();
+    cfg.placement_mode = PM_FILL;
+    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
+    placement_gate_publish_capacity();
+    sc = 1;
+    ASSERT_EQ(placement_select_gated(true, PLACEMENT_WEIGHTED_RR, ds, 4, &sc, 1, 65536, 0, &e, &why), MDS_OK);
+    ASSERT_EQ(atomic_load(&g_branch_metrics.placement_neutral_ds), 0u);
+    ASSERT_EQ(atomic_load(&g_branch_metrics.placement_retained_ds), 0u);
+    placement_gate_readiness(&r);
+    ASSERT_EQ(strcmp(r.coverage, "n/a"), 0);
+    ASSERT_EQ(r.neutral_ds, 0u);
     placement_gate_destroy();
     ds_cache_destroy(cache);
     mds_catalogue_close(cat);
@@ -1312,6 +1453,7 @@ int main(void)
     RUN_TEST(test_singleton_rr_needs_no_cache);
     RUN_TEST(test_singleton_publishes_capacity_from_cache);
     RUN_TEST(test_singleton_smart_init_and_readiness);
+    RUN_TEST(test_smart_readiness_and_gauges_count_verdicts);
     RUN_TEST(test_select_gated_legacy_path);
     RUN_TEST(test_admit_histogram_counts_every_selection);
     RUN_TEST(test_select_gated_legacy_rr_at2_branch);

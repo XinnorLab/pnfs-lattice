@@ -6684,11 +6684,12 @@ static void render_cfg_placement(const struct mds_config *cfg,
         RENDER_KEY("placement_readiness",
                    "mode_active=%d connector_config_valid=%d connector_reachable=%d "
                    "last_batch_valid=%d coverage=%s registered_ds=%u covered_ds=%u "
-                   "eligible_ds=%u",
+                   "eligible_ds=%u retained_ds=%u neutral_ds=%u",
                    rd.mode_active ? 1 : 0, rd.connector_config_valid ? 1 : 0,
                    rd.connector_reachable ? 1 : 0, rd.last_batch_valid ? 1 : 0,
                    rd.coverage, (unsigned)rd.registered_ds,
-                   (unsigned)rd.covered_ds, (unsigned)rd.eligible_ds);
+                   (unsigned)rd.covered_ds, (unsigned)rd.eligible_ds,
+                   (unsigned)rd.retained_ds, (unsigned)rd.neutral_ds);
         RENDER_KEY("placement_connector_config_digest", "%s",
                    rd.config_digest[0] != '\0' ? rd.config_digest : "-");
         {
@@ -6730,10 +6731,22 @@ static void render_cfg_placement(const struct mds_config *cfg,
             (void)snprintf(keybuf, sizeof(keybuf), "placement_ds.%u",
                            (unsigned)ids[i]);
             if (placement_gate_mode() == PM_SMART) {
+                /* verdict retention design section 5.3: a neutral DS (no
+                 * verdict in force) reads quality=NONE allowed=-
+                 * ppm=1000000 verdict=none hold_left_ms=none */
+                char hold[24];
+
+                if (ps.neutral) {
+                    (void)snprintf(hold, sizeof(hold), "none");
+                } else {
+                    (void)snprintf(hold, sizeof(hold), "%llu",
+                                   (unsigned long long)ps.hold_left_ms);
+                }
                 RENDER_KEY(keybuf,
                            "domain=%s state=%s capacity_age_ms=%s avail=%llu "
-                           "total=%llu assessment_age_ms=%s quality=%s allowed=%d "
-                           "ppm=%u ttl_ms=%llu weight=%llu reason=%s",
+                           "total=%llu assessment_age_ms=%s quality=%s allowed=%s "
+                           "ppm=%u ttl_ms=%llu weight=%llu reason=%s verdict=%s "
+                           "hold_left_ms=%s",
                            ps.domain,
                            (ps.state == DS_ONLINE) ? "ONLINE" : "OFFLINE",
                            age,
@@ -6741,11 +6754,13 @@ static void render_cfg_placement(const struct mds_config *cfg,
                            (unsigned long long)ps.total_bytes,
                            aage,
                            !ps.assessed ? "NONE" : (ps.assessment_valid ? "VALID" : "UNKNOWN"),
-                           ps.assessment_allowed ? 1 : 0,
+                           ps.neutral ? "-" : (ps.assessment_allowed ? "1" : "0"),
                            (unsigned)ps.assessment_ppm,
                            (unsigned long long)ps.assessment_ttl_ms,
                            (unsigned long long)ps.weight,
-                           placement_reason_name(ps.reason));
+                           placement_reason_name(ps.reason),
+                           ps.verdict[0] != '\0' ? ps.verdict : "none",
+                           hold);
             } else {
                 RENDER_KEY(keybuf,
                            "domain=%s state=%s capacity_age_ms=%s avail=%llu "

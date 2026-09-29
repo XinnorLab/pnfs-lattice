@@ -862,7 +862,9 @@ static void test_poll_once_publishes_and_readiness(void)
     ASSERT_EQ(r.last_batch_valid, true);
     ASSERT_EQ(r.registered_ds, 2u);
     ASSERT_EQ(r.covered_ds, 1u);
-    ASSERT_EQ(r.eligible_ds, 1u);
+    ASSERT_EQ(r.eligible_ds, 2u);                      /* ds 0 by its allow, ds 1 neutral */
+    ASSERT_EQ(r.retained_ds, 0u);
+    ASSERT_EQ(r.neutral_ds, 1u);
     ASSERT_EQ(strcmp(r.coverage, "partial"), 0);
     ASSERT_EQ(strcmp(r.config_digest, "cfg-d"), 0);
     ASSERT_EQ(r.profile_count, 1u);
@@ -930,18 +932,47 @@ static void test_poll_once_publishes_and_readiness(void)
     ASSERT_EQ(r.connector_reachable, false);
     ASSERT_EQ(r.covered_ds, 1u);                        /* 15 s TTL not yet over */
     ASSERT_EQ(atomic_load(&g_branch_metrics.connector_poll_errors_total[DCP_CONNECT]) >= 1u, true);
-    /* an unreachable connector refuses nothing */
+    /* the connector being unreachable excludes nothing by itself: ds 0
+     * stays placed by its still-live verdict, ds 1 neutrally */
     ASSERT_TRUE(gate_places_with(0, w));
     ASSERT_TRUE(gate_places_with(1, w));
 
     /* a good batch restores reachability */
     RESERVE(200, batch("rt-1", "e1", 2, "2026-09-24T10:00:02Z", "cfg-d", "COMPLETE", rec_ok(0)));
     ASSERT_EQ(ds_connector_poll_once(), MDS_OK);
-    s.keep_dir = false;
     fake_srv_stop(&s);
     placement_gate_readiness(&r);
     ASSERT_EQ(r.connector_reachable, true);
     ASSERT_EQ(atomic_load(&g_branch_metrics.connector_reachable), 1u);
+
+    /* a verdict that runs out without a new one is counted in the metrics
+     * when the next accepted batch finds it expired */
+    {
+        const uint64_t expired0 = atomic_load(&g_branch_metrics.connector_verdicts_expired_total);
+        const char *short_ttl = rec(0, 2, "mnt/data", "\"mnt/data:0:u\"", "192.168.64.51", "/mnt/data", 2049,
+                                    "NEW_ALLOCATION", "cluster-default", "VALID", 300, "sha256:p", "true",
+                                    1000000, "\"ctrl-1/fs-1/inc\"");
+
+        RESERVE(200, batch("rt-1", "e1", 3, "2026-09-24T10:00:03Z", "cfg-d", "COMPLETE", short_ttl));
+        ASSERT_EQ(ds_connector_poll_once(), MDS_OK);
+        fake_srv_stop(&s);
+        ASSERT_TRUE(atomic_load(&g_branch_metrics.connector_verdicts_expired_total) == expired0);
+        usleep(400 * 1000);
+        RESERVE(200, batch("rt-1", "e1", 4, "2026-09-24T10:00:04Z", "cfg-d", "COMPLETE", ""));
+        ASSERT_EQ(ds_connector_poll_once(), MDS_OK);
+        fake_srv_stop(&s);
+        ASSERT_TRUE(atomic_load(&g_branch_metrics.connector_verdicts_expired_total) == expired0 + 1);
+        placement_gate_readiness(&r);
+        ASSERT_EQ(r.covered_ds, 0u);
+        ASSERT_EQ(r.neutral_ds, 2u);
+        ASSERT_EQ(r.eligible_ds, 2u);
+        /* counted once */
+        RESERVE(200, batch("rt-1", "e1", 5, "2026-09-24T10:00:05Z", "cfg-d", "COMPLETE", ""));
+        ASSERT_EQ(ds_connector_poll_once(), MDS_OK);
+        s.keep_dir = false;
+        fake_srv_stop(&s);
+        ASSERT_TRUE(atomic_load(&g_branch_metrics.connector_verdicts_expired_total) == expired0 + 1);
+    }
 #undef RESERVE
 
     ds_connector_stop();
@@ -1250,14 +1281,17 @@ static void test_verdict_expires_on_its_ttl_and_is_counted(void)
     /* a dropped batch past the TTL commits nothing, the count included */
     ASSERT_EQ(apply_at(batch("rt-1", "e1", 0, "2026-09-29T10:00:20Z", "c", "COMPLETE", ""), 1016000, &v, &rep), DC_REPLAY);
     ASSERT_TRUE(ST.verdicts_expired_total == 0ull);
+    ASSERT_EQ(rep.expired, 0u);
     ASSERT_EQ(apply_at(batch("rt-1", "e1", 2, "2026-09-29T10:00:30Z", "c", "COMPLETE", ""), 1020000, &v, &rep), DC_OK);
     ASSERT_EQ(v.rows[0].present, false);                      /* 15 s TTL ran out */
     ASSERT_EQ(v.rows[0].valid, false);
     ASSERT_TRUE(ST.verdicts_expired_total == 1ull);
+    ASSERT_EQ(rep.expired, 1u);                               /* what the poll adds to the metric */
     ASSERT_EQ(ST.verdicts[0].live, false);
     /* counted once, not on every later batch */
     ASSERT_EQ(apply_at(batch("rt-1", "e1", 3, "2026-09-29T10:00:31Z", "c", "COMPLETE", ""), 1021000, &v, &rep), DC_OK);
     ASSERT_TRUE(ST.verdicts_expired_total == 1ull);
+    ASSERT_EQ(rep.expired, 0u);
     /* the TTL boundary is exclusive: live while now < expires */
     ASSERT_EQ(apply_at(batch("rt-1", "e1", 4, "2026-09-29T10:00:32Z", "c", "COMPLETE", rec_ok(0)), 1022000, &v, &rep), DC_OK);
     ASSERT_EQ(apply_at(batch("rt-1", "e1", 5, "2026-09-29T10:00:33Z", "c", "COMPLETE", ""), 1036999, &v, &rep), DC_OK);
@@ -1327,6 +1361,11 @@ static void test_rebind_clears_and_epoch_reset_keeps(void)
     ASSERT_EQ(v.rows[0].present, false);                      /* rebind announced: cleared */
     ASSERT_EQ(ST.verdicts[0].live, false);
     ASSERT_TRUE(ST.verdicts_expired_total == 0ull);           /* a clear is not an expiry */
+    ASSERT_EQ(rep.expired, 0u);
+    ASSERT_EQ(rep.rebound, 1u);                               /* seen against the stored verdict, not silent */
+    /* the next record of the new binding is no second rebind */
+    ASSERT_EQ(apply_at(batch("rt-2", "e1", 3, "2026-09-29T10:00:04Z", "c", "COMPLETE", gen3), 1003000, &v, &rep), DC_OK);
+    ASSERT_EQ(rep.rebound, 0u);
 }
 
 static void test_evidence_less_deny_is_a_live_verdict(void)

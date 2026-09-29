@@ -382,6 +382,12 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
                     why->neutral++;
                 }
             } else {
+                /* A retained verdict is counted whatever it says, so the
+                 * gauge agrees with readiness retained_ds; a retained deny
+                 * is a CONNECTOR_DENIED rejection as well. */
+                if (ar->retained && why != NULL) {
+                    why->retained++;
+                }
                 if (!ar->allowed) {
                     count_reason(why, PR_CONNECTOR_DENIED);
                     continue;
@@ -391,9 +397,6 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
                     continue;
                 }
                 ppm = ar->multiplier_ppm;
-                if (ar->retained && why != NULL) {
-                    why->retained++;
-                }
                 if (manual_domain_weight(ctx, rs[r_i].domain, &manual)) {
                     domain_weight = manual;
                 }
@@ -639,7 +642,9 @@ bool placement_ds_admitted(const struct placement_ctx *ctx,
 /*
  * Per-DS rejection counts into the metrics, plus a rate-limited ERROR for
  * the two alias grades that need an operator (review finding 3).  The
- * neutral / retained counts are not rejections and are not added here.
+ * neutral / retained counts are not rejections: they are stored as the
+ * gauges of the last decision (pnfs_mds_placement_neutral_ds /
+ * pnfs_mds_placement_retained_ds; 0 outside smart).
  */
 void placement_gate_note_rejections(const struct placement_reject_counts *why)
 {
@@ -649,6 +654,10 @@ void placement_gate_note_rejections(const struct placement_reject_counts *why)
     if (why == NULL) {
         return;
     }
+    atomic_store_explicit(&g_branch_metrics.placement_neutral_ds, why->neutral,
+                          memory_order_relaxed);
+    atomic_store_explicit(&g_branch_metrics.placement_retained_ds, why->retained,
+                          memory_order_relaxed);
     for (r = 1; r < PR_COUNT; r++) {
         if (why->by_reason[r] != 0) {
             atomic_fetch_add_explicit(&g_branch_metrics.placement_rejections_total[r],
@@ -914,22 +923,33 @@ void placement_gate_readiness(struct placement_readiness *out)
     memcpy(out->last_detail, g.conn.last_detail, sizeof(out->last_detail));
     pthread_rwlock_unlock(&g.lock);
     placement_gate_ctx(&ctx, now);
-    if (ctx.cap != NULL) {
-        out->registered_ds = ctx.cap->count;
-    }
     if (ctx.assess != NULL) {
-        uint32_t i;
-
         memcpy(out->config_digest, ctx.assess->config_digest, sizeof(out->config_digest));
         out->profile_count = ctx.assess->profile_count;
         memcpy(out->profiles, ctx.assess->profiles, sizeof(out->profiles));
-        for (i = 0; i < ctx.assess->count; i++) {
-            const struct placement_assessment_row *r = &ctx.assess->rows[i];
+    }
+    /* Over every registered DS (smart verdict retention design section
+     * 5.3): covered = a verdict in force, fresh or retained; neutral = the
+     * rest; eligible = not excluded by a live verdict (the neutral DS and
+     * the live allows with ppm > 0).  DS state and capacity are the gate's
+     * business, not readiness'. */
+    if (ctx.cap != NULL) {
+        uint32_t i;
 
-            if (!r->present || !r->valid || now >= r->expires_mono_ms) {
+        out->registered_ds = ctx.cap->count;
+        for (i = 0; i < ctx.cap->count; i++) {
+            const struct placement_assessment_row *r =
+                assess_row(ctx.assess, ctx.cap->rows[i].ds_id);
+
+            if (!verdict_in_force(&ctx, r)) {
+                out->neutral_ds++;
+                out->eligible_ds++;
                 continue;
             }
             out->covered_ds++;
+            if (r->retained) {
+                out->retained_ds++;
+            }
             if (r->allowed && r->multiplier_ppm > 0) {
                 out->eligible_ds++;
             }
@@ -1292,7 +1312,7 @@ bool placement_gate_ds_status(uint32_t ds_id, struct placement_ds_status *out)
     if (ctx.mode == PM_SMART) {
         const struct placement_assessment_row *ar = assess_row(ctx.assess, ds_id);
 
-        if (ar != NULL && ar->present) {
+        if (verdict_in_force(&ctx, ar)) {
             out->assessed = true;
             out->assessment_valid = ar->valid;
             out->assessment_allowed = ar->allowed;
@@ -1300,16 +1320,25 @@ bool placement_gate_ds_status(uint32_t ds_id, struct placement_ds_status *out)
             if (ctx.now_mono_ms >= ar->received_mono_ms) {
                 out->assessment_age_ms = ctx.now_mono_ms - ar->received_mono_ms;
             }
-            out->assessment_ttl_ms = (ctx.now_mono_ms < ar->expires_mono_ms)
-                ? ar->expires_mono_ms - ctx.now_mono_ms : 0;
+            out->assessment_ttl_ms = ar->expires_mono_ms - ctx.now_mono_ms;
+            out->hold_left_ms = out->assessment_ttl_ms;
+            (void)snprintf(out->verdict, sizeof(out->verdict), "%s",
+                           ar->retained ? "retained" : "fresh");
             if (ar->reason_count > 0) {
                 memcpy(out->assessment_reason, ar->reasons[0], PA_REASON_LEN);
             }
-            if (verdict_in_force(&ctx, ar) && ar->domain[0] != '\0') {
+            if (ar->domain[0] != '\0') {
                 /* the domain the gate uses: the connector's only from a
                  * verdict in force */
                 (void)snprintf(out->domain, PM_DOMAIN_ID_MAX, "%s", ar->domain);
             }
+        } else {
+            /* No verdict in force (none reported, or it ran out): the gate
+             * places the DS neutrally -- multiplier 1 000 000, the
+             * operator's domain.  A row that has run out is not shown. */
+            out->neutral = true;
+            out->assessment_ppm = 1000000u;
+            (void)snprintf(out->verdict, sizeof(out->verdict), "none");
         }
     }
     cands = calloc(ref->n_infos, sizeof(*cands));

@@ -1857,14 +1857,14 @@ static void test_config_show_placement_rows(void)
 
     struct mds_catalogue *db = open_test_db();
     ASSERT_TRUE(db != NULL);
-    {
+    for (uint32_t id = 0; id < 2; id++) {
         struct mds_cat_txn *txn = NULL;
         struct mds_ds_info info;
         memset(&info, 0, sizeof(info));
-        info.ds_id = 1;
+        info.ds_id = id;
         info.state = DS_ONLINE;
         info.port = 2049;
-        snprintf(info.host, sizeof(info.host), "ds-host");
+        snprintf(info.host, sizeof(info.host), "%s", id == 0 ? "ds-host-0" : "ds-host");
         ASSERT_EQ(mds_cat_txn_begin(db, MDS_CAT_TXN_WRITE, &txn), MDS_OK);
         ASSERT_EQ(mds_cat_ds_put(db, txn, &info), MDS_OK);
         ASSERT_EQ(mds_cat_txn_commit(txn), MDS_OK);
@@ -1893,7 +1893,9 @@ static void test_config_show_placement_rows(void)
     ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
     {
         struct ds_capacity_obs half = { 1000, 500, 9, ds_cache_mono_ms(), 0 };
+        struct ds_capacity_obs half0 = { 1000, 500, 8, ds_cache_mono_ms(), 0 };
         ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &half), 0);
+        ASSERT_EQ(ds_cache_set_capacity_obs(cache, 0, &half0), 0);
     }
     placement_gate_publish_capacity();
     cluster_transport_server_set_config(srv, &cfg);
@@ -1935,22 +1937,71 @@ static void test_config_show_placement_rows(void)
     ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
     {
         struct ds_capacity_obs half = { 1000, 500, 9, ds_cache_mono_ms(), 0 };
+        struct ds_capacity_obs half0 = { 1000, 500, 8, ds_cache_mono_ms(), 0 };
         ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &half), 0);
+        ASSERT_EQ(ds_cache_set_capacity_obs(cache, 0, &half0), 0);
     }
     placement_gate_publish_capacity();
+    const unsigned long long w_fill = (unsigned long long)placement_weight(50, 1000000, 1, NULL);
+    char neutral_row[200];
+    /* a neutral DS: no verdict in force -- the fill weight, reason NONE */
+    (void)snprintf(neutral_row, sizeof(neutral_row),
+                   "assessment_age_ms=none quality=NONE allowed=- ppm=1000000 ttl_ms=0 "
+                   "weight=%llu reason=NONE verdict=none hold_left_ms=none\n", w_fill);
     text = NULL;
     st = cluster_transport_request_config_show("127.0.0.1", port, NULL, &text);
     ASSERT_EQ(st, MDS_OK);
     ASSERT_TRUE(text != NULL);
-    ASSERT_TRUE(strstr(text, "placement_readiness = mode_active=1 connector_config_valid=0 connector_reachable=0 last_batch_valid=0 coverage=none registered_ds=1 covered_ds=0 eligible_ds=0\n") != NULL);
+    /* no batch yet: every registered DS is neutral and none is excluded
+     * by a verdict (the helper's steering-off fixture) */
+    ASSERT_TRUE(strstr(text, "placement_readiness = mode_active=1 connector_config_valid=0 connector_reachable=0 last_batch_valid=0 coverage=none registered_ds=2 covered_ds=0 eligible_ds=2 retained_ds=0 neutral_ds=2\n") != NULL);
     ASSERT_TRUE(strstr(text, "placement_ds.1 = domain=xi/fs-1 state=ONLINE capacity_age_ms=") != NULL);
+    ASSERT_TRUE(strstr(strstr(text, "placement_ds.1 = "), neutral_row) != NULL);
+    free(text);
+
+    /* one live retained verdict for ds 0, nothing for ds 1 */
     {
-        /* no batch yet: the DS is neutral -- the fill weight, reason NONE */
-        char neutral_row[160];
-        (void)snprintf(neutral_row, sizeof(neutral_row),
-                       "assessment_age_ms=none quality=NONE allowed=0 ppm=0 ttl_ms=0 weight=%llu reason=NONE\n",
-                       (unsigned long long)placement_weight(50, 1000000, 1, NULL));
-        ASSERT_TRUE(strstr(text, neutral_row) != NULL);
+        struct placement_assessment_view v;
+        uint64_t now = ds_cache_mono_ms();
+
+        memset(&v, 0, sizeof(v));
+        v.count = 1;
+        v.batch_valid = true;
+        v.rows[0].ds_id = 0;
+        v.rows[0].present = true;
+        v.rows[0].valid = true;
+        v.rows[0].retained = true;
+        v.rows[0].allowed = true;
+        v.rows[0].multiplier_ppm = 1000000;
+        v.rows[0].received_mono_ms = now;
+        v.rows[0].expires_mono_ms = now + 412000;
+        snprintf(v.rows[0].domain, sizeof(v.rows[0].domain), "xi/fs-0");
+        snprintf(v.rows[0].reasons[0], sizeof(v.rows[0].reasons[0]), "VERDICT_RETAINED");
+        v.rows[0].reason_count = 1;
+        placement_gate_publish_assessments(&v);
+    }
+    text = NULL;
+    st = cluster_transport_request_config_show("127.0.0.1", port, NULL, &text);
+    ASSERT_EQ(st, MDS_OK);
+    ASSERT_TRUE(text != NULL);
+    ASSERT_TRUE(strstr(text, "coverage=partial registered_ds=2 covered_ds=1 eligible_ds=2 retained_ds=1 neutral_ds=1\n") != NULL);
+    {
+        const char *r0 = strstr(text, "placement_ds.0 = domain=xi/fs-0 state=ONLINE ");
+        const char *r1 = strstr(text, "placement_ds.1 = domain=xi/fs-1 state=ONLINE ");
+        const char *e0;
+        char live_row[160];
+
+        ASSERT_TRUE(r0 != NULL && r1 != NULL);
+        e0 = strchr(r0, '\n');
+        ASSERT_TRUE(e0 != NULL);
+        ASSERT_TRUE(strstr(r0, "quality=VALID allowed=1 ppm=1000000 ttl_ms=") != NULL &&
+                    strstr(r0, "quality=VALID allowed=1 ppm=1000000 ttl_ms=") < e0);
+        (void)snprintf(live_row, sizeof(live_row),
+                       " weight=%llu reason=NONE verdict=retained hold_left_ms=", w_fill);
+        ASSERT_TRUE(strstr(r0, live_row) != NULL && strstr(r0, live_row) < e0);
+        ASSERT_TRUE(strstr(r0, "hold_left_ms=none") == NULL || strstr(r0, "hold_left_ms=none") > e0);
+        ASSERT_TRUE(strstr(r1, neutral_row) != NULL);
+        ASSERT_TRUE(strstr(r1, "allowed=- ppm=1000000") != NULL);
     }
     free(text);
 

@@ -652,8 +652,10 @@ static bool parse_record(const struct jdoc *d, int obj, struct rec *r,
 static bool pin_matches(const struct ds_connector_pin *p, const struct rec *r,
                         const char *instance)
 {
-    /* an unobserved incarnation (null on an UNKNOWN record) is not compared:
-     * the source was unreadable, the binding itself did not change */
+    /* an unobserved incarnation (null) is not compared: on an UNKNOWN
+     * record the source was unreadable, on a VALID deny the connector had
+     * no evidence to read one from (SHARE_ABSENT, IDENTITY_MISMATCH); the
+     * binding itself did not change */
     bool unobserved = (r->target_incarnation[0] == '\0');
 
     return strcmp(p->instance, instance) == 0 &&
@@ -760,6 +762,10 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
     struct ds_connector_pin *new_pins = NULL;
     struct ds_connector_verdict *new_verdicts = NULL;
     uint64_t expired = 0;
+    uint32_t rebind_cleared = 0;          /* live verdicts a rebind dropped */
+    uint32_t rebind_last_ds = 0;
+    uint32_t rebind_last_old_gen = 0;
+    uint32_t rebind_last_new_gen = 0;
     bool *seen = NULL;
     bool epoch_reset = false;
     char runtime_epoch[DC_NAME_MAX];
@@ -1163,9 +1169,20 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
 
                 /* Spec rule 5: a strictly higher binding_generation drops the
                  * old binding's verdict -- also across a runtime_epoch reset,
-                 * which clears the pins but keeps the store. */
+                 * which clears the pins but keeps the store: there the rebind
+                 * is seen only against the stored verdict, and it is counted
+                 * like a pinned one (rep->rebound) and logged at commit. */
                 if (rebound ||
                     (vd->live && (uint32_t)r.binding_generation > vd->binding_generation)) {
+                    if (!rebound) {
+                        rep->rebound++;
+                    }
+                    if (vd->live) {
+                        rebind_cleared++;
+                        rebind_last_ds = r.ds_id;
+                        rebind_last_old_gen = vd->binding_generation;
+                        rebind_last_new_gen = (uint32_t)r.binding_generation;
+                    }
                     memset(vd, 0, sizeof(*vd));
                 }
                 if (counts) {
@@ -1251,6 +1268,14 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
     memcpy(st->pins, new_pins, MDS_MAX_DS_NODES * sizeof(*new_pins));
     memcpy(st->verdicts, new_verdicts, MDS_MAX_DS_NODES * sizeof(*new_verdicts));
     st->verdicts_expired_total += expired;
+    rep->expired = (uint32_t)expired;
+    if (rebind_cleared != 0) {
+        MDS_LOG_INFO(LOG_COMP_MDS,
+            "ds_connector: %u verdict(s) of an old binding cleared by a rebind "
+            "(last: ds %u, binding_generation %u -> %u)",
+            (unsigned)rebind_cleared, (unsigned)rebind_last_ds,
+            (unsigned)rebind_last_old_gen, (unsigned)rebind_last_new_gen);
+    }
     st->last_generated_at_ms = generated_ms;
     out->batch_valid = true;
     out->batch_received_mono_ms = now_mono_ms;
@@ -1679,6 +1704,8 @@ enum mds_status ds_connector_poll_once(void)
         }
     }
     atomic_fetch_add_explicit(&g_branch_metrics.connector_batches_accepted_total, 1,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_branch_metrics.connector_verdicts_expired_total, rep.expired,
                               memory_order_relaxed);
     atomic_store_explicit(&g_branch_metrics.connector_covered_ds, covered, memory_order_relaxed);
     atomic_store_explicit(&g_branch_metrics.connector_last_success_mono_ms, now,

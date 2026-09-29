@@ -172,6 +172,8 @@ struct mds_branch_metrics {
     /* XinnorLab placement modes (placement_gate.c). */
     _Atomic uint64_t placement_rejections_total[32]; /**< indexed by enum placement_reason */
     _Atomic uint64_t placement_eligible_ds;          /**< gauge: candidates at the last admit */
+    _Atomic uint64_t placement_neutral_ds;           /**< gauge (smart): DS weighted neutrally at the last admit */
+    _Atomic uint64_t placement_retained_ds;          /**< gauge (smart): DS under a retained verdict at the last admit */
     _Atomic uint64_t placement_alias_suspected_total;
     _Atomic uint64_t placement_mode_gauge;           /**< enum placement_mode of the gate (0 = legacy) */
     /* Connector client (smart). */
@@ -181,6 +183,7 @@ struct mds_branch_metrics {
     _Atomic uint64_t connector_last_success_mono_ms;   /**< gauge source; 0 = never */
     _Atomic uint64_t connector_covered_ds;             /**< gauge */
     _Atomic uint64_t connector_reachable;              /**< gauge 0/1 */
+    _Atomic uint64_t connector_verdicts_expired_total; /**< verdicts that ran out without a new one */
     /** Time in the placement gate per selection / create admission, every
      *  mode (legacy included) -- `pnfs_mds_placement_admit_seconds`. */
     struct mds_histogram placement_admit_hist;

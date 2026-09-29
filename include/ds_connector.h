@@ -109,7 +109,10 @@ struct ds_connector_report {
     uint32_t rejected_binding;
     uint32_t rejected_shape;
     uint32_t unknown_ds;
-    uint32_t rebound;
+    uint32_t rebound;            /* rebinds applied: a strictly higher binding_generation
+                                  * than the pin or, after a runtime_epoch reset (no
+                                  * pins), than the stored verdict */
+    uint32_t expired;            /* verdicts this batch found run out (DC_OK only) */
     char     detail[160];
 };
 
