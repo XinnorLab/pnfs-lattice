@@ -15,7 +15,7 @@ upstream (`placement_policy`, `placement_policy_enabled`,
 |---|---|---|---|
 | `rr` | registered DS that are `DS_ONLINE` and pass the native NFS/transport/io-limit filters | none — cyclic order over the candidate list, one position per DS | not consulted |
 | `fill` | the `rr` set **and** a fresh capacity observation for the DS's capacity domain with `available > placement_min_free_bytes` | `domain_weight / N`, `domain_weight = max(1, floor(100 × available / total))` | not consulted |
-| `smart` | the `fill` set **and** a fresh `VALID` / `allowed` / `multiplier_ppm > 0` assessment from the DS connector | `domain_weight / N × multiplier_ppm / 1 000 000` | required |
+| `smart` | the `fill` set **minus** DS whose verdict in force contradicts the operator's `ds_capacity_domain.<id>` (`DOMAIN_MAP_MISMATCH`), denies (`CONNECTOR_DENIED`) or carries `multiplier_ppm = 0` (`ZERO_MULTIPLIER`); a DS without a verdict in force is **neutral** (placed as in `fill`) | `domain_weight / N × multiplier_ppm / 1 000 000`; `domain_weight` is the fill level or, with `placement_allow_manual_base_weights`, the domain's `placement_domain_weight.<domain>` (neutral: `multiplier_ppm = 1 000 000` on the same base weight — without manual weights, the `fill` weight) | steers; never required to place |
 
 `fill` and `smart` are **weighted random** selection, not a strict
 rotation.  `capacity` stays a legacy `placement_policy` value (strict
@@ -24,8 +24,9 @@ maximum) and is not one of the modes.
 **Status:** `rr`, `fill` and `smart` are implemented (Stages A and B).
 `smart` needs a binary built with `ENABLE_DS_CONNECTOR=ON` (refused with
 `PLACEMENT_MODE_UNSUPPORTED_BUILD` otherwise) and a running per-MDS
-`lattice-ds-connector`; the `lattice-placement` helper and the
-acceptance rows are Stage C.
+`lattice-ds-connector` to steer; without its verdicts every DS is
+neutral and `smart` places like `fill`.  The `lattice-placement` helper
+and the acceptance rows are Stage C.
 
 ## Keys
 
@@ -35,7 +36,7 @@ acceptance rows are Stage C.
 | `ds_capacity_poll_ms` | 60000 (existing) | fill/smart: `> 0` | fill, smart |
 | `placement_capacity_max_age_ms` | 120000 | `> ds_capacity_poll_ms`, ≤ 86400000 | fill, smart |
 | `placement_min_free_bytes` | 0 | uint64; a domain is a candidate only when `available > value` | fill, smart |
-| `ds_capacity_domain.<ds_id>` | unset = the DS is its own domain | non-empty string ≤ 127 bytes | fill (required for shared-filesystem aliases), smart (must agree with the connector) |
+| `ds_capacity_domain.<ds_id>` | unset = the DS is its own domain | non-empty string ≤ 127 bytes | fill (required for shared-filesystem aliases), smart (must agree with the connector; the only declaration of a shared-filesystem alias while the DS is neutral) |
 | `placement_stripe_shrink` | `allow` | `allow` \| `strict` | all |
 | `placement_allow_manual_base_weights` | false | bool | smart |
 | `placement_domain_weight.<domain>` | unset | 1..10000, only with the flag above | smart |
@@ -90,10 +91,15 @@ in this order: `DS_OFFLINE` → `DOMAIN_MAP_CONTRADICTION` /
 `SHARED_FS_ALIAS_UNMAPPED` → `CAPACITY_UNKNOWN` (never observed) /
 `CAPACITY_STALE` (older than `placement_capacity_max_age_ms`) →
 `CAPACITY_FULL` (`available ≤ placement_min_free_bytes`) →
-`WEIGHT_OVERFLOW` (defensive).  A refused placement is `NO_ELIGIBLE_DS`
-(nothing eligible) or `INSUFFICIENT_ELIGIBLE_DS` (strict shrink, or fewer
-eligible DS than mirrors); `smart` without its assessment source is
-`MODE_NOT_READY`.  Clients see the existing `NFS4ERR_NOSPC`.
+`WEIGHT_OVERFLOW` (defensive); in `smart` a verdict in force adds
+`DOMAIN_MAP_MISMATCH` (before the capacity checks) and `CONNECTOR_DENIED`
+/ `ZERO_MULTIPLIER` (after them).  A refused placement is
+`NO_ELIGIBLE_DS` (nothing eligible) or `INSUFFICIENT_ELIGIBLE_DS`
+(strict shrink, or fewer eligible DS than mirrors).  `NO_BINDING`,
+`ASSESSMENT_UNKNOWN`, `ASSESSMENT_STALE` and `MODE_NOT_READY` stay in the
+reason vocabulary for metric label stability but are no longer produced:
+a missing verdict is neutral, never a refusal.  Clients see the existing
+`NFS4ERR_NOSPC`.
 
 ## Where the gate runs
 
@@ -124,16 +130,18 @@ A batch is accepted whole or dropped whole: `contract_version` must be
 `ds_connector_expected_contract_major` (`1x`, `01.0` and a bare `1` are
 not versions); per connector instance the `(epoch, sequence)` line must
 not go backwards — an **equal** sequence is the connector re-serving its
-current snapshot until the next collection and is accepted (the rows are
-re-timed from the receive instant), a **lower** one is a replay that
-drops the batch; a changed `runtime_epoch` (connector restart) resets
-every line and every binding pin; a batch that would need more sequence
+current snapshot until the next collection and is accepted (each VALID
+record in it re-times its verdict from the receive instant), a **lower**
+one is a replay that drops the batch; a changed `runtime_epoch`
+(connector restart) resets every line and every binding pin but keeps
+the verdicts; a batch that would need more sequence
 lines than the 64 the MDS keeps is refused rather than run unprotected;
 `generated_at` must not go backwards (a backwards wall-clock step on the
 connector host therefore drops batches — `OLD_GENERATED_AT`, named in
 `placement_connector_last_detail` — until the clock passes the last
 accepted instant or the connector restarts with a new `runtime_epoch`;
-`smart` fails closed meanwhile); `config_digest` must equal
+meanwhile no new data arrives, the verdicts in force run out on their own
+end and their DS become neutral); `config_digest` must equal
 `ds_connector_expected_config_digest` when that pin is set.  The body is
 at most 4 MiB, nested at most 64 levels (checked in one linear pass before
 parsing — jsmn is quadratic on depth), and strings are decoded with the
@@ -155,49 +163,116 @@ is accepted. The batch is dropped if one profile id carries two digests
 or if there are more than 8 distinct profile ids.  The first accepted tuple
 `(instance, binding_generation, datastore_id, target_id,
 target_incarnation, access scope)` is pinned per DS; a later record must
-repeat it or carry a higher `binding_generation` (rebind: the DS is
-UNKNOWN for that batch); anything else is `BINDING_MISMATCH` and that DS
-has no record.  A `quality = UNKNOWN` record may carry
+repeat it or carry a higher `binding_generation` (rebind: the old
+binding's verdict is cleared and the DS is neutral until the next
+VALID record of the new binding); anything else is `BINDING_MISMATCH`
+and the record is rejected.  A `quality = UNKNOWN` record may carry
 `target_incarnation: null` — the connector could not read its source and
 knows the configured binding but not the share's incarnation; it is
-compared on the rest of the tuple, accepted as UNKNOWN
-(`ASSESSMENT_UNKNOWN` with the connector's reason codes, e.g.
-`SOURCE_UNAVAILABLE`), and it neither creates nor changes a pin (a higher
-generation clears the pin; the next VALID record pins).  A VALID record
-with a null incarnation is a shape error.  The profile digest is
+compared on the rest of the tuple, accepted as UNKNOWN (no new data, see
+below), and it neither creates nor changes a pin (a higher generation
+clears the pin; the next VALID record pins).  A VALID *deny* may carry a
+null incarnation too: the connector's evidence-less denies
+(`SHARE_ABSENT`, `IDENTITY_MISMATCH`, with null `observed_at` and
+`evidence_age_ms`) are compared the same way and are verdicts like any
+other.  A VALID *allow* with a null incarnation is a shape error, as the
+batch schema says.  The profile digest is
 deliberately **not** part of the per-DS binding tuple: it is checked on every batch for id consistency and per-id binding,
 but a connector profile reload must not strand every DS in
 `BINDING_MISMATCH` until a process restart.  Records for unknown DS ids
 are ignored; a DS id that appears more than once in a batch has no
 trusted record and pins nothing.
 
-Candidate rule in `smart` (after the capacity gate): a fresh record
-(`received + remaining_ttl_ms` on the MDS clock) with `quality = VALID`,
-`allowed = true` and `multiplier_ppm > 0`; otherwise `NO_BINDING`,
-`ASSESSMENT_UNKNOWN`, `ASSESSMENT_STALE`, `CONNECTOR_DENIED` or
-`ZERO_MULTIPLIER`.  Weight = `domain_weight × multiplier_ppm / 10⁶ / N`,
-where the domain is the connector's `capacity_domain_id` (an operator
-`ds_capacity_domain.<id>` that disagrees is `DOMAIN_MAP_MISMATCH`) and
-`domain_weight` is the fill level, or a manual
-`placement_domain_weight.<domain>` when
-`placement_allow_manual_base_weights = true`.  Without any assessment
-view every DS is `MODE_NOT_READY`; a lost connector never falls back to
-`rr`/`fill` — rows expire on their TTL and the MDS refuses new
-placements (`NFS4ERR_NOSPC`).
+The MDS keeps the last VALID verdict per data store across batches (the
+verdict store; XinnorLab/pNFS
+`docs/superpowers/specs/2026-09-29-smart-verdict-retention-design.md`
+§5.1): an accepted VALID record replaces it at once, in both directions
+(`allowed`, `multiplier_ppm`, `capacity_domain_id`, reason codes, and
+`received + remaining_ttl_ms` on the MDS clock as its end; a VALID record
+with `remaining_ttl_ms = 0` leaves no verdict).  An UNKNOWN record, a
+rejected record (binding mismatch, shape, profile pin, duplicate) or a
+dropped batch never replaces it.  A FAILED instance snapshot contributes
+only VALID records carrying `VERDICT_RETAINED` — the connector's retained
+verdicts; any other VALID record there is no new data.  A rebind (a
+strictly higher `binding_generation`, also across a connector restart)
+clears the verdict; a connector restart (new `runtime_epoch`) keeps it.
+A verdict runs out at its own end and is dropped (and counted in
+`pnfs_mds_connector_verdicts_expired_total`) at the next accepted batch;
+nothing ever extends it except a new or re-served VALID record.  A
+rebind that clears a live verdict is counted in the batch report and
+logged (INFO, `cleared by a rebind`).  The published view carries one
+row per registered DS built from the store: a row is present only with
+a live verdict, and says whether that verdict is a retained one
+(`VERDICT_RETAINED`).  When no batch is accepted no new view is built,
+and the rows of the last one run out on their own end.
 
-Readiness is four facts, reported by `config show` as
+Candidate rule in `smart` (after `DS_ONLINE`, the alias grades and the
+capacity gate, which apply to every DS exactly as in `fill`): a verdict
+is *in force* while its row is present and the MDS clock is before its
+`received + remaining_ttl_ms`.
+
+- **No verdict in force → neutral**: no row for the DS (never reported,
+  no binding on the connector), a row that has run out, or no assessment
+  view at all (the MDS has had no accepted batch since it started).  The
+  DS keeps `multiplier_ppm = 1 000 000` and the operator's domain
+  (`ds_capacity_domain.<id>` or `ds:<id>`), weighted by that domain's
+  base weight (below) — without manual weights, its `fill` weight.
+- **A live deny excludes** (`CONNECTOR_DENIED`), and so does a live
+  `multiplier_ppm = 0` (`ZERO_MULTIPLIER`).
+- **A live allow weights by its multiplier**: weight = `domain_weight ×
+  multiplier_ppm / 10⁶ / N`, where the domain is the connector's
+  `capacity_domain_id`.
+- **The base weight** (`domain_weight`) is one rule for both: a manual
+  `placement_domain_weight.<domain>` for the DS's effective domain when
+  `placement_allow_manual_base_weights = true` and one is set, the fill
+  level (1..100) otherwise.  A neutral DS and a live one are therefore
+  weighted on one scale.  Under manual weights, declare them for the
+  operator domains a neutral DS uses (`ds_capacity_domain.<id>`, or the
+  `ds:<id>` default) as well as for the connector's domains: a DS whose
+  effective domain has no manual weight falls back to the fill scale,
+  which does not compare with manual weights (1..10 000) — against
+  weights in the thousands it is starved, against weights of 1..10 it
+  takes almost every file.
+
+The connector's domain is used only from a verdict in force, so
+`DOMAIN_MAP_MISMATCH` (an operator `ds_capacity_domain.<id>` that
+disagrees with it) applies only to a live row; once the row runs out the
+operator's map applies again.  `MODE_NOT_READY`, `NO_BINDING`,
+`ASSESSMENT_UNKNOWN` and `ASSESSMENT_STALE` are no longer produced: a
+lost, restarting or never-started connector refuses no placement by
+itself — its verdicts run out on their own end and the DS become
+neutral, while a dead DS still drops out through its state and the
+capacity gate.  Neutral keeps every `fill` gate, the alias grades
+included, and that has one consequence: two exports of one filesystem
+on one host that only the connector's `capacity_domain_id` declares as
+one domain are undeclared once their verdicts run out, and the alias
+grade excludes them as `SHARED_FS_ALIAS_UNMAPPED` (an ERROR line names
+it).  Declare such aliases with `ds_capacity_domain.<id>` — the
+connector's domain id, so a live verdict raises no `DOMAIN_MAP_MISMATCH`
+— to keep them placeable while they are neutral.
+
+Readiness is four facts plus counts, reported by `config show` as
 `placement_readiness = mode_active=… connector_config_valid=…
 connector_reachable=… last_batch_valid=… coverage=full|partial|none
-registered_ds=… covered_ds=… eligible_ds=…` (reachable = an accepted
-batch within three intervals — one rule for every failure kind, whether
-the socket is absent (`CONNECT`), the request timed out or the response
-was malformed (`TIMEOUT`), the status was unexpected (`HTTP`), the
-connector answered 503 (`UNAVAILABLE`) or the batch was dropped (`DROP`);
-the `pnfs_mds_connector_reachable` gauge follows the same rule; coverage
-counts DS with a fresh VALID record).  Partial coverage is a degraded, correct state: the MDS keeps
-placing on the covered DS.  Run `lattice-ds-connector preflight
---expect-ds 0,1` on the MDS before switching to see the same facts from
-the connector's side.
+registered_ds=… covered_ds=… eligible_ds=… retained_ds=… neutral_ds=…`.
+Reachable is an accepted batch within three intervals — one rule for
+every failure kind, whether the socket is absent (`CONNECT`), the
+request timed out or the response was malformed (`TIMEOUT`), the status
+was unexpected (`HTTP`), the connector answered 503 (`UNAVAILABLE`) or
+the batch was dropped (`DROP`); the `pnfs_mds_connector_reachable` gauge
+follows the same rule.  The counts are over the registered DS:
+`covered_ds` have a verdict in force, fresh or retained (`coverage`
+compares it with `registered_ds`); `retained_ds` of them are held by a
+retained verdict (`VERDICT_RETAINED`, allow or deny — the connector is
+not observing them); `neutral_ds = registered_ds − covered_ds` are
+placed neutrally; `eligible_ds` are not denied or zeroed by a verdict
+(the neutral ones plus the live allows with `multiplier_ppm > 0` — DS
+state, capacity, the alias grades and `DOMAIN_MAP_MISMATCH` are not
+counted here).  Partial or no coverage is a
+degraded, correct state: the MDS places on the covered DS by their
+verdicts and on the others neutrally.  Run `lattice-ds-connector
+preflight --expect-ds 0,1` on the MDS before switching to see the same
+facts from the connector's side.
 
 ## Observability
 
@@ -214,10 +289,27 @@ the connector's side.
   `placement_connector_config_digest`, `placement_connector_profiles`,
   `placement_connector_last_detail`, and one `placement_ds.<id> = domain=…
   state=… capacity_age_ms=… avail=… total=… [assessment_age_ms=… quality=…
-  allowed=… ppm=… ttl_ms=…] weight=… reason=…` row per registered DS
-  (`config show placement_ds.<id>` for one row).
+  allowed=… ppm=… ttl_ms=…] weight=… reason=… [verdict=… hold_left_ms=…]`
+  row per registered DS (`config show placement_ds.<id>` for one row; the
+  bracketed fields in `smart` only).  `verdict` is `fresh` or `retained`
+  for a verdict in force, with `hold_left_ms` the time until it runs out
+  (the same value as `ttl_ms`); a neutral DS (no verdict in force) reads
+  `assessment_age_ms=none quality=NONE allowed=- ppm=1000000 ttl_ms=0 …
+  verdict=none hold_left_ms=none`, with its base weight (the manual
+  domain weight when configured, else the fill level) and the gate's
+  reason (`NONE` when it is a candidate).
 - Metrics: `pnfs_mds_placement_mode{mode}`,
   `pnfs_mds_placement_eligible_ds`,
+  `pnfs_mds_placement_neutral_ds` and `pnfs_mds_placement_retained_ds`
+  (gauges, `smart`: of the DS that reached the verdict step at the last
+  placement decision — past `DS_ONLINE`, the alias grades,
+  `DOMAIN_MAP_MISMATCH` and the capacity gate — those placed neutrally
+  and those under a retained verdict, allow or deny; readiness counts
+  every registered DS instead, so the two agree unless a DS is excluded
+  before the verdict step; 0 in the other modes.  They move only at a
+  placement decision: on an idle cluster they keep the last decision's
+  values, so they are no liveness signal — `pnfs_mds_connector_reachable`
+  is),
   `pnfs_mds_placement_rejections_total{reason}`,
   `pnfs_mds_placement_admit_seconds` (histogram, 100 µs … +Inf with
   `_sum`/`_count`: time in the gate per selection or create admission,
@@ -228,8 +320,18 @@ the connector's side.
 - Connector: `pnfs_mds_connector_batches_accepted_total`,
   `pnfs_mds_connector_batches_dropped_total{reason}`,
   `pnfs_mds_connector_poll_errors_total{code}`,
-  `pnfs_mds_connector_covered_ds`, `pnfs_mds_connector_reachable`,
-  `pnfs_mds_connector_last_success_mono_ms`.
+  `pnfs_mds_connector_covered_ds` (DS with a verdict in force at the last
+  accepted batch), `pnfs_mds_connector_reachable`,
+  `pnfs_mds_connector_last_success_mono_ms`,
+  `pnfs_mds_connector_verdicts_expired_total` (verdicts that ran out
+  without a new one; counted when the next accepted batch finds them
+  expired, so while the connector is unreachable it stays flat and
+  `pnfs_mds_placement_neutral_ds` shows the effect instead).
+- Alerts for `smart`: a lost connector no longer refuses placements, so
+  it has to be alerted on — `pnfs_mds_connector_reachable == 0` (the
+  liveness signal), and `pnfs_mds_placement_neutral_ds` growing while it
+  was 0 (verdicts ran out or never arrived: the cluster places, but no
+  longer steers; this gauge moves only when files are placed).
 - `pnfs_mds_placement_rejections_total{reason}` counts every DS the gate
   rejected at every placement decision (a DS that stays full for an hour
   keeps counting), `pnfs_mds_placement_alias_suspected_total` counts

@@ -38,14 +38,16 @@ struct placement_capacity_view {
 };
 
 /* Connector assessments (placement_mode = smart), design section 7.
- * Built by ds_connector.c from a validated batch; published into the gate
+ * Built by ds_connector.c from its verdict store after a validated batch
+ * (smart verdict retention design section 5.1); published into the gate
  * with placement_gate_publish_assessments(); one row per registered DS. */
 #define PA_REASONS_MAX  4
 #define PA_REASON_LEN   32
 struct placement_assessment_row {
     uint32_t ds_id;
-    bool     present;            /* an accepted record exists for this ds */
-    bool     valid;              /* quality == VALID and the instance snapshot was not FAILED */
+    bool     present;            /* a live, unexpired verdict exists for this ds */
+    bool     valid;              /* == present (the verdict came from a VALID record) */
+    bool     retained;           /* the verdict's record carried VERDICT_RETAINED */
     bool     allowed;
     uint32_t multiplier_ppm;
     uint64_t expires_mono_ms;    /* received + remaining_ttl_ms (MDS clock) */
@@ -73,7 +75,7 @@ struct placement_ctx {
     /* cfg->ds_capacity_domain (indexed by ds_id) or NULL. */
     const char          (*domain_of)[PM_DOMAIN_ID_MAX];
     const struct placement_capacity_view   *cap;      /* NULL in rr/legacy */
-    const struct placement_assessment_view *assess;   /* NULL until Stage B */
+    const struct placement_assessment_view *assess;   /* NULL until the first batch: every DS neutral */
     _Atomic uint32_t     *rr_counter;                 /* shared rr cursor; NULL = rr_key only */
     /* Manual base weights (smart, placement_allow_manual_base_weights). */
     const char          (*domain_weight_id)[PM_DOMAIN_ID_MAX];
@@ -93,6 +95,13 @@ struct placement_candidate {
 
 struct placement_reject_counts {
     uint32_t by_reason[PR_COUNT];
+    /* smart, per decision (not rejections), over the DS that passed the
+     * capacity gate: DS without a verdict in force (weighted neutrally),
+     * and DS whose live verdict carries VERDICT_RETAINED -- allow or deny;
+     * a retained deny is counted under CONNECTOR_DENIED as well.
+     * placement_gate_note_rejections() stores both as gauges. */
+    uint32_t neutral;
+    uint32_t retained;
 };
 
 /*
@@ -163,8 +172,13 @@ struct placement_readiness {
     bool     connector_reachable;
     bool     last_batch_valid;
     uint32_t registered_ds;
-    uint32_t covered_ds;               /* fresh valid records */
-    uint32_t eligible_ds;              /* covered and allowed with ppm > 0 */
+    uint32_t covered_ds;               /* registered DS with a live verdict, fresh or retained */
+    uint32_t eligible_ds;              /* registered DS not denied or zeroed by a
+                                        * verdict: the neutral ones + live allows with
+                                        * ppm > 0 (DS state, capacity, the alias grades
+                                        * and DOMAIN_MAP_MISMATCH are not counted here) */
+    uint32_t retained_ds;              /* live verdicts carrying VERDICT_RETAINED, allow or deny */
+    uint32_t neutral_ds;               /* registered_ds - covered_ds: placed neutrally */
     char     coverage[8];              /* "full" | "partial" | "none" | "n/a" */
     uint64_t last_success_mono_ms;
     char     config_digest[PM_DIGEST_MAX];
@@ -206,13 +220,16 @@ struct placement_ds_status {
     uint64_t weight;            /* 0 when not a candidate */
     enum placement_reason reason;
     /* smart */
-    bool     assessed;          /* a record exists */
+    bool     assessed;          /* a verdict is in force (live, unexpired row) */
     bool     assessment_valid;
     bool     assessment_allowed;
-    uint32_t assessment_ppm;
+    uint32_t assessment_ppm;    /* 1 000 000 when neutral */
     uint64_t assessment_age_ms; /* UINT64_MAX when none */
     uint64_t assessment_ttl_ms; /* remaining, 0 when expired/none */
     char     assessment_reason[PA_REASON_LEN];
+    bool     neutral;           /* no verdict in force: `allowed=-`, ppm 1 000 000 */
+    char     verdict[12];       /* "fresh" | "retained" | "none" ("" outside smart) */
+    uint64_t hold_left_ms;      /* until the verdict runs out; 0 when none */
 };
 
 /* DS ids in the published view (0 in rr/legacy or before the first publish). */

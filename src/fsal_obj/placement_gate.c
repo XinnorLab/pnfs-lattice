@@ -106,7 +106,7 @@ static bool row_fresh(const struct placement_ctx *ctx,
 }
 
 /*
- * Weighted-mode candidate list (fill and, with an assessment view, smart).
+ * Weighted-mode candidate list (fill and smart).
  *
  * The caller's ds_list is only the NATIVE-eligible subset (ONLINE, profile,
  * io-limit).  Every registry-level fact -- a domain's alias count N, the
@@ -136,6 +136,19 @@ assess_row(const struct placement_assessment_view *v, uint32_t ds_id)
         }
     }
     return NULL;
+}
+
+/*
+ * A verdict in force: a present, valid row before its end on the MDS clock
+ * (smart verdict retention design section 5.2).  Anything else -- no row,
+ * no view at all, a row that has run out -- is "no verdict": the DS is
+ * neutral (multiplier 1 000 000, the operator's domain).
+ */
+static bool verdict_in_force(const struct placement_ctx *ctx,
+                             const struct placement_assessment_row *ar)
+{
+    return ar != NULL && ar->present && ar->valid &&
+           ctx->now_mono_ms < ar->expires_mono_ms;
 }
 
 /* Manual base weight for a domain (smart, placement_allow_manual_base_weights). */
@@ -191,13 +204,8 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
     uint32_t i, j;
     uint32_t n_out = 0;
 
-    if (ctx->mode == PM_SMART && ctx->assess == NULL) {
-        /* Stage A: smart has no assessment source yet. */
-        for (i = 0; i < n; i++) {
-            count_reason(why, PR_MODE_NOT_READY);
-        }
-        return 0;
-    }
+    /* smart without an assessment view (no batch since start) is not a
+     * refusal: assess_row() finds no row and every DS is neutral. */
     if (cap == NULL || cap->count == 0) {
         for (i = 0; i < n; i++) {
             count_reason(why, PR_CAPACITY_UNKNOWN);
@@ -216,13 +224,15 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
                           cap->rows[j].obs.total_bytes != 0);
         rs[j].map_mismatch = false;
         if (ctx->mode == PM_SMART) {
-            /* The connector knows the filesystem: its capacity_domain_id is
-             * the domain; an operator map that disagrees is a mismatch
-             * (design section 4).  No connector domain -> the DS's own. */
+            /* The connector knows the filesystem: the capacity_domain_id of
+             * a verdict in force is the domain; an operator map that
+             * disagrees is a mismatch (design section 4).  No verdict in
+             * force, or one without a domain -> the operator map / ds:<id>
+             * (neutral; DOMAIN_MAP_MISMATCH cannot arise). */
             const struct placement_assessment_row *ar =
                 assess_row(ctx->assess, cap->rows[j].ds_id);
 
-            if (ar != NULL && ar->present && ar->domain[0] != '\0') {
+            if (verdict_in_force(ctx, ar) && ar->domain[0] != '\0') {
                 if (rs[j].declared && strcmp(rs[j].domain, ar->domain) != 0) {
                     rs[j].map_mismatch = true;
                 }
@@ -357,30 +367,42 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
         domain_weight = domain_weight_of(avail, total);
         ppm = 1000000u;
         if (ctx->mode == PM_SMART) {
+            /* Verdict retention design rules 1, 3 and 7: without a verdict
+             * in force the DS is neutral -- ppm stays 1 000 000 on its
+             * domain's base weight, after every gate above.  Only a live
+             * verdict can exclude it or lower its weight.
+             * NO_BINDING / ASSESSMENT_UNKNOWN / ASSESSMENT_STALE /
+             * MODE_NOT_READY are no longer produced (the enum keeps them
+             * for metric label stability). */
             const struct placement_assessment_row *ar = assess_row(ctx->assess, ds_list[i].ds_id);
             uint32_t manual = 0;
 
-            if (ar == NULL || !ar->present) {
-                count_reason(why, PR_NO_BINDING);
-                continue;
+            if (!verdict_in_force(ctx, ar)) {
+                if (why != NULL) {
+                    why->neutral++;
+                }
+            } else {
+                /* A retained verdict is counted whatever it says, so the
+                 * gauge agrees with readiness retained_ds; a retained deny
+                 * is a CONNECTOR_DENIED rejection as well. */
+                if (ar->retained && why != NULL) {
+                    why->retained++;
+                }
+                if (!ar->allowed) {
+                    count_reason(why, PR_CONNECTOR_DENIED);
+                    continue;
+                }
+                if (ar->multiplier_ppm == 0) {
+                    count_reason(why, PR_ZERO_MULTIPLIER);
+                    continue;
+                }
+                ppm = ar->multiplier_ppm;
             }
-            if (!ar->valid) {
-                count_reason(why, PR_ASSESSMENT_UNKNOWN);
-                continue;
-            }
-            if (ctx->now_mono_ms >= ar->expires_mono_ms) {
-                count_reason(why, PR_ASSESSMENT_STALE);
-                continue;
-            }
-            if (!ar->allowed) {
-                count_reason(why, PR_CONNECTOR_DENIED);
-                continue;
-            }
-            if (ar->multiplier_ppm == 0) {
-                count_reason(why, PR_ZERO_MULTIPLIER);
-                continue;
-            }
-            ppm = ar->multiplier_ppm;
+            /* The base weight (design section 5.2) is one rule for a
+             * neutral DS and a live one: the manual weight of the effective
+             * domain (the connector's for a live row, the operator map /
+             * ds:<id> otherwise) when configured, the fill level otherwise
+             * -- so both are weighted on one scale. */
             if (manual_domain_weight(ctx, rs[r_i].domain, &manual)) {
                 domain_weight = manual;
             }
@@ -482,8 +504,7 @@ enum mds_status placement_admit(const struct placement_ctx *ctx,
                           memory_order_relaxed);
     if (n_c == 0) {
         free(cands);
-        set_reason(reason, (ctx->mode == PM_SMART && ctx->assess == NULL)
-                           ? PR_MODE_NOT_READY : PR_NO_ELIGIBLE_DS);
+        set_reason(reason, PR_NO_ELIGIBLE_DS);
         return MDS_ERR_NOSPC;
     }
     if (n_c < mirror_count) {
@@ -625,7 +646,10 @@ bool placement_ds_admitted(const struct placement_ctx *ctx,
 
 /*
  * Per-DS rejection counts into the metrics, plus a rate-limited ERROR for
- * the two alias grades that need an operator (review finding 3).
+ * the two alias grades that need an operator (review finding 3).  The
+ * neutral / retained counts are not rejections: they are stored as the
+ * gauges of the last decision (pnfs_mds_placement_neutral_ds /
+ * pnfs_mds_placement_retained_ds; 0 outside smart).
  */
 void placement_gate_note_rejections(const struct placement_reject_counts *why)
 {
@@ -635,6 +659,10 @@ void placement_gate_note_rejections(const struct placement_reject_counts *why)
     if (why == NULL) {
         return;
     }
+    atomic_store_explicit(&g_branch_metrics.placement_neutral_ds, why->neutral,
+                          memory_order_relaxed);
+    atomic_store_explicit(&g_branch_metrics.placement_retained_ds, why->retained,
+                          memory_order_relaxed);
     for (r = 1; r < PR_COUNT; r++) {
         if (why->by_reason[r] != 0) {
             atomic_fetch_add_explicit(&g_branch_metrics.placement_rejections_total[r],
@@ -900,22 +928,34 @@ void placement_gate_readiness(struct placement_readiness *out)
     memcpy(out->last_detail, g.conn.last_detail, sizeof(out->last_detail));
     pthread_rwlock_unlock(&g.lock);
     placement_gate_ctx(&ctx, now);
-    if (ctx.cap != NULL) {
-        out->registered_ds = ctx.cap->count;
-    }
     if (ctx.assess != NULL) {
-        uint32_t i;
-
         memcpy(out->config_digest, ctx.assess->config_digest, sizeof(out->config_digest));
         out->profile_count = ctx.assess->profile_count;
         memcpy(out->profiles, ctx.assess->profiles, sizeof(out->profiles));
-        for (i = 0; i < ctx.assess->count; i++) {
-            const struct placement_assessment_row *r = &ctx.assess->rows[i];
+    }
+    /* Over every registered DS (smart verdict retention design section
+     * 5.3): covered = a verdict in force, fresh or retained; neutral = the
+     * rest; eligible = not denied or zeroed by a verdict (the neutral DS
+     * and the live allows with ppm > 0).  DS state, capacity, the alias
+     * grades and DOMAIN_MAP_MISMATCH are the gate's business, not
+     * readiness'. */
+    if (ctx.cap != NULL) {
+        uint32_t i;
 
-            if (!r->present || !r->valid || now >= r->expires_mono_ms) {
+        out->registered_ds = ctx.cap->count;
+        for (i = 0; i < ctx.cap->count; i++) {
+            const struct placement_assessment_row *r =
+                assess_row(ctx.assess, ctx.cap->rows[i].ds_id);
+
+            if (!verdict_in_force(&ctx, r)) {
+                out->neutral_ds++;
+                out->eligible_ds++;
                 continue;
             }
             out->covered_ds++;
+            if (r->retained) {
+                out->retained_ds++;
+            }
             if (r->allowed && r->multiplier_ppm > 0) {
                 out->eligible_ds++;
             }
@@ -1278,7 +1318,7 @@ bool placement_gate_ds_status(uint32_t ds_id, struct placement_ds_status *out)
     if (ctx.mode == PM_SMART) {
         const struct placement_assessment_row *ar = assess_row(ctx.assess, ds_id);
 
-        if (ar != NULL && ar->present) {
+        if (verdict_in_force(&ctx, ar)) {
             out->assessed = true;
             out->assessment_valid = ar->valid;
             out->assessment_allowed = ar->allowed;
@@ -1286,14 +1326,25 @@ bool placement_gate_ds_status(uint32_t ds_id, struct placement_ds_status *out)
             if (ctx.now_mono_ms >= ar->received_mono_ms) {
                 out->assessment_age_ms = ctx.now_mono_ms - ar->received_mono_ms;
             }
-            out->assessment_ttl_ms = (ctx.now_mono_ms < ar->expires_mono_ms)
-                ? ar->expires_mono_ms - ctx.now_mono_ms : 0;
+            out->assessment_ttl_ms = ar->expires_mono_ms - ctx.now_mono_ms;
+            out->hold_left_ms = out->assessment_ttl_ms;
+            (void)snprintf(out->verdict, sizeof(out->verdict), "%s",
+                           ar->retained ? "retained" : "fresh");
             if (ar->reason_count > 0) {
                 memcpy(out->assessment_reason, ar->reasons[0], PA_REASON_LEN);
             }
             if (ar->domain[0] != '\0') {
+                /* the domain the gate uses: the connector's only from a
+                 * verdict in force */
                 (void)snprintf(out->domain, PM_DOMAIN_ID_MAX, "%s", ar->domain);
             }
+        } else {
+            /* No verdict in force (none reported, or it ran out): the gate
+             * places the DS neutrally -- multiplier 1 000 000, the
+             * operator's domain.  A row that has run out is not shown. */
+            out->neutral = true;
+            out->assessment_ppm = 1000000u;
+            (void)snprintf(out->verdict, sizeof(out->verdict), "none");
         }
     }
     cands = calloc(ref->n_infos, sizeof(*cands));

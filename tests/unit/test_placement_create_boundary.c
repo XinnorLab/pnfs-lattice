@@ -322,9 +322,11 @@ static void test_admit_create_refuses_a_connector_denied_ds(void)
         ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &half), 0);
     }
     placement_gate_publish_capacity();
-    /* no assessment yet: the create boundary is not ready */
-    ASSERT_EQ(placement_gate_admit_create(1, PP_NEW_OBJECT, &tok, &why), MDS_ERR_NOSPC);
-    ASSERT_EQ(why, PR_MODE_NOT_READY);
+    /* no assessment yet: the DS is neutral and admitted (verdict retention
+     * design rule 1; MODE_NOT_READY is no longer produced) */
+    ASSERT_EQ(placement_gate_admit_create(1, PP_NEW_OBJECT, &tok, &why), MDS_OK);
+    ASSERT_EQ(why, PR_NONE);
+    ASSERT_EQ(placement_token_valid(&tok, 1, ds_cache_mono_ms()), true);
     /* the connector denies the DS: refused, with the connector's reason */
     memset(&v, 0, sizeof(v));
     v.count = 1; v.batch_valid = true;
@@ -341,6 +343,20 @@ static void test_admit_create_refuses_a_connector_denied_ds(void)
     placement_gate_publish_assessments(&v);
     ASSERT_EQ(placement_gate_admit_create(1, PP_NEW_OBJECT, &tok, &why), MDS_OK);
     ASSERT_EQ(placement_token_valid(&tok, 1, ds_cache_mono_ms()), true);
+    /* a deny that has run out is no verdict in force: neutral, admitted */
+    v.rows[0].allowed = false; v.rows[0].multiplier_ppm = 0;
+    v.rows[0].expires_mono_ms = ds_cache_mono_ms();
+    placement_gate_publish_assessments(&v);
+    ASSERT_EQ(placement_gate_admit_create(1, PP_NEW_OBJECT, &tok, &why), MDS_OK);
+    ASSERT_EQ(why, PR_NONE);
+    /* and a full DS is refused whatever the verdict */
+    {
+        struct ds_capacity_obs full = { 1000, 0, 1, ds_cache_mono_ms(), 0 };
+        ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &full), 0);
+    }
+    placement_gate_publish_capacity();
+    ASSERT_EQ(placement_gate_admit_create(1, PP_NEW_OBJECT, &tok, &why), MDS_ERR_NOSPC);
+    ASSERT_EQ(why, PR_CAPACITY_FULL);
     placement_gate_destroy();
     ds_cache_destroy(cache);
     mds_catalogue_close(cat);

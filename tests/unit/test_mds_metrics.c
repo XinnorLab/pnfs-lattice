@@ -131,6 +131,36 @@ static void test_metrics_prometheus_v2_wave6(void)
     passed++;
 }
 
+/* smart verdict retention (design section 5.3): the neutral / retained
+ * gauges and the expired-verdict counter are exposed with their types. */
+static void test_metrics_prometheus_v2_verdict_retention(void)
+{
+    fprintf(stdout, "  test_metrics_v2_verdict_retention: ");
+
+    struct mds_metrics_snapshot s;
+    static char buf[131072];
+    int n;
+
+    memset(&s, 0, sizeof(s));
+    atomic_store(&g_branch_metrics.placement_neutral_ds, 3);
+    atomic_store(&g_branch_metrics.placement_retained_ds, 2);
+    atomic_store(&g_branch_metrics.connector_verdicts_expired_total, 5);
+    n = mds_metrics_prometheus_v2(&s, &g_branch_metrics, buf, sizeof(buf));
+    ASSERT_TRUE(n > 0);
+    ASSERT_TRUE(strstr(buf, "# TYPE pnfs_mds_placement_neutral_ds gauge\n"
+                            "pnfs_mds_placement_neutral_ds 3\n") != NULL);
+    ASSERT_TRUE(strstr(buf, "# TYPE pnfs_mds_placement_retained_ds gauge\n"
+                            "pnfs_mds_placement_retained_ds 2\n") != NULL);
+    ASSERT_TRUE(strstr(buf, "# TYPE pnfs_mds_connector_verdicts_expired_total counter\n"
+                            "pnfs_mds_connector_verdicts_expired_total 5\n") != NULL);
+    atomic_store(&g_branch_metrics.placement_neutral_ds, 0);
+    atomic_store(&g_branch_metrics.placement_retained_ds, 0);
+    atomic_store(&g_branch_metrics.connector_verdicts_expired_total, 0);
+
+    fprintf(stdout, "PASS\n");
+    passed++;
+}
+
 /* Every op/cat-op enum entry must have a name-table row: designated
  * initializers silently leave gaps as NULL, which would put "(null)"
  * into /metrics label values.  Also pins the Wave 6 addition. */
@@ -160,6 +190,7 @@ int main(void)
     test_metrics_prometheus();
     test_metrics_prometheus_truncation();
     test_metrics_prometheus_v2_wave6();
+    test_metrics_prometheus_v2_verdict_retention();
     test_op_metrics_name_tables_complete();
 
     fprintf(stdout, "\n  %d passed, %d failed\n", passed, failed);
